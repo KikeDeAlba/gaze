@@ -61,6 +61,10 @@ pub fn inkwell_docs() -> PathBuf {
     env_path("INKWELL_DOCS_DIR").unwrap_or_else(|| home().join(".local/share/inkwell/docs"))
 }
 
+pub fn inkwell_db() -> PathBuf {
+    env_path("INKWELL_DB_PATH").unwrap_or_else(|| home().join(".local/share/inkwell/inkwell.db"))
+}
+
 pub fn claude_projects() -> PathBuf {
     home().join(".claude/projects")
 }

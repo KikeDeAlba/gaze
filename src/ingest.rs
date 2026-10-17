@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
@@ -9,6 +10,7 @@ use crate::embed::Embedder;
 use crate::paths;
 use crate::project;
 use crate::store::{GLOBAL, NewNode, Store};
+use crate::text;
 
 pub fn frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
     let mut map = BTreeMap::new();
@@ -97,13 +99,36 @@ impl IngestReport {
     }
 }
 
+fn inkwell_spaces() -> &'static HashMap<String, i64> {
+    static SPACES: OnceLock<HashMap<String, i64>> = OnceLock::new();
+    SPACES.get_or_init(|| read_inkwell_spaces(&paths::inkwell_db()).unwrap_or_default())
+}
+
+pub fn read_inkwell_spaces(db: &Path) -> Option<HashMap<String, i64>> {
+    let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let mut stmt = conn.prepare("SELECT name, external_ref FROM spaces WHERE external_ref LIKE 'bita:project:%'").ok()?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).ok()?;
+    Some(
+        rows.flatten()
+            .filter_map(|(name, reference)| reference.strip_prefix("bita:project:")?.parse::<i64>().ok().map(|id| (text::slugify(&name), id)))
+            .collect(),
+    )
+}
+
+pub fn folder_project(store: &Store, spaces: &HashMap<String, i64>, folder: &str) -> String {
+    spaces
+        .get(folder)
+        .and_then(|id| project::project_for_bita_id(store, *id))
+        .unwrap_or_else(|| project::project_for_name(store, folder))
+}
+
 pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path) -> Result<Option<(String, &'static str)>> {
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
     let key = format!("inkwell:{rel}");
     let raw = std::fs::read_to_string(path)?;
     let (meta, body) = frontmatter(&raw);
     let folder = rel.split('/').next().unwrap_or(GLOBAL);
-    let project = project::project_for_name(store, folder);
+    let project = folder_project(store, inkwell_spaces(), folder);
     let title = meta.get("title").cloned().unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
     let mut attrs: Vec<(String, String)> = Vec::new();
     let (kind, body) = if let Some(entry) = meta.get("entryId") {
@@ -330,6 +355,24 @@ pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value) -> Result<Va
 mod tests {
     use super::*;
     use crate::embed::FakeEmbedder;
+
+    #[test]
+    fn inkwell_folders_follow_the_bita_project_of_their_space() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("inkwell.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE spaces (id INTEGER PRIMARY KEY, name TEXT NOT NULL, external_ref TEXT);
+             INSERT INTO spaces VALUES (1, 'Global', 'bita:project:218978619'), (2, 'Notas sueltas', NULL);",
+        )
+        .unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name) VALUES ('vivaglobal', 218978619, 'VivaGlobal')", []).unwrap();
+        let spaces = read_inkwell_spaces(&db).unwrap();
+        assert_eq!(folder_project(&store, &spaces, "global"), "vivaglobal");
+        assert_eq!(folder_project(&store, &spaces, "notas-sueltas"), "notas-sueltas");
+        assert_eq!(folder_project(&store, &spaces, "_no-project"), GLOBAL);
+    }
 
     #[test]
     fn frontmatter_parses_nested_and_body() {

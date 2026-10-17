@@ -76,6 +76,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_nodes USING fts5(
   tokenize = 'unicode61 remove_diacritics 2'
 );
 
+CREATE TABLE IF NOT EXISTS project_groups (
+  name TEXT NOT NULL,
+  project TEXT NOT NULL,
+  PRIMARY KEY (name, project)
+);
+
 CREATE TABLE IF NOT EXISTS injections (
   session_id TEXT NOT NULL,
   node_id TEXT NOT NULL,
@@ -140,7 +146,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version < 1 {
         conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", 1)?;
+        conn.pragma_update(None, "user_version", 2)?;
+    } else if version < 2 {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS project_groups (name TEXT NOT NULL, project TEXT NOT NULL, PRIMARY KEY (name, project));")?;
+        conn.pragma_update(None, "user_version", 2)?;
     }
     Ok(conn)
 }

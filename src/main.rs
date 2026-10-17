@@ -60,6 +60,17 @@ enum Command {
     Link { a: String, b: String },
     #[command(about = "Borra una nota")]
     Forget { id: String },
+    #[command(about = "Mueve una nota o regla a otro proyecto o grupo")]
+    Move {
+        id: String,
+        #[arg(long)]
+        project: String,
+    },
+    #[command(about = "Grupos de proyectos que comparten reglas y notas")]
+    Group {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
     #[command(about = "Grafo de notas y aristas")]
     Graph {
         #[arg(long)]
@@ -147,6 +158,13 @@ enum RuleAction {
 }
 
 #[derive(Subcommand)]
+enum GroupAction {
+    Set { name: String, projects: Vec<String> },
+    Ls,
+    Rm { name: String },
+}
+
+#[derive(Subcommand)]
 enum ImportWhat {
     ClaudeMemory {
         #[arg(long)]
@@ -175,6 +193,12 @@ fn command_name(command: &Command) -> &'static str {
         },
         Command::Link { .. } => "link",
         Command::Forget { .. } => "forget",
+        Command::Move { .. } => "move",
+        Command::Group { action } => match action {
+            GroupAction::Set { .. } => "group set",
+            GroupAction::Ls => "group ls",
+            GroupAction::Rm { .. } => "group rm",
+        },
         Command::Graph { .. } => "graph",
         Command::Ingest { .. } => "ingest",
         Command::Import { .. } => "import claude-memory",
@@ -351,6 +375,41 @@ fn run(command: Command) -> Result<Output> {
             let store = Store::open_default()?;
             let node = store.forget(&id)?;
             Ok(Output::new(json!({"id": node.id, "removed": true}), format!("Borrada: [{}] {}", node.id, node.title)))
+        }
+        Command::Move { id, project: target } => {
+            let store = Store::open_default()?;
+            let target = project::project_for_name(&store, &target);
+            let node = store.move_node(&embedder(), &id, &target)?;
+            Ok(Output::new(json!({"id": node.id, "project": node.project}), format!("[{}] ahora está en {}", node.id, node.project)))
+        }
+        Command::Group { action } => {
+            let store = Store::open_default()?;
+            match action {
+                GroupAction::Set { name, projects } => {
+                    let name = text::slugify(&name);
+                    if name.is_empty() || name == GLOBAL || projects.is_empty() {
+                        return Err(usage("Uso: gaze group set <nombre> <proyecto>..."));
+                    }
+                    let members: Vec<String> = projects.iter().map(|p| project::project_for_name(&store, p)).filter(|p| p != GLOBAL).collect();
+                    store.set_group(&name, &members)?;
+                    Ok(Output::new(json!({"name": name, "projects": members}), format!("Grupo {name}: {}", members.join(", "))))
+                }
+                GroupAction::Ls => {
+                    let groups = store.groups()?;
+                    let human = if groups.is_empty() {
+                        "Sin grupos.".to_string()
+                    } else {
+                        groups.iter().map(|(n, m)| format!("{n}: {}", m.join(", "))).collect::<Vec<_>>().join("\n")
+                    };
+                    let data: Vec<Value> = groups.iter().map(|(n, m)| json!({"name": n, "projects": m})).collect();
+                    Ok(Output::new(json!(data), human))
+                }
+                GroupAction::Rm { name } => {
+                    let name = text::slugify(&name);
+                    let removed = store.remove_group(&name)?;
+                    Ok(Output::new(json!({"name": name, "removed": removed}), if removed { format!("Grupo {name} borrado.") } else { format!("No existe el grupo {name}.") }))
+                }
+            }
         }
         Command::Graph { project } => {
             let store = Store::open_default()?;

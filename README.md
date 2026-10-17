@@ -19,7 +19,7 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 Requiere Rust (1.88 o más nuevo) y macOS (el daemon usa launchd; el resto funciona en cualquier Unix).
 
 ```sh
-cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.2.0   # o, desde el clon: cargo install --path .
+cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.2.1   # o, desde el clon: cargo install --path .
 gaze setup                        # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
 gaze daemon install               # daemon en launchd que mantiene el modelo cargado (hooks de ~15 ms)
 claude plugin marketplace add KikeDeAlba/gaze

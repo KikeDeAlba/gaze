@@ -132,7 +132,9 @@ pub fn refresh_bita_projects(store: &Store, cwd: &Path) -> Option<Vec<Value>> {
     let value = run_json(&bita_bin(), &["projects", "--all", "--json"], cwd, Duration::from_secs(5))?;
     let list = value["data"].as_array()?.clone();
     for project in &list {
-        if let (Some(pid), Some(name)) = (project["id"].as_i64(), project["name"].as_str()) {
+        if let (Some(pid), Some(name)) = (project["id"].as_i64(), project["name"].as_str())
+            && text::slugify(name) != GLOBAL
+        {
             let key = project["key"].as_str().map(str::to_string);
             let _ = store.conn.execute(
                 "INSERT INTO projects (slug, bita_id, name, key) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(slug) DO UPDATE SET bita_id = excluded.bita_id, name = excluded.name, key = COALESCE(excluded.key, projects.key)",

@@ -1,0 +1,12 @@
+{
+  "name": "gaze",
+  "version": "0.1.0",
+  "description": "Cerebro local por proyecto con búsqueda híbrida: reglas, notas atómicas y cosecha automática para Claude Code.",
+  "author": {
+    "name": "Jesus Enrique De Alba Gaytan"
+  },
+  "homepage": "https://github.com/KikeDeAlba/gaze#readme",
+  "repository": "https://github.com/KikeDeAlba/gaze",
+  "license": "MIT",
+  "keywords": ["memory", "knowledge", "search", "gaze"]
+}

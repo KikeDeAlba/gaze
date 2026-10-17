@@ -1,0 +1,16 @@
+{
+  "name": "gaze",
+  "owner": {
+    "name": "Jesus Enrique De Alba Gaytan"
+  },
+  "metadata": {
+    "description": "Plugin de gaze para Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "gaze",
+      "source": "./",
+      "description": "Cerebro por proyecto: reglas al iniciar, notas relevantes por prompt, cosecha al cerrar y herramientas MCP."
+    }
+  ]
+}

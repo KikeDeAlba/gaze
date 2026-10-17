@@ -19,7 +19,7 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 Requiere Rust (1.88 o más nuevo) y macOS (el daemon usa launchd; el resto funciona en cualquier Unix).
 
 ```sh
-cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.1.0   # o, desde el clon: cargo install --path .
+cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.2.0   # o, desde el clon: cargo install --path .
 gaze setup                        # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
 gaze daemon install               # daemon en launchd que mantiene el modelo cargado (hooks de ~15 ms)
 claude plugin marketplace add KikeDeAlba/gaze
@@ -78,6 +78,9 @@ gaze show <id>
 gaze rule add <texto> [--project P | --global] [--until AAAA-MM-DD] [--pin]
 gaze rule ls [--project P | --all]
 gaze rule rm <id>
+gaze group set <nombre> <proyecto>...   # p. ej. gaze group set dp Dportenis DPSuites "IA DP"
+gaze group ls | gaze group rm <nombre>
+gaze move <id> --project <proyecto o grupo>
 gaze link <a> <b>
 gaze forget <id>
 gaze graph [--project P]
@@ -107,6 +110,10 @@ Tipos de nota: `rule`, `fact`, `decision`, `doc`, `entry`, `issue`, `meeting`, `
 ## Cómo resuelve el proyecto
 
 Para un directorio: `bita repo which --json` si existe; si no, el remoto `origin` contra el `scopeMapping` de `~/.config/bita/config.json` (el prefijo más largo); si no, `gaze.toml` en la raíz del repo (`project = "Nombre"`); si no, `global`. El nombre del proyecto se guarda como slug (igual que las carpetas de inkwell) y el resultado se cachea 24 horas en la base. `GAZE_PROJECT` lo fuerza.
+
+## Grupos de proyectos
+
+Un grupo junta proyectos de un mismo cliente. Lo que se guarda en el grupo (`--project dp`) y lo de cualquiera de sus proyectos se ve desde todos ellos: reglas al iniciar sesión y resultados de búsqueda. Así «en los proyectos de DP los commits van así» se escribe una vez: `gaze rule add "..." --project dp`.
 
 ## Datos
 

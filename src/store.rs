@@ -563,12 +563,69 @@ impl Store {
         Ok(())
     }
 
-    fn projects_for(scope: &Scope) -> Vec<Option<String>> {
-        match scope {
-            Scope::All => vec![None],
-            Scope::Project(p) if p == GLOBAL => vec![Some(GLOBAL.to_string())],
-            Scope::Project(p) => vec![Some(p.clone()), Some(GLOBAL.to_string())],
+    pub fn scope_projects(&self, project: &str) -> Result<Vec<String>> {
+        if project == GLOBAL {
+            return Ok(vec![GLOBAL.to_string()]);
         }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT name FROM project_groups WHERE project = ?1
+             UNION SELECT g.project FROM project_groups g JOIN project_groups m ON m.name = g.name WHERE m.project = ?1",
+        )?;
+        let related: Vec<String> = stmt.query_map([project], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut projects = vec![project.to_string(), GLOBAL.to_string()];
+        for name in related {
+            if !projects.contains(&name) {
+                projects.push(name);
+            }
+        }
+        Ok(projects)
+    }
+
+    fn projects_for(&self, scope: &Scope) -> Result<Vec<Option<String>>> {
+        Ok(match scope {
+            Scope::All => vec![None],
+            Scope::Project(p) => self.scope_projects(p)?.into_iter().map(Some).collect(),
+        })
+    }
+
+    pub fn groups(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT name, project FROM project_groups ORDER BY name, project")?;
+        let rows: Vec<(String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, project) in rows {
+            match groups.last_mut() {
+                Some((last, members)) if *last == name => members.push(project),
+                _ => groups.push((name, vec![project])),
+            }
+        }
+        Ok(groups)
+    }
+
+    pub fn set_group(&self, name: &str, projects: &[String]) -> Result<()> {
+        self.tx(|| {
+            self.conn.execute("DELETE FROM project_groups WHERE name = ?1", [name])?;
+            for project in projects {
+                self.conn.execute("INSERT OR IGNORE INTO project_groups (name, project) VALUES (?1, ?2)", params![name, project])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn remove_group(&self, name: &str) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM project_groups WHERE name = ?1", [name])? > 0)
+    }
+
+    pub fn move_node(&self, emb: &dyn Embedder, id: &str, project: &str) -> Result<Node> {
+        let node = self.require(id)?;
+        let chunks = text::chunk(&node.title, &node.body);
+        let vectors = emb.embed(&chunks, Mode::Passage)?;
+        self.tx(|| {
+            self.conn.execute("UPDATE nodes SET project = ?2 WHERE id = ?1", params![node.id, project])?;
+            self.conn.execute("DELETE FROM edges WHERE kind = 'similar' AND (src = ?1 OR dst = ?1)", [&node.id])?;
+            self.write_content(&node.id, project, &node.title, &node.body, &chunks, Some(&vectors))?;
+            self.refresh_similar(&node.id, project, &vectors[0])
+        })?;
+        self.require(&node.id)
     }
 
     pub fn search(&self, emb: Option<&dyn Embedder>, query: &str, scope: &Scope, options: &SearchOptions) -> Result<Vec<Hit>> {
@@ -582,8 +639,8 @@ impl Store {
             let (sql, scoped) = match scope {
                 Scope::All => ("SELECT node_id FROM fts_nodes WHERE fts_nodes MATCH ?1 ORDER BY bm25(fts_nodes, 0, 0, 3.0, 1.0) LIMIT ?2", None),
                 Scope::Project(p) => (
-                    "SELECT node_id FROM fts_nodes WHERE fts_nodes MATCH ?1 AND project IN (?3, 'global') ORDER BY bm25(fts_nodes, 0, 0, 3.0, 1.0) LIMIT ?2",
-                    Some(p.clone()),
+                    "SELECT node_id FROM fts_nodes WHERE fts_nodes MATCH ?1 AND project IN (SELECT value FROM json_each(?3)) ORDER BY bm25(fts_nodes, 0, 0, 3.0, 1.0) LIMIT ?2",
+                    Some(serde_json::to_string(&self.scope_projects(p)?)?),
                 ),
             };
             let mut stmt = self.conn.prepare_cached(sql)?;
@@ -599,7 +656,7 @@ impl Store {
             && let Some(vector) = vectors.first()
         {
             let mut best: HashMap<String, (f32, String)> = HashMap::new();
-            for project in Self::projects_for(scope) {
+            for project in self.projects_for(scope)? {
                 for (node_id, _, similarity, chunk) in self.knn(vector, project.as_deref(), pool)? {
                     let slot = best.entry(node_id).or_insert((similarity, chunk.clone()));
                     if similarity > slot.0 {
@@ -672,11 +729,12 @@ impl Store {
 
     pub fn active_rules(&self, project: &str) -> Result<Vec<Node>> {
         let sql = format!(
-            "SELECT {NODE_COLUMNS} FROM nodes WHERE kind = 'rule' AND project IN (?1, 'global') AND (until IS NULL OR until >= ?2)
-             ORDER BY pinned DESC, (project = ?1) DESC, updated_at DESC"
+            "SELECT {NODE_COLUMNS} FROM nodes WHERE kind = 'rule' AND project IN (SELECT value FROM json_each(?3)) AND (until IS NULL OR until >= ?2)
+             ORDER BY pinned DESC, (project = ?1) DESC, (project = 'global') ASC, updated_at DESC"
         );
+        let scope = serde_json::to_string(&self.scope_projects(project)?)?;
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![project, text::today()], row_node)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt.query_map(params![project, text::today(), scope], row_node)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -685,9 +743,13 @@ impl Store {
         let sql = format!("SELECT {NODE_COLUMNS} FROM nodes WHERE kind = 'rule' ORDER BY project, pinned DESC, updated_at DESC");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], row_node)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let scope = match project {
+            Some(p) => Some(self.scope_projects(p)?),
+            None => None,
+        };
         Ok(rows
             .into_iter()
-            .filter(|n| project.is_none_or(|p| n.project == p || n.project == GLOBAL))
+            .filter(|n| scope.as_ref().is_none_or(|s| s.contains(&n.project)))
             .filter(|n| include_expired || n.until.as_deref().is_none_or(|u| u >= today.as_str()))
             .collect())
     }
@@ -824,6 +886,31 @@ mod tests {
         assert!(all.iter().any(|h| h.project == "otro"));
         let lexical_only = store.search(None, "sqlite", &Scope::Project("den".into()), &SearchOptions { limit: 5, ..Default::default() }).unwrap();
         assert_eq!(lexical_only.len(), 1);
+    }
+
+    #[test]
+    fn groups_share_rules_and_search_across_their_projects() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let rule = store.remember(&e, note("dportenis", "rule", "Commits", "En DP los commits llevan la clave de Jira al inicio"), true).unwrap();
+        store.remember(&e, note("dpsuites", "fact", "Pipeline", "El pipeline de dpsuites corre en GitHub Actions"), true).unwrap();
+        store.remember(&e, note("apartados", "rule", "VM", "No mencionar la VM en apartados"), true).unwrap();
+        assert!(store.active_rules("dpsuites").unwrap().is_empty());
+
+        store.set_group("dp", &["dportenis".into(), "dpsuites".into()]).unwrap();
+        let rules = store.active_rules("dpsuites").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].project, "dportenis");
+        let hits = store.search(None, "pipeline", &Scope::Project("dportenis".into()), &SearchOptions { limit: 5, ..Default::default() }).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let moved = store.move_node(&e, &rule.id, "dp").unwrap();
+        assert_eq!(moved.project, "dp");
+        assert_eq!(store.active_rules("dportenis").unwrap()[0].project, "dp");
+        assert!(store.active_rules("apartados").unwrap().iter().all(|r| r.project != "dp"));
+        assert_eq!(store.rules(Some("dpsuites"), false).unwrap().len(), 1);
+        assert!(store.remove_group("dp").unwrap());
+        assert!(store.active_rules("dpsuites").unwrap().is_empty());
     }
 
     #[test]

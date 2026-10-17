@@ -222,6 +222,10 @@ pub fn project_for_name(store: &Store, name: &str) -> String {
     if trimmed.is_empty() || trimmed == GLOBAL || trimmed == "_no-project" {
         return GLOBAL.into();
     }
+    let group = text::slugify(trimmed);
+    if store.conn.query_row("SELECT 1 FROM project_groups WHERE name = ?1 LIMIT 1", [&group], |_| Ok(())).optional().ok().flatten().is_some() {
+        return group;
+    }
     let by_key: Option<String> = store
         .conn
         .query_row("SELECT slug FROM projects WHERE upper(key) = upper(?1) OR lower(name) = lower(?1)", [trimmed], |r| r.get(0))
@@ -246,6 +250,16 @@ pub fn explicit_or_cwd(store: &Store, explicit: Option<&str>, cwd: &Path) -> Res
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_group_name_wins_over_a_project_key() {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name, key) VALUES ('app-dp-v2', 1, 'App DP v2', 'DP')", []).unwrap();
+        assert_eq!(project_for_name(&store, "dp"), "app-dp-v2");
+        store.set_group("dp", &["app-dp-v2".into(), "dportenis".into()]).unwrap();
+        assert_eq!(project_for_name(&store, "dp"), "dp");
+        assert_eq!(project_for_name(&store, "App DP v2"), "app-dp-v2");
+    }
 
     #[test]
     fn remote_slugs_normalize() {

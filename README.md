@@ -117,9 +117,11 @@ Para un directorio, en este orden (gana el primero que acierta):
 2. Caché en la base: 24 horas; 1 hora si el resultado fue `global`.
 3. `bita repo which --json`, solo dentro de un repo.
 4. `scopeMapping` de `~/.config/bita/config.json` (el prefijo más largo) con el slug del directorio: el remoto `origin`; sin remoto, o en una carpeta sin repo, la ruta relativa a `~/dev` en minúsculas (`~/dev/github.com/KikeDeAlba` → `github.com/kikedealba`).
-5. Scope automático: compara los segmentos del slug (del más profundo al más superficial, sin el host) con los nombres de proyecto de bita normalizados (sin acentos, espacios, `-` ni `_`). Acierta si el nombre es igual al segmento o empieza con él (segmento de 4 caracteres o más) y el resultado es único. Lo registra con `bita scope set <prefijo> <id>` (fuente `auto-scope`; `suggestion` si bita falla).
-6. `gaze.toml` (`project = "Nombre"`) en la raíz del repo; sin repo, se busca hacia arriba dentro de `~/dev`.
+5. `gaze.toml` (`project = "Nombre"`) en la raíz del repo; sin repo, se busca hacia arriba dentro de `~/dev`.
+6. Scope automático: compara los segmentos del slug (del más profundo al más superficial, sin el host) con los nombres de proyecto de bita. Ignora los segmentos de menos de 4 caracteres y los genéricos (`api`, `apps`, `web`, `core`, `shared`, `services`, `devops`, `infra`, `platform`, `docs`, `frontend`, `backend`, `modules`, `tools`, `test`, entre otros). Acierta si el nombre normalizado (sin acentos, espacios, `-` ni `_`) es igual al segmento, o si el nombre empieza con el segmento en frontera de palabra (`doters-sso` → «Doters SSO Legacy», `kikedealba` → «KikeDeAlba Modules»; `viva` no acierta con «Vivaaerobus»), y el resultado es único. Lo registra con `bita scope set <prefijo> <id>` (fuente `auto-scope`; `suggestion` si bita falla) y lo anota en `harvest.log`.
 7. `global`.
+
+Los hooks (inicio de sesión y prompt) no corren el scope automático ni `bita projects`, para no pasarse de su tiempo límite: si su resolución da `global` sin caché, lanzan en segundo plano `gaze project --cwd <dir> --refresh`, que sí lo corre y deja el resultado en el caché para el siguiente prompt o sesión. `gaze project` y la cosecha usan la resolución completa.
 
 El nombre del proyecto se guarda como slug (igual que las carpetas de inkwell). Si el caché quedó viejo, `gaze project --refresh` lo ignora y lo rehace.
 

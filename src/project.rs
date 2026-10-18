@@ -128,7 +128,7 @@ pub fn path_slug(dir: &Path, home: &Path) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join("/"))
 }
 
-fn normalize_name(value: &str) -> String {
+pub(crate) fn normalize_name(value: &str) -> String {
     text::fold(value).chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').collect()
 }
 

@@ -132,7 +132,7 @@ pub fn session_context(rules: &[Node], budget: usize) -> String {
 pub fn session_start(store: &Store, input: &Value) -> Result<Option<Value>> {
     let started = Instant::now();
     let cwd = input_cwd(input);
-    let project = project::resolve(store, &cwd, false)?;
+    let project = resolve_for_hook(store, &cwd)?;
     let rules = store.active_rules(&project.slug)?;
     let context = session_context(&rules, store.cfg.hooks.rules_tokens);
     let ids: Vec<String> = rules.iter().map(|r| r.id.clone()).collect();
@@ -237,6 +237,24 @@ fn spawn_daemon() {
     }
 }
 
+pub fn needs_background_refresh(project: &project::Project) -> bool {
+    project.slug == GLOBAL && project.repo.is_some() && !project.source.starts_with("cache:") && project.source != "env"
+}
+
+fn resolve_for_hook(store: &Store, cwd: &Path) -> Result<project::Project> {
+    let project = project::resolve_fast(store, cwd)?;
+    if !cfg!(test)
+        && needs_background_refresh(&project)
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let mut command = Command::new(exe);
+        command.args(["project", "--refresh", "--cwd"]).arg(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        detach(&mut command);
+        let _ = command.spawn();
+    }
+    Ok(project)
+}
+
 pub fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
@@ -250,7 +268,7 @@ pub fn prompt(store: &Store, input: &Value) -> Result<Option<Value>> {
         return Ok(None);
     }
     let cwd = input_cwd(input);
-    let project = project::resolve(store, &cwd, false)?;
+    let project = resolve_for_hook(store, &cwd)?;
     let session = session_id(input);
     let already = store.injected(&session)?;
 
@@ -552,6 +570,15 @@ mod tests {
         assert!(context.contains("reglas más: gaze rule ls"));
         assert!(context.starts_with(BRAIN_LINE));
         assert_eq!(session_context(&[], 300), BRAIN_LINE);
+    }
+
+    #[test]
+    fn only_fresh_global_resolutions_with_a_slug_refresh_in_background() {
+        let fresh = project::Project { repo: Some("github.com/kikedealba".into()), ..project::Project::global("default") };
+        assert!(needs_background_refresh(&fresh));
+        assert!(!needs_background_refresh(&project::Project { source: "cache:default".into(), ..fresh.clone() }));
+        assert!(!needs_background_refresh(&project::Project { repo: None, ..fresh.clone() }));
+        assert!(!needs_background_refresh(&project::Project { slug: "gaze".into(), ..fresh }));
     }
 
     #[test]

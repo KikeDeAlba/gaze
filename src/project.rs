@@ -106,7 +106,7 @@ fn run_json(program: &str, args: &[&str], cwd: &Path, timeout: Duration) -> Opti
     stdout.lines().rev().find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
 }
 
-fn bita_bin() -> String {
+pub fn bita_bin() -> String {
     std::env::var("GAZE_BITA_BIN").unwrap_or_else(|_| "bita".into())
 }
 
@@ -114,11 +114,13 @@ struct Resolver {
     home: PathBuf,
     bita: String,
     bita_config: PathBuf,
+    auto: bool,
+    log: Option<PathBuf>,
 }
 
 impl Resolver {
-    fn from_env() -> Self {
-        Self { home: paths::home(), bita: bita_bin(), bita_config: paths::bita_config() }
+    fn from_env(auto: bool) -> Self {
+        Self { home: paths::home(), bita: bita_bin(), bita_config: paths::bita_config(), auto, log: Some(paths::harvest_log()) }
     }
 }
 
@@ -132,22 +134,84 @@ pub(crate) fn normalize_name(value: &str) -> String {
     text::fold(value).chars().filter(|c| !c.is_whitespace() && *c != '-' && *c != '_').collect()
 }
 
+pub(crate) fn name_tokens(value: &str) -> Vec<String> {
+    text::fold(value).split(|c: char| c.is_whitespace() || c == '-' || c == '_').filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
+const GENERIC_SEGMENTS: &[&str] = &[
+    "api",
+    "apis",
+    "app",
+    "apps",
+    "web",
+    "core",
+    "common",
+    "shared",
+    "libs",
+    "lib",
+    "packages",
+    "services",
+    "service",
+    "microservices",
+    "public",
+    "private",
+    "admin",
+    "devops",
+    "infra",
+    "infrastructure",
+    "platform",
+    "docs",
+    "frontend",
+    "backend",
+    "mobile",
+    "src",
+    "tools",
+    "jobs",
+    "workers",
+    "cronjobs",
+    "lambdas",
+    "modules",
+    "dev",
+    "test",
+    "qa",
+];
+
+fn starts_on_boundary(name: &[String], segment: &[String]) -> bool {
+    if segment.len() > 1 {
+        return name.len() >= segment.len() && name[..segment.len()] == *segment;
+    }
+    let Some(target) = segment.first() else { return false };
+    let mut joined = String::new();
+    for token in name {
+        joined.push_str(token);
+        if joined == *target {
+            return true;
+        }
+        if !target.starts_with(&joined) {
+            return false;
+        }
+    }
+    false
+}
+
 pub fn suggest_scope(slug: &str, projects: &[(i64, String)]) -> Option<(String, i64, String)> {
     let segments: Vec<&str> = slug.split('/').collect();
-    let normalized: Vec<(i64, &str, String)> = projects.iter().map(|(id, name)| (*id, name.as_str(), normalize_name(name))).collect();
+    let normalized: Vec<(i64, &str, String, Vec<String>)> =
+        projects.iter().map(|(id, name)| (*id, name.as_str(), normalize_name(name), name_tokens(name))).collect();
     for depth in (1..segments.len()).rev() {
         let segment = normalize_name(segments[depth]);
-        if segment.is_empty() {
+        if segment.chars().count() < 4 || GENERIC_SEGMENTS.contains(&segment.as_str()) {
             continue;
         }
-        let pick = |matches: &dyn Fn(&str) -> bool| {
-            let mut found: Vec<(i64, &str)> = normalized.iter().filter(|(_, _, n)| matches(n)).map(|(id, name, _)| (*id, *name)).collect();
+        let tokens = name_tokens(segments[depth]);
+        let pick = |matches: &dyn Fn(&str, &[String]) -> bool| {
+            let mut found: Vec<(i64, &str)> = normalized.iter().filter(|(_, _, n, t)| matches(n, t)).map(|(id, name, _, _)| (*id, *name)).collect();
             found.sort_by_key(|(id, _)| *id);
             found.dedup_by_key(|(id, _)| *id);
             found
         };
-        let exact = pick(&|n| n == segment);
-        let candidates = if exact.is_empty() && segment.chars().count() >= 4 { pick(&|n| n.starts_with(&segment)) } else { exact };
+        let exact = pick(&|n, _| n == segment);
+        let candidates = if exact.is_empty() { pick(&|_, t| starts_on_boundary(t, &tokens)) } else { exact };
         match candidates.as_slice() {
             [] => continue,
             [(id, name)] => return Some((segments[..=depth].join("/"), *id, name.to_string())),
@@ -180,7 +244,7 @@ pub fn refresh_bita_projects(store: &Store, cwd: &Path) -> Option<Vec<Value>> {
     refresh_projects_with(store, cwd, &bita_bin())
 }
 
-fn refresh_projects_with(store: &Store, cwd: &Path, bin: &str) -> Option<Vec<Value>> {
+pub(crate) fn refresh_projects_with(store: &Store, cwd: &Path, bin: &str) -> Option<Vec<Value>> {
     let value = run_json(bin, &["projects", "--all", "--json"], cwd, Duration::from_secs(5))?;
     let list = value["data"].as_array()?.clone();
     for project in &list {
@@ -197,9 +261,12 @@ fn refresh_projects_with(store: &Store, cwd: &Path, bin: &str) -> Option<Vec<Val
     Some(list)
 }
 
-fn bita_key(store: &Store, id: i64, cwd: &Path, bin: &str) -> Option<String> {
+fn bita_key(store: &Store, id: i64, cwd: &Path, bin: &str, refresh: bool) -> Option<String> {
     if let Ok(Some(key)) = store.conn.query_row("SELECT key FROM projects WHERE bita_id = ?1 AND key IS NOT NULL", [id], |r| r.get::<_, String>(0)).optional() {
         return Some(key);
+    }
+    if !refresh {
+        return None;
     }
     let list = refresh_projects_with(store, cwd, bin)?;
     list.iter().find(|p| p["id"].as_i64() == Some(id)).and_then(|p| p["key"].as_str()).map(str::to_string)
@@ -218,15 +285,20 @@ fn known_projects(store: &Store) -> Vec<(i64, String)> {
     stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
 }
 
-fn auto_scope(store: &Store, cwd: &Path, slug: &str, bin: &str) -> Option<((i64, String), &'static str)> {
+fn auto_scope(store: &Store, cwd: &Path, slug: &str, env: &Resolver) -> Option<((i64, String), &'static str)> {
     let (prefix, id, name) = suggest_scope(slug, &known_projects(store)).or_else(|| {
-        refresh_projects_with(store, cwd, bin)?;
+        refresh_projects_with(store, cwd, &env.bita)?;
         suggest_scope(slug, &known_projects(store))
     })?;
     let id_arg = id.to_string();
-    let saved = run_json(bin, &["scope", "set", &prefix, &id_arg, "--json"], cwd, Duration::from_secs(5)).is_some_and(|v| v["ok"] == Value::Bool(true));
+    let saved = run_json(&env.bita, &["scope", "set", &prefix, &id_arg, "--json"], cwd, Duration::from_secs(5)).is_some_and(|v| v["ok"] == Value::Bool(true));
     let source = if saved { "auto-scope" } else { "suggestion" };
-    eprintln!("{source} {prefix} -> {name} ({id})");
+    if let Some(path) = &env.log
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{} {source} {prefix} -> {name} ({id})", text::now_iso());
+    }
     Some(((id, name), source))
 }
 
@@ -250,7 +322,7 @@ pub fn remember_project(store: &Store, project: &Project) {
 }
 
 pub fn resolve_uncached(store: &Store, cwd: &Path) -> Project {
-    resolve_with(store, cwd, &Resolver::from_env())
+    resolve_with(store, cwd, &Resolver::from_env(true))
 }
 
 fn resolve_with(store: &Store, cwd: &Path, env: &Resolver) -> Project {
@@ -259,15 +331,17 @@ fn resolve_with(store: &Store, cwd: &Path, env: &Resolver) -> Project {
         Some(root) => origin_url(root).and_then(|u| remote_slug(&u)).or_else(|| path_slug(root, &env.home)),
         None => path_slug(cwd, &env.home),
     };
-    let found = root
+    let bita_project = |((id, name), source): ((i64, String), &str)| {
+        let key = bita_key(store, id, cwd, &env.bita, env.auto);
+        Project { slug: text::slugify(&name), name: Some(name), bita_id: Some(id), key, source: source.into(), repo: slug.clone() }
+    };
+    let configured = root
         .as_ref()
         .and_then(|_| from_bita_which(&env.bita, cwd))
         .map(|f| (f, "bita"))
-        .or_else(|| slug.as_deref().and_then(|s| from_scope_mapping(&env.bita_config, s)).map(|f| (f, "scope-mapping")))
-        .or_else(|| slug.as_deref().and_then(|s| auto_scope(store, cwd, s, &env.bita)));
-    if let Some(((id, name), source)) = found {
-        let key = bita_key(store, id, cwd, &env.bita);
-        return Project { slug: text::slugify(&name), name: Some(name), bita_id: Some(id), key, source: source.into(), repo: slug };
+        .or_else(|| slug.as_deref().and_then(|s| from_scope_mapping(&env.bita_config, s)).map(|f| (f, "scope-mapping")));
+    if let Some(found) = configured {
+        return bita_project(found);
     }
     let toml = match &root {
         Some(root) => from_gaze_toml(root),
@@ -276,10 +350,23 @@ fn resolve_with(store: &Store, cwd: &Path, env: &Resolver) -> Project {
     if let Some(project) = toml {
         return Project { slug: project, name: None, bita_id: None, key: None, source: "gaze.toml".into(), repo: slug };
     }
+    if env.auto
+        && let Some(found) = slug.as_deref().and_then(|s| auto_scope(store, cwd, s, env))
+    {
+        return bita_project(found);
+    }
     Project { repo: slug, ..Project::global("default") }
 }
 
 pub fn resolve(store: &Store, cwd: &Path, refresh: bool) -> Result<Project> {
+    resolve_env(store, cwd, refresh, &Resolver::from_env(true))
+}
+
+pub fn resolve_fast(store: &Store, cwd: &Path) -> Result<Project> {
+    resolve_env(store, cwd, false, &Resolver::from_env(false))
+}
+
+fn resolve_env(store: &Store, cwd: &Path, refresh: bool, env: &Resolver) -> Result<Project> {
     if let Ok(forced) = std::env::var("GAZE_PROJECT")
         && !forced.trim().is_empty()
     {
@@ -304,7 +391,7 @@ pub fn resolve(store: &Store, cwd: &Path, refresh: bool) -> Result<Project> {
             return Ok(Project { slug, name, bita_id, key: project_key, source: format!("cache:{source}"), repo: None });
         }
     }
-    let project = resolve_uncached(store, &cwd);
+    let project = resolve_with(store, &cwd, env);
     remember_project(store, &project);
     store.conn.execute(
         "INSERT INTO project_cache (cwd, project, source, resolved_at) VALUES (?1, ?2, ?3, ?4)
@@ -440,10 +527,93 @@ mod tests {
         assert_eq!(suggest_scope("gitlab.com/acme/logistica-norte", &list).map(|s| s.1), Some(1));
         assert_eq!(suggest_scope("gitlab.com/acme/appone", &list).map(|s| s.1), Some(2));
         assert_eq!(suggest_scope("gitlab.com/acme/app", &list), None);
-        assert_eq!(suggest_scope("gitlab.com/zip/x", &list).map(|s| (s.0, s.1)), Some(("gitlab.com/zip".into(), 4)));
+        assert_eq!(suggest_scope("gitlab.com/zip/x", &list), None);
         assert_eq!(suggest_scope("gitlab.com/log/x", &list), None);
         let twins = projects(&[(5, "Apartados Web"), (6, "Apartados Api")]);
         assert_eq!(suggest_scope("gitlab.com/zip/apartados", &[twins.clone(), list.clone()].concat()), None);
+    }
+
+    #[test]
+    fn suggest_scope_ignores_generic_segments() {
+        let generic = projects(&[(1, "DevOps Platform"), (3, "Api Gateway")]);
+        assert_eq!(suggest_scope("gitlab.com/acme/devops", &generic), None);
+        assert_eq!(suggest_scope("gitlab.com/acme/api", &generic), None);
+        assert_eq!(suggest_scope("gitlab.com/acme/platform", &generic), None);
+        let list = projects(&[(1, "DevOps Platform"), (2, "Acme Infra"), (3, "Api Gateway")]);
+        assert_eq!(suggest_scope("gitlab.com/acme/devops/x", &list).map(|s| (s.0, s.1)), Some(("gitlab.com/acme".into(), 2)));
+    }
+
+    #[test]
+    fn suggest_scope_ignores_short_exact_names() {
+        let list = projects(&[(1, "Den"), (2, "DP")]);
+        assert_eq!(suggest_scope("gitlab.com/den", &list), None);
+        assert_eq!(suggest_scope("gitlab.com/dp/x", &list), None);
+    }
+
+    #[test]
+    fn suggest_scope_prefixes_stop_at_word_boundaries() {
+        let list = projects(&[(1, "Vivaaerobus"), (2, "Viva Aerobus Ops"), (3, "Doters SSO Legacy")]);
+        let glued = projects(&[(1, "Vivaaerobus")]);
+        assert_eq!(suggest_scope("gitlab.com/acme/viva", &glued), None);
+        assert_eq!(suggest_scope("gitlab.com/acme/vivaaero", &list), None);
+        assert_eq!(suggest_scope("gitlab.com/acme/viva", &list).map(|s| s.1), Some(2));
+        assert_eq!(suggest_scope("gitlab.com/acme/vivaaerobus", &list).map(|s| s.1), Some(1));
+        assert_eq!(suggest_scope("gitlab.com/acme/doters-sso", &list).map(|s| s.1), Some(3));
+        assert_eq!(suggest_scope("gitlab.com/acme/doters-ss", &list), None);
+        let single = projects(&[(2, "Viva Aerobus Ops")]);
+        assert_eq!(suggest_scope("gitlab.com/acme/vivaaerobus", &single).map(|s| s.1), Some(2));
+    }
+
+    fn fake_bita(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = dir.join("calls");
+        let script = dir.join("bita");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$1\" in\nprojects) echo '{{\"ok\":true,\"data\":[{{\"id\":7,\"name\":\"KikeDeAlba Modules\",\"key\":\"KM\"}}]}}' ;;\nscope) echo '{{\"ok\":true}}' ;;\nesac\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, calls)
+    }
+
+    fn calls_of(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn gaze_toml_wins_over_the_automatic_scope() {
+        let store = Store::in_memory().unwrap();
+        let (dir, home, folder) = fake_home();
+        let (script, calls) = fake_bita(dir.path());
+        std::fs::write(folder.join("gaze.toml"), "project = \"Mi Carpeta\"\n").unwrap();
+        let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json"), auto: true, log: None };
+        let resolved = resolve_with(&store, &folder, &env);
+        assert_eq!(resolved.slug, "mi-carpeta");
+        assert_eq!(resolved.source, "gaze.toml");
+        assert!(!calls_of(&calls).contains("scope set"));
+    }
+
+    #[test]
+    fn fast_resolution_skips_bita_projects_and_scope_set_but_caches() {
+        let store = Store::in_memory().unwrap();
+        let (dir, home, folder) = fake_home();
+        let (script, calls) = fake_bita(dir.path());
+        let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json"), auto: false, log: None };
+        let fast = resolve_env(&store, &folder, false, &env).unwrap();
+        assert_eq!(fast.slug, GLOBAL);
+        assert_eq!(fast.repo.as_deref(), Some("github.com/kikedealba"));
+        let logged = calls_of(&calls);
+        assert!(!logged.contains("projects"), "{logged}");
+        assert!(!logged.contains("scope"), "{logged}");
+        assert_eq!(resolve_env(&store, &folder, false, &env).unwrap().source, "cache:default");
+        let full = Resolver { auto: true, ..env };
+        let refreshed = resolve_env(&store, &folder, true, &full).unwrap();
+        assert_eq!(refreshed.slug, "kikedealba-modules");
+        assert_eq!(resolve_env(&store, &folder, false, &full).unwrap().slug, "kikedealba-modules");
     }
 
     #[test]
@@ -461,7 +631,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let config = dir.path().join("config.json");
         std::fs::write(&config, json!({"scopeMapping": {"github.com/kikedealba/gaze": {"projectId": 8, "projectName": "Gaze"}}}).to_string()).unwrap();
-        let env = Resolver { home, bita: "/nonexistent/bita".into(), bita_config: config };
+        let env = Resolver { home, bita: "/nonexistent/bita".into(), bita_config: config, auto: true, log: None };
         let resolved = resolve_with(&store, &nested, &env);
         assert_eq!(resolved.slug, "gaze");
         assert_eq!(resolved.source, "scope-mapping");
@@ -474,7 +644,7 @@ mod tests {
         let (dir, home, folder) = fake_home();
         let config = dir.path().join("config.json");
         std::fs::write(&config, json!({"scopeMapping": {"github.com/kikedealba": {"projectId": 7, "projectName": "KikeDeAlba Modules"}}}).to_string()).unwrap();
-        let env = Resolver { home, bita: "/nonexistent/bita".into(), bita_config: config };
+        let env = Resolver { home, bita: "/nonexistent/bita".into(), bita_config: config, auto: true, log: None };
         let resolved = resolve_with(&store, &folder, &env);
         assert_eq!(resolved.slug, "kikedealba-modules");
         assert_eq!(resolved.source, "scope-mapping");
@@ -498,7 +668,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json") };
+        let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json"), auto: true, log: None };
         let resolved = resolve_with(&store, &folder, &env);
         assert_eq!(resolved.slug, "kikedealba-modules");
         assert_eq!(resolved.source, "auto-scope");
@@ -512,7 +682,7 @@ mod tests {
         let (dir, home, folder) = fake_home();
         std::fs::create_dir_all(folder.join("notes")).unwrap();
         std::fs::write(home.join("dev/gaze.toml"), "project = \"Dev Wide\"\n").unwrap();
-        let env = Resolver { home: home.clone(), bita: "/nonexistent/bita".into(), bita_config: dir.path().join("missing.json") };
+        let env = Resolver { home: home.clone(), bita: "/nonexistent/bita".into(), bita_config: dir.path().join("missing.json"), auto: true, log: None };
         let resolved = resolve_with(&store, &folder.join("notes"), &env);
         assert_eq!(resolved.slug, "dev-wide");
         assert_eq!(resolved.source, "gaze.toml");

@@ -672,6 +672,9 @@ mod tests {
         assert_eq!(harvest_target(&store, Some("global"), "den"), GLOBAL);
         assert_eq!(harvest_target(&store, Some("kikedealba-modules"), "den"), "kikedealba-modules");
         assert_eq!(harvest_target(&store, Some("KM"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("km"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("Km"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("DP"), "den"), "dp");
         assert_eq!(harvest_target(&store, Some("Kike Modules"), "den"), "kikedealba-modules");
         assert_eq!(harvest_target(&store, Some("dp"), "den"), "dp");
         assert_eq!(harvest_target(&store, Some("invented-project"), "den"), "den");

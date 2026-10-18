@@ -447,6 +447,28 @@ mod tests {
     }
 
     #[test]
+    fn suggest_scope_never_matches_the_host_segment() {
+        let list = projects(&[(1, "Github Com"), (2, "Github")]);
+        assert_eq!(suggest_scope("github.com/zzzz", &list), None);
+        assert_eq!(suggest_scope("github/zzzz", &list), None);
+    }
+
+    #[test]
+    fn repo_without_remote_resolves_from_nested_directories() {
+        let store = Store::in_memory().unwrap();
+        let (dir, home, folder) = fake_home();
+        let nested = folder.join("gaze/src/deep/er");
+        std::fs::create_dir_all(&nested).unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, json!({"scopeMapping": {"github.com/kikedealba/gaze": {"projectId": 8, "projectName": "Gaze"}}}).to_string()).unwrap();
+        let env = Resolver { home, bita: "/nonexistent/bita".into(), bita_config: config };
+        let resolved = resolve_with(&store, &nested, &env);
+        assert_eq!(resolved.slug, "gaze");
+        assert_eq!(resolved.source, "scope-mapping");
+        assert_eq!(resolved.repo.as_deref(), Some("github.com/kikedealba/gaze"));
+    }
+
+    #[test]
     fn folder_outside_a_repo_uses_the_scope_mapping() {
         let store = Store::in_memory().unwrap();
         let (dir, home, folder) = fake_home();

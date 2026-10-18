@@ -429,7 +429,7 @@ fn run(command: Command) -> Result<Output> {
                 return Err(usage("--source debe ser inkwell, recap, bita o all"));
             }
             if source == "all" || source == "inkwell" {
-                reports.push(serde_json::to_value(ingest::ingest_inkwell(&store, &emb, &paths::inkwell_docs(), true)?)?);
+                reports.push(serde_json::to_value(ingest::ingest_inkwell(&store, &emb, &paths::inkwell_docs(), true, &project::bita_bin())?)?);
             }
             if source == "all" || source == "recap" {
                 reports.push(serde_json::to_value(ingest::ingest_recap(&store, &emb)?)?);

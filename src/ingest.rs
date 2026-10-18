@@ -124,15 +124,15 @@ fn known_project(store: &Store, slug: &str) -> bool {
 }
 
 fn prefix_project(store: &Store, folder: &str) -> Option<String> {
-    let target = project::normalize_name(folder);
+    let target = project::name_tokens(folder);
     let mut stmt = store.conn.prepare("SELECT slug, COALESCE(name, slug) FROM projects WHERE slug != ?1").ok()?;
     let rows: Vec<(String, String)> = stmt.query_map([GLOBAL], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.flatten().collect();
     let matches: Vec<(usize, String)> = rows
         .into_iter()
         .filter_map(|(slug, name)| {
-            let normalized = project::normalize_name(&name);
-            let length = normalized.chars().count();
-            (length >= 4 && target.starts_with(&normalized)).then_some((length, slug))
+            let tokens = project::name_tokens(&name);
+            let length = project::normalize_name(&name).chars().count();
+            (length >= 4 && !tokens.is_empty() && target.starts_with(&tokens)).then_some((length, slug))
         })
         .collect();
     let longest = matches.iter().map(|(length, _)| *length).max()?;
@@ -210,7 +210,8 @@ pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path)
     Ok(Some((outcome.id, outcome.action)))
 }
 
-pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: bool) -> Result<IngestReport> {
+pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: bool, bita: &str) -> Result<IngestReport> {
+    let _ = project::refresh_projects_with(store, root, bita);
     let mut report = IngestReport { source: "inkwell".into(), ..Default::default() };
     let mut files = Vec::new();
     walk_md(root, &mut files);
@@ -448,6 +449,32 @@ mod tests {
     }
 
     #[test]
+    fn folder_prefixes_match_only_on_word_boundaries() {
+        let store = store_with_projects();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name) VALUES ('viva', 7, 'Viva')", []).unwrap();
+        let spaces = HashMap::new();
+        assert_eq!(folder_project(&store, &spaces, "vivalavida"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "viva-la-vida"), "viva");
+        assert_eq!(folder_project(&store, &spaces, "apartados-remediacion"), "apartados");
+        assert_eq!(folder_project(&store, &spaces, "apartadosremediacion"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "dp-personalizationx"), GLOBAL);
+    }
+
+    #[test]
+    fn inkwell_ingest_refreshes_bita_projects_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bita");
+        std::fs::write(&script, "#!/bin/sh\necho '{\"ok\":true,\"data\":[{\"id\":42,\"name\":\"Linked Space\",\"key\":\"LS\"}]}'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        ingest_inkwell(&store, &FakeEmbedder, &root, false, &script.to_string_lossy()).unwrap();
+        assert_eq!(project::project_for_bita_id(&store, 42).as_deref(), Some("linked-space"));
+    }
+
+    #[test]
     fn inkwell_entries_without_a_folder_project_follow_their_frontmatter() {
         let store = store_with_projects();
         let e = FakeEmbedder;
@@ -499,9 +526,9 @@ mod tests {
             "---\nbita: 1\nentryId: 914\ntitle: TC 07\nproject: DP\nday: 2026-10-16\nduration: 1h\njira: DD-1905\n---\n\n# TC 07\n\n## Contexto\n\n## Qué se hizo\n",
         )
         .unwrap();
-        let report = ingest_inkwell(&store, &e, root, false).unwrap();
+        let report = ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap();
         assert_eq!((report.scanned, report.created), (2, 2));
-        let again = ingest_inkwell(&store, &e, root, false).unwrap();
+        let again = ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap();
         assert_eq!(again.unchanged, 2);
         let entry = store.by_source_ref("inkwell:dp-personalization/2026/10/16-914-tc.md").unwrap().unwrap();
         assert_eq!(entry.kind, "entry");
@@ -513,7 +540,7 @@ mod tests {
         let bita_node = result["node"]["id"].as_str().unwrap().to_string();
         assert!(store.neighbors(&bita_node).unwrap().iter().any(|n| n.id == entry.id && n.edge_kind == "same-entry"));
         std::fs::remove_file(root.join("dp-personalization/infra.md")).unwrap();
-        assert_eq!(ingest_inkwell(&store, &e, root, false).unwrap().removed, 1);
+        assert_eq!(ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap().removed, 1);
         let deleted = bita_event(&store, &e, &json!({"event": "delete", "entry": {"id": 914}})).unwrap();
         assert_eq!(deleted["removed"], true);
     }

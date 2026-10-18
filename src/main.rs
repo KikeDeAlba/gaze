@@ -407,7 +407,10 @@ fn run(command: Command) -> Result<Output> {
                 GroupAction::Rm { name } => {
                     let name = text::slugify(&name);
                     let removed = store.remove_group(&name)?;
-                    Ok(Output::new(json!({"name": name, "removed": removed}), if removed { format!("Grupo {name} borrado.") } else { format!("No existe el grupo {name}.") }))
+                    Ok(Output::new(
+                        json!({"name": name, "removed": removed}),
+                        if removed { format!("Grupo {name} borrado.") } else { format!("No existe el grupo {name}.") },
+                    ))
                 }
             }
         }
@@ -426,7 +429,7 @@ fn run(command: Command) -> Result<Output> {
                 return Err(usage("--source debe ser inkwell, recap, bita o all"));
             }
             if source == "all" || source == "inkwell" {
-                reports.push(serde_json::to_value(ingest::ingest_inkwell(&store, &emb, &paths::inkwell_docs(), true)?)?);
+                reports.push(serde_json::to_value(ingest::ingest_inkwell(&store, &emb, &paths::inkwell_docs(), true, &project::bita_bin())?)?);
             }
             if source == "all" || source == "recap" {
                 reports.push(serde_json::to_value(ingest::ingest_recap(&store, &emb)?)?);
@@ -604,7 +607,7 @@ fn main() {
         }
         Command::BitaHook => {
             let input = hooks::read_input();
-            let result = Store::open_default().and_then(|store| ingest::bita_event(&store, &embedder(), &input));
+            let result = Store::open_default().and_then(|store| ingest::bita_event(&store, &embedder(), &input, &project::bita_bin()));
             match result {
                 Ok(value) => println!("{} bita-hook {value}", text::now_iso()),
                 Err(error) => {

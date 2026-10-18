@@ -44,6 +44,8 @@ gaze ingest                 # inkwell (páginas y notas de entradas) y recap (mi
 gaze ingest --source inkwell
 ```
 
+Las carpetas de inkwell sin vínculo con bita nunca crean un proyecto: se asignan a un proyecto o grupo conocido; si no, al proyecto conocido cuyo nombre normalizado sea el prefijo más largo del nombre de la carpeta; si no, a `global`. Las entradas que caen en `global` usan el `project`/`projectId` del frontmatter si es conocido.
+
 Es incremental por fecha de modificación. Las entradas de bita llegan solas por eventos (`gaze bita-hook`, suscrito a `stop`, `amend` y `delete`).
 
 ### Apagar la memoria automática de Claude
@@ -109,7 +111,19 @@ Tipos de nota: `rule`, `fact`, `decision`, `doc`, `entry`, `issue`, `meeting`, `
 
 ## Cómo resuelve el proyecto
 
-Para un directorio: `bita repo which --json` si existe; si no, el remoto `origin` contra el `scopeMapping` de `~/.config/bita/config.json` (el prefijo más largo); si no, `gaze.toml` en la raíz del repo (`project = "Nombre"`); si no, `global`. El nombre del proyecto se guarda como slug (igual que las carpetas de inkwell) y el resultado se cachea 24 horas en la base. `GAZE_PROJECT` lo fuerza.
+Para un directorio, en este orden (gana el primero que acierta):
+
+1. `GAZE_PROJECT`.
+2. Caché en la base: 24 horas; 1 hora si el resultado fue `global`.
+3. `bita repo which --json`, solo dentro de un repo.
+4. `scopeMapping` de `~/.config/bita/config.json` (el prefijo más largo) con el slug del directorio: el remoto `origin`; sin remoto, o en una carpeta sin repo, la ruta relativa a `~/dev` en minúsculas (`~/dev/github.com/KikeDeAlba` → `github.com/kikedealba`).
+5. `gaze.toml` (`project = "Nombre"`) en la raíz del repo; sin repo, se busca hacia arriba dentro de `~/dev`.
+6. Scope automático: compara los segmentos del slug (del más profundo al más superficial, sin el host) con los nombres de proyecto de bita. Ignora los segmentos de menos de 4 caracteres y los genéricos (`api`, `apps`, `web`, `core`, `shared`, `services`, `devops`, `infra`, `platform`, `docs`, `frontend`, `backend`, `modules`, `tools`, `test`, entre otros). Acierta si el nombre normalizado (sin acentos, espacios, `-` ni `_`) es igual al segmento, o si el nombre empieza con el segmento en frontera de palabra (`doters-sso` → «Doters SSO Legacy», `kikedealba` → «KikeDeAlba Modules»; `viva` no acierta con «Vivaaerobus»), y el resultado es único. Lo registra con `bita scope set <prefijo> <id>` (fuente `auto-scope`; `suggestion` si bita falla) y lo anota en `harvest.log`.
+7. `global`.
+
+Los hooks (inicio de sesión y prompt) no corren el scope automático ni `bita projects`, para no pasarse de su tiempo límite: si su resolución da `global` sin caché, lanzan en segundo plano `gaze project --cwd <dir> --refresh`, que sí lo corre y deja el resultado en el caché para el siguiente prompt o sesión. `gaze project` y la cosecha usan la resolución completa.
+
+El nombre del proyecto se guarda como slug (igual que las carpetas de inkwell). Si el caché quedó viejo, `gaze project --refresh` lo ignora y lo rehace.
 
 ## Grupos de proyectos
 
@@ -165,7 +179,7 @@ Los umbrales están calibrados para `multilingual-e5-small`, que comprime las si
 claude -p --model haiku --output-format json --tools "" --strict-mcp-config --no-session-persistence --disable-slash-commands
 ```
 
-con `GAZE_HARVEST=1`, que apaga todos los hooks de gaze en esa sesión hija. Lo que devuelve se guarda con deduplicación y queda en `~/.local/share/gaze/harvest.log`.
+con `GAZE_HARVEST=1`, que apaga todos los hooks de gaze en esa sesión hija. El prompt incluye los proyectos conocidos (tabla de proyectos y grupos). Cada nota va al proyecto de la carpeta, salvo que el modelo la atribuya a otro proyecto conocido o a `global`; un nombre desconocido cae al proyecto de la carpeta. Lo que devuelve se guarda con deduplicación y queda en `~/.local/share/gaze/harvest.log`.
 
 ## Desarrollo
 

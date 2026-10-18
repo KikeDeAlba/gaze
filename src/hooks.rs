@@ -132,7 +132,7 @@ pub fn session_context(rules: &[Node], budget: usize) -> String {
 pub fn session_start(store: &Store, input: &Value) -> Result<Option<Value>> {
     let started = Instant::now();
     let cwd = input_cwd(input);
-    let project = project::resolve(store, &cwd, false)?;
+    let project = resolve_for_hook(store, &cwd)?;
     let rules = store.active_rules(&project.slug)?;
     let context = session_context(&rules, store.cfg.hooks.rules_tokens);
     let ids: Vec<String> = rules.iter().map(|r| r.id.clone()).collect();
@@ -237,6 +237,24 @@ fn spawn_daemon() {
     }
 }
 
+pub fn needs_background_refresh(project: &project::Project) -> bool {
+    project.slug == GLOBAL && project.repo.is_some() && !project.source.starts_with("cache:") && project.source != "env"
+}
+
+fn resolve_for_hook(store: &Store, cwd: &Path) -> Result<project::Project> {
+    let project = project::resolve_fast(store, cwd)?;
+    if !cfg!(test)
+        && needs_background_refresh(&project)
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let mut command = Command::new(exe);
+        command.args(["project", "--refresh", "--cwd"]).arg(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        detach(&mut command);
+        let _ = command.spawn();
+    }
+    Ok(project)
+}
+
 pub fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
@@ -250,7 +268,7 @@ pub fn prompt(store: &Store, input: &Value) -> Result<Option<Value>> {
         return Ok(None);
     }
     let cwd = input_cwd(input);
-    let project = project::resolve(store, &cwd, false)?;
+    let project = resolve_for_hook(store, &cwd)?;
     let session = session_id(input);
     let already = store.injected(&session)?;
 
@@ -363,17 +381,51 @@ pub fn transcript_text(path: &Path, skip_lines: usize) -> Result<(String, usize)
     Ok((out, count))
 }
 
-pub fn harvest_prompt(project: &str, transcript: &str) -> String {
+pub fn known_projects(store: &Store) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = store.conn.prepare("SELECT slug, name, key FROM projects WHERE slug != ?1 ORDER BY slug")
+        && let Ok(rows) = stmt.query_map([GLOBAL], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))
+    {
+        for (slug, name, key) in rows.flatten() {
+            let parts: Vec<String> = [Some(slug), name, key].into_iter().flatten().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+            out.push(parts.join(" · "));
+        }
+    }
+    if let Ok(mut stmt) = store.conn.prepare("SELECT DISTINCT name FROM project_groups WHERE name != ?1 ORDER BY name")
+        && let Ok(rows) = stmt.query_map([GLOBAL], |r| r.get::<_, String>(0))
+    {
+        out.extend(rows.flatten().map(|name| format!("{name} (grupo)")));
+    }
+    out
+}
+
+pub fn harvest_prompt(project: &str, known: &[String], transcript: &str) -> String {
+    let known = if known.is_empty() {
+        String::new()
+    } else {
+        format!("Proyectos conocidos:\n{}\n\n", known.iter().map(|k| format!("- {k}")).collect::<Vec<_>>().join("\n"))
+    };
     format!(
         "Extrae aprendizajes DURADEROS de esta conversación de trabajo (proyecto: {project}). \
 Solo: decisiones tomadas, correcciones del usuario, convenciones del proyecto, datos del cliente o de infraestructura. \
 Nada efímero (estado de la tarea, pasos ya hechos, errores resueltos sin lección, saludos). \
 Cada nota atómica: un solo hecho, autocontenida, en el idioma de la conversación, título corto, cuerpo de 1 a 3 frases; usa [[Título]] para enlazar notas relacionadas. \
 kind: decision | fact | rule (rule solo si el usuario dio una instrucción permanente). \
-project: omítelo salvo que el hecho sea general del usuario (usa \"global\"). \
+project: omítelo salvo que el hecho sea claramente de otro proyecto de la lista de proyectos conocidos (usa su slug) o general del usuario (usa \"global\"). \
 Responde SOLO un arreglo JSON: [{{\"kind\":\"...\",\"title\":\"...\",\"body\":\"...\",\"project\":\"...\"}}]. Si no hay nada durable, responde [].\n\n\
-<conversation>\n{transcript}\n</conversation>"
+{known}<conversation>\n{transcript}\n</conversation>"
     )
+}
+
+pub fn harvest_target(store: &Store, item_project: Option<&str>, default: &str) -> String {
+    let Some(name) = item_project.map(str::trim).filter(|p| !p.is_empty()) else { return default.to_string() };
+    if name == GLOBAL {
+        return GLOBAL.to_string();
+    }
+    let slug = project::project_for_name(store, name);
+    let known =
+        store.conn.query_row("SELECT 1 FROM projects WHERE slug = ?1 UNION SELECT 1 FROM project_groups WHERE name = ?1 LIMIT 1", [&slug], |_| Ok(())).is_ok();
+    if known { slug } else { default.to_string() }
 }
 
 pub fn parse_learnings(raw: &str) -> Vec<Value> {
@@ -404,7 +456,7 @@ pub fn harvest_run(store: &Store, emb: &dyn Embedder, transcript: &Path, session
     let chars: Vec<char> = conversation.chars().collect();
     let tail: String = chars[chars.len().saturating_sub(cfg.max_chars)..].iter().collect();
     let project = project::resolve(store, cwd, false)?;
-    let prompt = harvest_prompt(&project.slug, &tail);
+    let prompt = harvest_prompt(&project.slug, &known_projects(store), &tail);
     let claude = std::env::var("GAZE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let mut child = Command::new(&claude)
         .args([
@@ -454,10 +506,7 @@ pub fn harvest_run(store: &Store, emb: &dyn Embedder, transcript: &Path, session
         let kind = item["kind"].as_str().unwrap_or("fact");
         let kind = if ["decision", "fact", "rule"].contains(&kind) { kind } else { "fact" };
         let Some(body) = item["body"].as_str().filter(|b| b.trim().len() > 10) else { continue };
-        let target = match item["project"].as_str().map(str::trim).filter(|p| !p.is_empty()) {
-            Some(GLOBAL) => GLOBAL.to_string(),
-            _ => project.slug.clone(),
-        };
+        let target = harvest_target(store, item["project"].as_str(), &project.slug);
         let outcome = store.remember(
             emb,
             NewNode {
@@ -521,6 +570,15 @@ mod tests {
         assert!(context.contains("reglas más: gaze rule ls"));
         assert!(context.starts_with(BRAIN_LINE));
         assert_eq!(session_context(&[], 300), BRAIN_LINE);
+    }
+
+    #[test]
+    fn only_fresh_global_resolutions_with_a_slug_refresh_in_background() {
+        let fresh = project::Project { repo: Some("github.com/kikedealba".into()), ..project::Project::global("default") };
+        assert!(needs_background_refresh(&fresh));
+        assert!(!needs_background_refresh(&project::Project { source: "cache:default".into(), ..fresh.clone() }));
+        assert!(!needs_background_refresh(&project::Project { repo: None, ..fresh.clone() }));
+        assert!(!needs_background_refresh(&project::Project { slug: "gaze".into(), ..fresh }));
     }
 
     #[test]
@@ -622,5 +680,48 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["kind"], "decision");
         assert!(parse_learnings("{\"result\":\"nada\"}").is_empty());
+    }
+
+    fn store_with_projects() -> Store {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name, key) VALUES ('kikedealba-modules', 1, 'Kike Modules', 'KM')", []).unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name, key) VALUES ('bare', 2, NULL, NULL)", []).unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name, key) VALUES ('global', 3, 'Global', 'GL')", []).unwrap();
+        store.set_group("dp", &["app-dp-v2".into(), "dportenis".into()]).unwrap();
+        store
+    }
+
+    #[test]
+    fn harvest_target_accepts_only_known_projects() {
+        let store = store_with_projects();
+        assert_eq!(harvest_target(&store, None, "den"), "den");
+        assert_eq!(harvest_target(&store, Some("  "), "den"), "den");
+        assert_eq!(harvest_target(&store, Some("global"), "den"), GLOBAL);
+        assert_eq!(harvest_target(&store, Some("kikedealba-modules"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("KM"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("km"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("Km"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("DP"), "den"), "dp");
+        assert_eq!(harvest_target(&store, Some("Kike Modules"), "den"), "kikedealba-modules");
+        assert_eq!(harvest_target(&store, Some("dp"), "den"), "dp");
+        assert_eq!(harvest_target(&store, Some("invented-project"), "den"), "den");
+    }
+
+    #[test]
+    fn known_projects_lists_rows_and_groups_without_global() {
+        let store = store_with_projects();
+        let known = known_projects(&store);
+        assert_eq!(known, vec!["bare".to_string(), "kikedealba-modules · Kike Modules · KM".into(), "dp (grupo)".into()]);
+    }
+
+    #[test]
+    fn harvest_prompt_includes_known_projects_and_transcript() {
+        let known = vec!["kikedealba-modules · Kike Modules · KM".to_string(), "dp (grupo)".into()];
+        let prompt = harvest_prompt("den", &known, "USER: hola");
+        assert!(prompt.contains("Proyectos conocidos:\n- kikedealba-modules · Kike Modules · KM\n- dp (grupo)"));
+        assert!(prompt.contains("<conversation>\nUSER: hola\n</conversation>"));
+        let bare = harvest_prompt("den", &[], "USER: hola");
+        assert!(!bare.contains("Proyectos conocidos"));
+        assert!(bare.contains("<conversation>\nUSER: hola\n</conversation>"));
     }
 }

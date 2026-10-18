@@ -286,10 +286,13 @@ fn known_projects(store: &Store) -> Vec<(i64, String)> {
 }
 
 fn auto_scope(store: &Store, cwd: &Path, slug: &str, env: &Resolver) -> Option<((i64, String), &'static str)> {
-    let (prefix, id, name) = suggest_scope(slug, &known_projects(store)).or_else(|| {
-        refresh_projects_with(store, cwd, &env.bita)?;
-        suggest_scope(slug, &known_projects(store))
-    })?;
+    let candidates: Vec<(i64, String)> = match refresh_projects_with(store, cwd, &env.bita) {
+        Some(list) => {
+            list.iter().filter_map(|p| Some((p["id"].as_i64()?, p["name"].as_str()?.to_string()))).filter(|(_, name)| text::slugify(name) != GLOBAL).collect()
+        }
+        None => known_projects(store),
+    };
+    let (prefix, id, name) = suggest_scope(slug, &candidates)?;
     let id_arg = id.to_string();
     let saved = run_json(&env.bita, &["scope", "set", &prefix, &id_arg, "--json"], cwd, Duration::from_secs(5)).is_some_and(|v| v["ok"] == Value::Bool(true));
     let source = if saved { "auto-scope" } else { "suggestion" };
@@ -564,15 +567,18 @@ mod tests {
         assert_eq!(suggest_scope("gitlab.com/acme/vivaaerobus", &single).map(|s| s.1), Some(2));
     }
 
-    fn fake_bita(dir: &Path) -> (PathBuf, PathBuf) {
+    const KIKE_MODULES: &str = r#"[{"id":7,"name":"KikeDeAlba Modules","key":"KM"}]"#;
+
+    fn fake_bita(dir: &Path, projects: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let calls = dir.join("calls");
         let script = dir.join("bita");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$1\" in\nprojects) echo '{{\"ok\":true,\"data\":[{{\"id\":7,\"name\":\"KikeDeAlba Modules\",\"key\":\"KM\"}}]}}' ;;\nscope) echo '{{\"ok\":true}}' ;;\nesac\n",
-                calls.display()
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$1\" in\nprojects) echo '{{\"ok\":true,\"data\":{}}}' ;;\nscope) echo '{{\"ok\":true}}' ;;\nesac\n",
+                calls.display(),
+                projects
             ),
         )
         .unwrap();
@@ -585,10 +591,26 @@ mod tests {
     }
 
     #[test]
+    fn automatic_scope_uses_the_fresh_bita_list_over_a_partial_table() {
+        let store = Store::in_memory().unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name) VALUES ('apartados-web', 5, 'Apartados Web')", []).unwrap();
+        let (dir, home, _) = fake_home();
+        let folder = home.join("dev/gitlab.com/acme/apartados");
+        std::fs::create_dir_all(&folder).unwrap();
+        let (script, calls) = fake_bita(dir.path(), r#"[{"id":5,"name":"Apartados Web"},{"id":6,"name":"Apartados Api"}]"#);
+        let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json"), auto: true, log: None };
+        let resolved = resolve_with(&store, &folder, &env);
+        assert_eq!(resolved.slug, GLOBAL);
+        let logged = calls_of(&calls);
+        assert!(logged.contains("projects"), "{logged}");
+        assert!(!logged.contains("scope set"), "{logged}");
+    }
+
+    #[test]
     fn gaze_toml_wins_over_the_automatic_scope() {
         let store = Store::in_memory().unwrap();
         let (dir, home, folder) = fake_home();
-        let (script, calls) = fake_bita(dir.path());
+        let (script, calls) = fake_bita(dir.path(), KIKE_MODULES);
         std::fs::write(folder.join("gaze.toml"), "project = \"Mi Carpeta\"\n").unwrap();
         let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json"), auto: true, log: None };
         let resolved = resolve_with(&store, &folder, &env);
@@ -601,7 +623,7 @@ mod tests {
     fn fast_resolution_skips_bita_projects_and_scope_set_but_caches() {
         let store = Store::in_memory().unwrap();
         let (dir, home, folder) = fake_home();
-        let (script, calls) = fake_bita(dir.path());
+        let (script, calls) = fake_bita(dir.path(), KIKE_MODULES);
         let env = Resolver { home, bita: script.to_string_lossy().into(), bita_config: dir.path().join("missing.json"), auto: false, log: None };
         let fast = resolve_env(&store, &folder, false, &env).unwrap();
         assert_eq!(fast.slug, GLOBAL);

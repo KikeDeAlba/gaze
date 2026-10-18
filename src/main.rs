@@ -407,7 +407,10 @@ fn run(command: Command) -> Result<Output> {
                 GroupAction::Rm { name } => {
                     let name = text::slugify(&name);
                     let removed = store.remove_group(&name)?;
-                    Ok(Output::new(json!({"name": name, "removed": removed}), if removed { format!("Grupo {name} borrado.") } else { format!("No existe el grupo {name}.") }))
+                    Ok(Output::new(
+                        json!({"name": name, "removed": removed}),
+                        if removed { format!("Grupo {name} borrado.") } else { format!("No existe el grupo {name}.") },
+                    ))
                 }
             }
         }

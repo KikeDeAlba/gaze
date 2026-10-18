@@ -607,7 +607,7 @@ fn main() {
         }
         Command::BitaHook => {
             let input = hooks::read_input();
-            let result = Store::open_default().and_then(|store| ingest::bita_event(&store, &embedder(), &input));
+            let result = Store::open_default().and_then(|store| ingest::bita_event(&store, &embedder(), &input, &project::bita_bin()));
             match result {
                 Ok(value) => println!("{} bita-hook {value}", text::now_iso()),
                 Err(error) => {

@@ -327,7 +327,7 @@ fn touched_files(database: &str, entry: i64) -> Vec<String> {
     stmt.query_map([entry], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
 }
 
-pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value) -> Result<Value> {
+pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value, bita: &str) -> Result<Value> {
     let name = event["event"].as_str().unwrap_or_default();
     let entry = &event["entry"];
     let Some(id) = entry["id"].as_i64() else { return Ok(json!({"skipped": "no entry"})) };
@@ -344,6 +344,11 @@ pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value) -> Result<Va
     }
     if !(name == "stop" || name == "amend") || entry["running"] == json!(true) {
         return Ok(json!({"event": name, "entry": id, "skipped": true}));
+    }
+    if let Some(pid) = entry["projectId"].as_i64()
+        && project::project_for_bita_id(store, pid).is_none()
+    {
+        let _ = project::refresh_projects_with(store, Path::new("/"), bita);
     }
     let project = entry["projectId"]
         .as_i64()
@@ -461,6 +466,30 @@ mod tests {
     }
 
     #[test]
+    fn bita_events_refresh_projects_when_the_entry_project_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let script = dir.path().join("bita");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\necho '{{\"ok\":true,\"data\":[{{\"id\":77,\"name\":\"Nuevo Cliente\"}}]}}'\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = script.to_string_lossy().to_string();
+        let event = json!({"event": "stop", "entry": {"id": 5, "description": "Arranque", "projectId": 77, "projectName": "Nuevo Cliente"}});
+        let result = bita_event(&store, &FakeEmbedder, &event, &bin).unwrap();
+        let node = store.get(result["node"]["id"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(node.project, "nuevo-cliente");
+        assert_eq!(project::project_for_bita_id(&store, 77).as_deref(), Some("nuevo-cliente"));
+        let again = json!({"event": "stop", "entry": {"id": 6, "description": "Otra", "projectId": 77}});
+        bita_event(&store, &FakeEmbedder, &again, &bin).unwrap();
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    }
+
+    #[test]
     fn inkwell_ingest_refreshes_bita_projects_first() {
         use std::os::unix::fs::PermissionsExt;
         let store = Store::in_memory().unwrap();
@@ -536,12 +565,12 @@ mod tests {
         let page = store.by_source_ref("inkwell:dp-personalization/infra.md").unwrap().unwrap();
         assert!(store.neighbors(&entry.id).unwrap().iter().any(|n| n.id == page.id && n.edge_kind == "same-issue"));
         let event = json!({"event": "stop", "entry": {"id": 914, "description": "TC 07", "projectName": "DP Personalization", "localDay": "2026-10-16", "durationHuman": "1h"}, "docPath": "dp-personalization/2026/10/16-914-tc.md", "docsRoot": root});
-        let result = bita_event(&store, &e, &event).unwrap();
+        let result = bita_event(&store, &e, &event, "/nonexistent/bita").unwrap();
         let bita_node = result["node"]["id"].as_str().unwrap().to_string();
         assert!(store.neighbors(&bita_node).unwrap().iter().any(|n| n.id == entry.id && n.edge_kind == "same-entry"));
         std::fs::remove_file(root.join("dp-personalization/infra.md")).unwrap();
         assert_eq!(ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap().removed, 1);
-        let deleted = bita_event(&store, &e, &json!({"event": "delete", "entry": {"id": 914}})).unwrap();
+        let deleted = bita_event(&store, &e, &json!({"event": "delete", "entry": {"id": 914}}), "/nonexistent/bita").unwrap();
         assert_eq!(deleted["removed"], true);
     }
 }

@@ -1,9 +1,9 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
 use crate::embed::Embedder;
@@ -115,11 +115,52 @@ pub fn read_inkwell_spaces(db: &Path) -> Option<HashMap<String, i64>> {
     )
 }
 
+fn known_project(store: &Store, slug: &str) -> bool {
+    slug == GLOBAL
+        || store
+            .conn
+            .query_row("SELECT 1 FROM projects WHERE slug = ?1 UNION ALL SELECT 1 FROM project_groups WHERE name = ?1 LIMIT 1", [slug], |_| Ok(()))
+            .is_ok()
+}
+
+fn prefix_project(store: &Store, folder: &str) -> Option<String> {
+    let target = project::name_tokens(folder);
+    let mut stmt = store.conn.prepare("SELECT slug, COALESCE(name, slug) FROM projects WHERE slug != ?1").ok()?;
+    let rows: Vec<(String, String)> = stmt.query_map([GLOBAL], |r| Ok((r.get(0)?, r.get(1)?))).ok()?.flatten().collect();
+    let matches: Vec<(usize, String)> = rows
+        .into_iter()
+        .filter_map(|(slug, name)| {
+            let tokens = project::name_tokens(&name);
+            let length = project::normalize_name(&name).chars().count();
+            (length >= 4 && !tokens.is_empty() && target.starts_with(&tokens)).then_some((length, slug))
+        })
+        .collect();
+    let longest = matches.iter().map(|(length, _)| *length).max()?;
+    let mut best: Vec<&String> = matches.iter().filter(|(length, _)| *length == longest).map(|(_, slug)| slug).collect();
+    best.sort();
+    best.dedup();
+    match best.as_slice() {
+        [slug] => Some((*slug).clone()),
+        _ => None,
+    }
+}
+
 pub fn folder_project(store: &Store, spaces: &HashMap<String, i64>, folder: &str) -> String {
-    spaces
-        .get(folder)
-        .and_then(|id| project::project_for_bita_id(store, *id))
-        .unwrap_or_else(|| project::project_for_name(store, folder))
+    if let Some(slug) = spaces.get(folder).and_then(|id| project::project_for_bita_id(store, *id)) {
+        return slug;
+    }
+    let named = project::project_for_name(store, folder);
+    if known_project(store, &named) {
+        return named;
+    }
+    prefix_project(store, folder).unwrap_or_else(|| GLOBAL.into())
+}
+
+fn frontmatter_project(store: &Store, meta: &BTreeMap<String, String>) -> Option<String> {
+    meta.get("projectId")
+        .and_then(|id| id.parse::<i64>().ok())
+        .and_then(|id| project::project_for_bita_id(store, id))
+        .or_else(|| meta.get("project").map(|name| project::project_for_name(store, name)).filter(|slug| slug != GLOBAL && known_project(store, slug)))
 }
 
 pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path) -> Result<Option<(String, &'static str)>> {
@@ -128,7 +169,10 @@ pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path)
     let raw = std::fs::read_to_string(path)?;
     let (meta, body) = frontmatter(&raw);
     let folder = rel.split('/').next().unwrap_or(GLOBAL);
-    let project = folder_project(store, inkwell_spaces(), folder);
+    let project = match folder_project(store, inkwell_spaces(), folder) {
+        slug if slug == GLOBAL => frontmatter_project(store, &meta).unwrap_or(slug),
+        slug => slug,
+    };
     let title = meta.get("title").cloned().unwrap_or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
     let mut attrs: Vec<(String, String)> = Vec::new();
     let (kind, body) = if let Some(entry) = meta.get("entryId") {
@@ -166,7 +210,8 @@ pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path)
     Ok(Some((outcome.id, outcome.action)))
 }
 
-pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: bool) -> Result<IngestReport> {
+pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: bool, bita: &str) -> Result<IngestReport> {
+    let _ = project::refresh_projects_with(store, root, bita);
     let mut report = IngestReport { source: "inkwell".into(), ..Default::default() };
     let mut files = Vec::new();
     walk_md(root, &mut files);
@@ -282,7 +327,7 @@ fn touched_files(database: &str, entry: i64) -> Vec<String> {
     stmt.query_map([entry], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
 }
 
-pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value) -> Result<Value> {
+pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value, bita: &str) -> Result<Value> {
     let name = event["event"].as_str().unwrap_or_default();
     let entry = &event["entry"];
     let Some(id) = entry["id"].as_i64() else { return Ok(json!({"skipped": "no entry"})) };
@@ -299,6 +344,11 @@ pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value) -> Result<Va
     }
     if !(name == "stop" || name == "amend") || entry["running"] == json!(true) {
         return Ok(json!({"event": name, "entry": id, "skipped": true}));
+    }
+    if let Some(pid) = entry["projectId"].as_i64()
+        && project::project_for_bita_id(store, pid).is_none()
+    {
+        let _ = project::refresh_projects_with(store, Path::new("/"), bita);
     }
     let project = entry["projectId"]
         .as_i64()
@@ -370,8 +420,109 @@ mod tests {
         store.conn.execute("INSERT INTO projects (slug, bita_id, name) VALUES ('vivaglobal', 218978619, 'VivaGlobal')", []).unwrap();
         let spaces = read_inkwell_spaces(&db).unwrap();
         assert_eq!(folder_project(&store, &spaces, "global"), "vivaglobal");
-        assert_eq!(folder_project(&store, &spaces, "notas-sueltas"), "notas-sueltas");
+        assert_eq!(folder_project(&store, &spaces, "notas-sueltas"), GLOBAL);
         assert_eq!(folder_project(&store, &spaces, "_no-project"), GLOBAL);
+    }
+
+    fn store_with_projects() -> Store {
+        let store = Store::in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO projects (slug, bita_id, name) VALUES ('apartados', 1, 'Apartados'), ('dp-personalization', 2, 'DP Personalization'), ('dp', 3, 'DP'), ('global', 4, 'Global'), ('cliente-uno', 5, 'Cliente Uno'), ('cliente-uno-bis', 6, 'Cliente-Uno');
+                 INSERT INTO project_groups (name, project) VALUES ('equipo', 'dp');",
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn unlinked_folders_use_known_projects_and_never_invent_one() {
+        let store = store_with_projects();
+        let spaces = HashMap::new();
+        assert_eq!(folder_project(&store, &spaces, "apartados-remediacion-de-seguridad-2026"), "apartados");
+        assert_eq!(folder_project(&store, &spaces, "dp-personalization-notas"), "dp-personalization");
+        assert_eq!(folder_project(&store, &spaces, "dp-personalization"), "dp-personalization");
+        assert_eq!(folder_project(&store, &spaces, "equipo"), "equipo");
+        assert_eq!(folder_project(&store, &spaces, "cliente-uno-2026"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "dpx-otra-cosa"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "remediacion-de-seguridad"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "global-notas"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "_no-project"), GLOBAL);
+        let total: i64 = store.conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 6);
+    }
+
+    #[test]
+    fn folder_prefixes_match_only_on_word_boundaries() {
+        let store = store_with_projects();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name) VALUES ('viva', 7, 'Viva')", []).unwrap();
+        let spaces = HashMap::new();
+        assert_eq!(folder_project(&store, &spaces, "vivalavida"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "viva-la-vida"), "viva");
+        assert_eq!(folder_project(&store, &spaces, "apartados-remediacion"), "apartados");
+        assert_eq!(folder_project(&store, &spaces, "apartadosremediacion"), GLOBAL);
+        assert_eq!(folder_project(&store, &spaces, "dp-personalizationx"), GLOBAL);
+    }
+
+    #[test]
+    fn bita_events_refresh_projects_when_the_entry_project_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let calls = dir.path().join("calls");
+        let script = dir.path().join("bita");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\necho '{{\"ok\":true,\"data\":[{{\"id\":77,\"name\":\"Nuevo Cliente\"}}]}}'\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = script.to_string_lossy().to_string();
+        let event = json!({"event": "stop", "entry": {"id": 5, "description": "Arranque", "projectId": 77, "projectName": "Nuevo Cliente"}});
+        let result = bita_event(&store, &FakeEmbedder, &event, &bin).unwrap();
+        let node = store.get(result["node"]["id"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(node.project, "nuevo-cliente");
+        assert_eq!(project::project_for_bita_id(&store, 77).as_deref(), Some("nuevo-cliente"));
+        let again = json!({"event": "stop", "entry": {"id": 6, "description": "Otra", "projectId": 77}});
+        bita_event(&store, &FakeEmbedder, &again, &bin).unwrap();
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn inkwell_ingest_refreshes_bita_projects_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bita");
+        std::fs::write(&script, "#!/bin/sh\necho '{\"ok\":true,\"data\":[{\"id\":42,\"name\":\"Linked Space\",\"key\":\"LS\"}]}'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = dir.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        ingest_inkwell(&store, &FakeEmbedder, &root, false, &script.to_string_lossy()).unwrap();
+        assert_eq!(project::project_for_bita_id(&store, 42).as_deref(), Some("linked-space"));
+    }
+
+    #[test]
+    fn inkwell_entries_without_a_folder_project_follow_their_frontmatter() {
+        let store = store_with_projects();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("_no-project/2026/10")).unwrap();
+        std::fs::create_dir_all(root.join("apartados/2026/10")).unwrap();
+        let write = |rel: &str, project: &str| {
+            std::fs::write(root.join(rel), format!("---\nentryId: 1\ntitle: T\n{project}\n---\n\n# T\n\nAlgo.\n")).unwrap();
+            inkwell_note(&store, &e, root, &root.join(rel)).unwrap().unwrap();
+            store.by_source_ref(&format!("inkwell:{rel}")).unwrap().unwrap().project
+        };
+        assert_eq!(write("_no-project/2026/10/a.md", "project: DP Personalization"), "dp-personalization");
+        assert_eq!(write("_no-project/2026/10/b.md", "projectId: 1"), "apartados");
+        assert_eq!(write("_no-project/2026/10/c.md", "project: Proyecto Inexistente"), GLOBAL);
+        assert_eq!(write("apartados/2026/10/d.md", "project: DP Personalization"), "apartados");
+        assert_eq!(write("_no-project/2026/10/e.md", ""), GLOBAL);
+        let total: i64 = store.conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 6);
     }
 
     #[test]
@@ -389,6 +540,7 @@ mod tests {
     #[test]
     fn inkwell_ingest_builds_entry_and_issue_edges() {
         let store = Store::in_memory().unwrap();
+        store.conn.execute("INSERT INTO projects (slug, bita_id, name) VALUES ('dp-personalization', 2, 'DP Personalization')", []).unwrap();
         let e = FakeEmbedder;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -403,9 +555,9 @@ mod tests {
             "---\nbita: 1\nentryId: 914\ntitle: TC 07\nproject: DP\nday: 2026-10-16\nduration: 1h\njira: DD-1905\n---\n\n# TC 07\n\n## Contexto\n\n## Qué se hizo\n",
         )
         .unwrap();
-        let report = ingest_inkwell(&store, &e, root, false).unwrap();
+        let report = ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap();
         assert_eq!((report.scanned, report.created), (2, 2));
-        let again = ingest_inkwell(&store, &e, root, false).unwrap();
+        let again = ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap();
         assert_eq!(again.unchanged, 2);
         let entry = store.by_source_ref("inkwell:dp-personalization/2026/10/16-914-tc.md").unwrap().unwrap();
         assert_eq!(entry.kind, "entry");
@@ -413,12 +565,12 @@ mod tests {
         let page = store.by_source_ref("inkwell:dp-personalization/infra.md").unwrap().unwrap();
         assert!(store.neighbors(&entry.id).unwrap().iter().any(|n| n.id == page.id && n.edge_kind == "same-issue"));
         let event = json!({"event": "stop", "entry": {"id": 914, "description": "TC 07", "projectName": "DP Personalization", "localDay": "2026-10-16", "durationHuman": "1h"}, "docPath": "dp-personalization/2026/10/16-914-tc.md", "docsRoot": root});
-        let result = bita_event(&store, &e, &event).unwrap();
+        let result = bita_event(&store, &e, &event, "/nonexistent/bita").unwrap();
         let bita_node = result["node"]["id"].as_str().unwrap().to_string();
         assert!(store.neighbors(&bita_node).unwrap().iter().any(|n| n.id == entry.id && n.edge_kind == "same-entry"));
         std::fs::remove_file(root.join("dp-personalization/infra.md")).unwrap();
-        assert_eq!(ingest_inkwell(&store, &e, root, false).unwrap().removed, 1);
-        let deleted = bita_event(&store, &e, &json!({"event": "delete", "entry": {"id": 914}})).unwrap();
+        assert_eq!(ingest_inkwell(&store, &e, root, false, "/nonexistent/bita").unwrap().removed, 1);
+        let deleted = bita_event(&store, &e, &json!({"event": "delete", "entry": {"id": 914}}), "/nonexistent/bita").unwrap();
         assert_eq!(deleted["removed"], true);
     }
 }

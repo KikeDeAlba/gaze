@@ -1,25 +1,35 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, copyFileSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ensureBinary, hopAllowed, resolveTarget } from './install.js'
+import { ensureBinary, hopAllowed, needsRepair, registryManifest, repairLock, resolveTarget, startRepair } from './install.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
 const TARGETS = ['aarch64-apple-darwin', 'x86_64-unknown-linux-gnu']
 const SUPPORTED = { 'darwin-arm64': 'aarch64-apple-darwin', 'linux-x64': 'x86_64-unknown-linux-gnu' }[`${process.platform}-${process.arch}`]
 const SCRIPT = '#!/bin/sh\nif [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi\nif [ "$1" = "die" ]; then kill -TERM $$; fi\nif [ "$1" = "cat" ]; then exec cat; fi\necho "fake gaze $*"\nexit "${GAZE_FAKE_EXIT:-0}"\n'
-const NO_PROXY_ENV = { HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '', NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '' }
+const REGISTERING_SCRIPT = `#!/bin/sh
+self="$(cd "$(dirname "$0")" && pwd -P)/gaze"
+if [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi
+case "$1" in
+  setup) mkdir -p "$KIT_REGISTRY_DIR" && printf '{"version":"%s","bin":["%s"]}\\n' "$(cat "$(dirname "$self")/.version")" "$self" > "$KIT_REGISTRY_DIR/gaze.json" ;;
+  daemon) printf '<plist><string>%s</string><string>serve</string></plist>\\n' "$self" > "$HOME/Library/LaunchAgents/com.kikedealba.gaze.plist" ;;
+  *) echo "fake gaze $*" ;;
+esac
+`
+const NO_PROXY_ENV = { HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '', NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '', KIT_REGISTRY_DIR: '', XDG_CONFIG_HOME: '' }
 const quiet = () => {}
 
 const scratch = mkdtempSync(path.join(tmpdir(), 'gaze-npm-test-'))
 let goodArchive
+let registeringArchive
 let symlinkArchive
 let archive
 let requests = []
@@ -49,11 +59,11 @@ function writeChecksums(root, { version = VERSION, targets = TARGETS, hash = sha
   writeFileSync(path.join(root, 'npm', 'checksums.json'), JSON.stringify({ version, assets }))
 }
 
-function packageRoot(checksums = {}) {
+function packageRoot(checksums = {}, version = VERSION) {
   const root = mkdtempSync(path.join(scratch, 'pkg-'))
   mkdirSync(path.join(root, 'npm'))
   for (const file of ['install.js', 'gaze.js']) copyFileSync(path.join(HERE, file), path.join(root, 'npm', file))
-  writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: '@kikedealba/gaze', version: VERSION, type: 'module' }))
+  writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: '@kikedealba/gaze', version, type: 'module' }))
   if (checksums) writeChecksums(root, checksums)
   return root
 }
@@ -85,6 +95,7 @@ function vendorEntries(root) {
 
 before(async () => {
   goodArchive = tarball('good', (file) => writeFileSync(file, SCRIPT, { mode: 0o644 }))
+  registeringArchive = tarball('registering', (file) => writeFileSync(file, REGISTERING_SCRIPT, { mode: 0o644 }))
   symlinkArchive = tarball('symlink', (file) => symlinkSync('/bin/sh', file))
   server = createServer((request, response) => {
     requests.push(request.url)
@@ -94,7 +105,7 @@ before(async () => {
       response.writeHead(302, { Location: `http://downloads.example.com/${name}` }).end()
     } else if (pathname.startsWith('/loop/')) {
       response.writeHead(302, { Location: pathname }).end()
-    } else if (pathname.startsWith(`/v${VERSION}/`) && name.endsWith('.tar.gz')) {
+    } else if (/^\/v\d+\.\d+\.\d+\//.test(pathname) && name.endsWith('.tar.gz')) {
       response.writeHead(302, { Location: `/files/${name}` }).end()
     } else if (pathname.startsWith('/files/') && name.endsWith('.tar.gz')) {
       response.writeHead(200, { 'Content-Type': 'application/gzip' }).end(archive)
@@ -464,5 +475,131 @@ describe('install.js', () => {
     const result = await installScript(root, ['--postinstall'])
     assert.notEqual(result.code, 0)
     assert.match(result.stderr, SUPPORTED ? /checksums\.json is missing/ : /no prebuilt binary/)
+  })
+})
+
+describe('registration repair', { skip: SUPPORTED ? false : `no release target for ${process.platform}-${process.arch}` }, () => {
+  function machine() {
+    const agentHome = mkdtempSync(path.join(scratch, 'home-'))
+    mkdirSync(path.join(agentHome, 'Library', 'LaunchAgents'), { recursive: true })
+    return { HOME: agentHome, KIT_REGISTRY_DIR: path.join(agentHome, 'tools.d'), GAZE_FAKE_LOG: path.join(agentHome, 'calls.log') }
+  }
+
+  function registered(env) {
+    return JSON.parse(readFileSync(registryManifest(env), 'utf8'))
+  }
+
+  function plist(env) {
+    return readFileSync(path.join(env.HOME, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'), 'utf8')
+  }
+
+  async function settled(root) {
+    const lock = repairLock(root)
+    const deadline = Date.now() + 15_000
+    while (existsSync(lock)) {
+      if (Date.now() > deadline) throw new Error(`repair still running: ${readFileSync(lock, 'utf8')}`)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+
+  async function installVersion(version, env) {
+    const root = packageRoot({ version }, version)
+    const setup = await run(root, ['setup'], env)
+    assert.equal(setup.code, 0, setup.stderr)
+    const daemon = await run(root, ['daemon', 'install'], env)
+    assert.equal(daemon.code, 0, daemon.stderr)
+    return root
+  }
+
+  beforeEach(() => {
+    archive = registeringArchive
+  })
+
+  test('needsRepair is false without a registration and when it matches the binary', async () => {
+    const env = machine()
+    const root = packageRoot()
+    assert.equal(needsRepair(null, { root, env }), false)
+    await installVersion(VERSION, env)
+    const current = await installVersion(VERSION, env)
+    assert.equal(needsRepair(path.join(current, 'vendor', 'gaze'), { root: current, env }), false)
+    assert.equal(needsRepair(null, { root: current, env }), true)
+    assert.equal(needsRepair(path.join(current, 'vendor', 'gaze'), { root: current, env: { ...env, GAZE_BINARY_PATH: '/bin/sh' } }), false)
+  })
+
+  test('needsRepair notices a plist that points elsewhere', async () => {
+    const env = machine()
+    const root = await installVersion(VERSION, env)
+    writeFileSync(path.join(env.HOME, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'), '<plist><string>/old/vendor/gaze</string></plist>')
+    assert.equal(needsRepair(path.join(root, 'vendor', 'gaze'), { root, env }), true)
+  })
+
+  test('a hook after upgrading repairs the registry and the daemon in the background', { timeout: 30_000 }, async () => {
+    const env = machine()
+    const old = await installVersion('9.9.8', env)
+    assert.equal(registered(env).bin[0], path.join(realpathSync(old), 'vendor', 'gaze'))
+    rmSync(old, { recursive: true, force: true })
+    writeFileSync(env.GAZE_FAKE_LOG, '')
+
+    const upgraded = packageRoot({ version: '9.9.9' }, '9.9.9')
+    const started = Date.now()
+    const hook = await run(upgraded, ['hook', 'prompt'], env, '{}')
+    assert.equal(hook.code, 0)
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`)
+    await settled(upgraded)
+
+    const binary = path.join(realpathSync(upgraded), 'vendor', 'gaze')
+    assert.deepEqual(registered(env), { version: '9.9.9', bin: [binary] })
+    assert.match(plist(env), new RegExp(`<string>${binary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`))
+    assert.equal(readFileSync(env.GAZE_FAKE_LOG, 'utf8'), 'setup\ndaemon install\n')
+
+    const next = await run(upgraded, ['hook', 'prompt'], env, '{}')
+    assert.equal(next.stdout, 'fake gaze hook prompt\n')
+    assert.equal(existsSync(repairLock(upgraded)), false)
+    assert.equal(readFileSync(env.GAZE_FAKE_LOG, 'utf8'), 'setup\ndaemon install\nhook prompt\n')
+  })
+
+  test('the registered binary stays valid across two simulated versions', { timeout: 30_000 }, async () => {
+    const env = machine()
+    const first = await installVersion('9.9.7', env)
+    const second = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const result = await run(second, ['stats'], env)
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stderr, /refreshing them in the background/)
+    await settled(second)
+    rmSync(first, { recursive: true, force: true })
+    const { bin, version } = registered(env)
+    assert.equal(version, '9.9.8')
+    assert.ok(existsSync(bin[0]), bin[0])
+    assert.ok(plist(env).includes(`<string>${bin[0]}</string>`))
+    assert.equal(needsRepair(path.join(second, 'vendor', 'gaze'), { root: second, env }), false)
+  })
+
+  test('explicit setup and daemon install do not start a background repair', async () => {
+    const env = machine()
+    await installVersion('9.9.7', env)
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const result = await run(root, ['setup'], env)
+    assert.equal(result.code, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /refreshing/)
+    assert.equal(existsSync(repairLock(root)), false)
+  })
+
+  test('a failed repair keeps its lock so hooks do not retry it on every run', { timeout: 30_000 }, async () => {
+    const env = { ...machine(), GAZE_DOWNLOAD_BASE: `${base}/missing` }
+    await installVersion('9.9.7', { ...env, GAZE_DOWNLOAD_BASE: base })
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const hook = await run(root, ['hook', 'prompt'], env, '{}')
+    assert.equal(hook.code, 0)
+    const lock = repairLock(root)
+    const deadline = Date.now() + 15_000
+    while (!/HTTP 404/.test(existsSync(lock) ? readFileSync(lock, 'utf8') : '')) {
+      assert.ok(Date.now() < deadline, 'the repair did not record its failure')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.equal(startRepair({ root, env: { ...process.env, ...NO_PROXY_ENV, ...env } }), false)
+    utimesSync(lock, new Date(0), new Date(0))
+    assert.equal(startRepair({ root, env: { ...process.env, ...NO_PROXY_ENV, ...env, GAZE_DOWNLOAD_BASE: base } }), true)
+    await settled(root)
+    assert.equal(registered(env).version, '9.9.8')
   })
 })

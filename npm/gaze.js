@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
-import { ensureBinary } from './install.js'
+import { ensureBinary, needsRepair, startRepair } from './install.js'
 
 const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']
 
@@ -8,6 +8,7 @@ const args = process.argv.slice(2)
 const QUICK_EXIT = { hook: 0, mcp: 1 }
 
 const quick = Object.hasOwn(QUICK_EXIT, args[0])
+const registering = ['setup', 'daemon', 'uninstall'].includes(args[0])
 
 let binary
 try {
@@ -16,6 +17,7 @@ try {
   process.stderr.write(`gaze: ${error.message}\n`)
   process.exit(quick ? QUICK_EXIT[args[0]] : 1)
 }
+if (!registering && needsRepair(binary)) startRepair({ warn: quick ? undefined : (message) => process.stderr.write(message) })
 if (!binary) {
   process.stderr.write('gaze: the gaze binary is not installed yet; run `gaze setup` once to download it\n')
   process.exit(QUICK_EXIT[args[0]])

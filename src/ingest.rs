@@ -758,4 +758,91 @@ mod tests {
         let deleted = bita_event(&store, &e, &json!({"event": "delete", "entry": {"id": 914}}), "/nonexistent/bita").unwrap();
         assert_eq!(deleted["removed"], true);
     }
+
+    #[test]
+    fn inkwell_large_batches_with_moved_and_written_of_the_same_file_settle_on_the_final_path() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dp")).unwrap();
+        let mut changes = Vec::new();
+        for index in 0..150 {
+            std::fs::write(root.join(format!("dp/page-{index}.md")), format!("# Page {index}\n\nContenido numero {index}.\n")).unwrap();
+            changes.push(json!({"action": "written", "relPath": format!("dp/page-{index}.md")}));
+        }
+        inkwell_event(&store, &e, &docs_event(root, json!(changes))).unwrap();
+        let total = |store: &Store| -> i64 { store.conn.query_row("SELECT COUNT(*) FROM nodes WHERE source = 'inkwell'", [], |r| r.get(0)).unwrap() };
+        assert_eq!(total(&store), 150);
+
+        let mut batch = Vec::new();
+        for index in 0..150 {
+            std::fs::rename(root.join(format!("dp/page-{index}.md")), root.join(format!("dp/renamed-{index}.md"))).unwrap();
+            batch.push(json!({"action": "written", "relPath": format!("dp/page-{index}.md")}));
+            batch.push(json!({"action": "moved", "relPath": format!("dp/renamed-{index}.md"), "from": format!("dp/page-{index}.md")}));
+            batch.push(json!({"action": "written", "relPath": format!("dp/renamed-{index}.md")}));
+        }
+        let result = inkwell_event(&store, &e, &docs_event(root, json!(batch))).unwrap();
+        assert_eq!(result["failed"], 0);
+        assert_eq!(result["changes"].as_array().unwrap().len(), 450);
+        assert_eq!(total(&store), 150);
+        for index in 0..150 {
+            assert!(store.by_source_ref(&format!("inkwell:dp/page-{index}.md")).unwrap().is_none());
+            assert!(store.by_source_ref(&format!("inkwell:dp/renamed-{index}.md")).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn inkwell_moved_then_written_in_either_order_and_a_move_onto_itself_keep_one_note() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dp")).unwrap();
+        std::fs::write(root.join("dp/a.md"), "# A\n\nTexto.\n").unwrap();
+        inkwell_event(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": "dp/a.md"}]))).unwrap();
+        std::fs::rename(root.join("dp/a.md"), root.join("dp/b.md")).unwrap();
+        inkwell_event(
+            &store,
+            &e,
+            &docs_event(root, json!([{"action": "written", "relPath": "dp/b.md"}, {"action": "moved", "relPath": "dp/b.md", "from": "dp/a.md"}])),
+        )
+        .unwrap();
+        assert!(store.by_source_ref("inkwell:dp/a.md").unwrap().is_none());
+        assert!(store.by_source_ref("inkwell:dp/b.md").unwrap().is_some());
+        let own = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "moved", "relPath": "dp/b.md", "from": "dp/b.md"}]))).unwrap();
+        assert_eq!(own["failed"], 0);
+        assert!(store.by_source_ref("inkwell:dp/b.md").unwrap().is_some());
+        let invalid_from = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "moved", "relPath": "dp/b.md", "from": "../a.md"}]))).unwrap();
+        assert_eq!(invalid_from["changes"][0]["fromRemoved"], false);
+        assert!(store.by_source_ref("inkwell:dp/b.md").unwrap().is_some());
+        let total: i64 = store.conn.query_row("SELECT COUNT(*) FROM nodes WHERE source = 'inkwell'", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn inkwell_events_without_changes_or_with_malformed_shapes_do_nothing() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for event in [
+            json!({"docsRoot": root, "event": "docs.changed"}),
+            json!({"docsRoot": root, "event": "docs.changed", "changes": null}),
+            json!({"docsRoot": root, "event": "docs.changed", "changes": []}),
+            json!({"docsRoot": root, "event": "docs.changed", "changes": "dp/a.md"}),
+            json!({"docsRoot": root, "event": "docs.changed", "changes": {"action": "written"}}),
+            json!({"docsRoot": root, "event": "docs.changed", "changes": [null, 7, "x", [], {}]}),
+            json!({"docsRoot": 7, "event": "docs.changed", "changes": []}),
+        ] {
+            let result = inkwell_event(&store, &e, &event).unwrap();
+            assert_eq!(result["failed"], 0);
+            assert!(result["changes"].as_array().unwrap().iter().all(|c| c["result"] == "ignored"));
+        }
+        let other =
+            inkwell_event(&store, &e, &json!({"event": "page.opened", "docsRoot": root, "changes": [{"action": "written", "relPath": "dp/a.md"}]})).unwrap();
+        assert_eq!(other["skipped"], true);
+        let total: i64 = store.conn.query_row("SELECT COUNT(*) FROM nodes WHERE source = 'inkwell'", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 0);
+    }
 }

@@ -10,6 +10,8 @@ fn gaze(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
         .env("GAZE_SOCKET", dir.join("s.sock"))
         .env("KIT_REGISTRY_DIR", dir.join("tools.d"))
         .env("GAZE_EMBEDDER", "fake")
+        .env("INKWELL_DOCS_DIR", dir.join("docs"))
+        .env("INKWELL_DB_PATH", dir.join("inkwell.db"))
         .env("GAZE_PROJECT", "den")
         .env_remove("GAZE_HARVEST")
         .stdin(Stdio::piped())
@@ -115,4 +117,26 @@ fn hooks_are_silent_during_harvest() {
         .output()
         .unwrap();
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn inkwell_hook_survives_garbage_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for payload in [
+        "",
+        "not json",
+        "{",
+        "[]",
+        "null",
+        "\"docs\"",
+        "{\"event\":\"docs.changed\"}",
+        "{\"event\":\"docs.changed\",\"changes\":\"x\"}",
+        "{\"event\":\"docs.changed\",\"changes\":[null,1,{}]}",
+    ] {
+        let out = gaze(d, &["inkwell-hook"], Some(payload));
+        assert!(out.contains("inkwell-hook"), "payload {payload:?} gave {out:?}");
+    }
+    let found = envelope(&gaze(d, &["search", "nada", "--json"], None));
+    assert_eq!(found["data"].as_array().unwrap().len(), 0);
 }

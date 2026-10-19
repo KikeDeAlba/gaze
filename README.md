@@ -29,7 +29,19 @@ El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` 
 
 El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postinstall` no corrió (por red, por `npm install --ignore-scripts` o porque npm bloqueó los scripts), **la primera ejecución de `gaze` descarga el binario**; por eso conviene que esa primera ejecución sea `gaze setup` y no un hook, que tiene pocos segundos. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado y avisa por stderr en cada ejecución.
 
-Tras actualizar o cambiar de Node, `gaze setup && gaze daemon install`: el manifiesto de kit y el plist de launchd guardan la ruta del binario dentro de `vendor/`, que cambia con el prefijo global de npm. El `postinstall` lo hace solo si ya existe `~/Library/LaunchAgents/com.kikedealba.gaze.plist`; si falla, solo avisa. `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar.
+El manifiesto de kit (`~/.config/kikedealba/tools.d/gaze.json`) y el plist de launchd guardan la ruta del binario nativo dentro de `vendor/`, que cambia con cada versión (con pnpm vive en su store versionado) y con el prefijo global de npm. Tras `npm i -g` o `pnpm add -g` de otra versión, eso se repara solo:
+
+- El `postinstall` corre `gaze setup` y `gaze daemon install` si ya existían el manifiesto o el plist. pnpm no corre `postinstall` sin aprobación, así que no se puede depender de él.
+- Por eso el lanzador revisa en cada ejecución el manifiesto de kit. Repara si el binario registrado ya no existe, si su versión es menor que la del paquete o si el plist no apunta al binario registrado cuando ese binario es el suyo. En ese caso lanza en segundo plano `install.js --repair`, que descarga el binario si falta y corre `gaze setup` y `gaze daemon install`. El hook o comando en curso no espera. Basta con la siguiente ejecución de `gaze`, aunque sea un hook de Claude Code.
+- No repara si no existe `tools.d/gaze.json` (aunque haya plist: quitar el manifiesto es decisión del usuario), si el binario registrado existe y no está en el `vendor/` de un paquete `@kikedealba/gaze` (instalación con cargo o manual) ni con `GAZE_BINARY_PATH`. Dos instalaciones de npm o pnpm no se quitan el registro: gana la versión mayor y, con la misma versión, la que ya estaba.
+- Solo corre una reparación a la vez por usuario, con el candado `repair.lock` (modo 0600) en el directorio de datos de gaze (`~/.local/share/gaze`). Si falla, o si al terminar el registro sigue sin apuntar al binario (por ejemplo, porque el binario reporta otra versión que el paquete), el candado guarda el error y no se reintenta en 10 minutos. Un candado de más de 10 minutos solo se reemplaza si su proceso ya no existe; uno de más de 1 hora se reemplaza siempre, por si el pid se reutilizó. `gaze setup`, `gaze daemon …` y `gaze uninstall` explícitos nunca disparan la reparación. El `postinstall` y la reparación dan hasta 180 s a cada paso, más que el peor caso de `gaze daemon install`.
+- Medido en macOS arm64 (100 corridas de `gaze capabilities --json`): binario nativo 4.0 ms, lanzador 27.5 ms, lanzador con la revisión 28.0 ms (mediana).
+
+El manifiesto y el plist apuntan al binario nativo y no al lanzador del `PATH` (`~/Library/pnpm/bin/gaze` o `<prefijo>/bin/gaze`): launchd arranca el daemon con `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, donde no está el `node` de nvm, Volta o Homebrew, y el lanzador dejaría un proceso de Node residente (~44 MB) junto al daemon. Con el binario nativo, Den y kit tampoco pagan los ~24 ms del lanzador en cada llamada.
+
+Si hace falta a mano: `gaze setup && gaze daemon install`. `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar.
+
+`gaze daemon install` saca el job anterior de launchd, espera hasta 10 s a que `launchctl print gui/<uid>/com.kikedealba.gaze` deje de encontrarlo, lo habilita (`launchctl enable`, por si se deshabilitó), carga el plist, espera hasta 10 s a que el job tenga pid y hasta 30 s a que responda en el socket. Reintenta hasta 3 veces y, si no queda cargado, sale con error y el detalle de cada intento. Si el job sigue vivo pero aún no responde (la primera vez puede estar descargando el modelo), termina bien y lo dice. En el peor caso tarda unos 160 s. `gaze daemon uninstall` falla con un error claro si launchd no descarga el job, y entonces no borra el plist. `gaze daemon status` distingue entre corriendo, plist instalado pero no cargado en launchd, cargado sin responder todavía en el socket y apagado (campo `state`: `running`, `not-loaded`, `starting`, `stopped`).
 
 Los hooks (`gaze hook …`) y `gaze mcp` nunca descargan: si todavía no hay binario, avisan por stderr y salen (0 los hooks, para no romper la sesión; 1 el MCP).
 
@@ -44,7 +56,7 @@ El plugin de Claude Code (hooks, skill y MCP) se instala desde el marketplace de
 Requiere Rust 1.88 o más nuevo:
 
 ```sh
-cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.4.0   # o, desde el clon: cargo install --path .
+cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.4.1   # o, desde el clon: cargo install --path .
 gaze setup
 ```
 

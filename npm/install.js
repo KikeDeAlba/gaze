@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { accessSync, chmodSync, constants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,7 +24,9 @@ const TIMEOUT_MS = 120_000
 const NETWORK_EXIT = 3
 const UNWRITABLE = new Set(['EACCES', 'EPERM', 'EROFS'])
 const ORPHAN_AGE_MS = 10 * 60 * 1000
-const REFRESH_TIMEOUT_MS = 60_000
+const REFRESH_TIMEOUT_MS = 180_000
+const REPAIR_RETRY_MS = 10 * 60 * 1000
+const ABANDONED_LOCK_MS = 60 * 60 * 1000
 
 export class InstallError extends Error {
   constructor(message) {
@@ -288,14 +290,171 @@ function invokedDirectly() {
   }
 }
 
-export function launchAgent() {
-  return path.join(homedir(), 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist')
+function home(env) {
+  return env.HOME || homedir()
 }
 
-export function refreshDaemon(binary, warn = (message) => process.stderr.write(message)) {
-  if (!existsSync(launchAgent())) return false
-  for (const args of [['setup'], ['daemon', 'install']]) {
-    const result = spawnSync(binary, args, { stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8' })
+export function launchAgent(env = process.env) {
+  return path.join(home(env), 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist')
+}
+
+export function registryManifest(env = process.env) {
+  const config = env.XDG_CONFIG_HOME || path.join(home(env), '.config')
+  return path.join(env.KIT_REGISTRY_DIR || path.join(config, 'kikedealba', 'tools.d'), 'gaze.json')
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function npmManaged(bin) {
+  const vendor = path.dirname(bin)
+  return path.basename(vendor) === 'vendor' && readJson(path.join(path.dirname(vendor), 'package.json'))?.name === '@kikedealba/gaze'
+}
+
+function versionParts(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? ''))
+  return match ? match.slice(1).map(Number) : null
+}
+
+export function olderVersion(candidate, reference) {
+  const a = versionParts(candidate)
+  const b = versionParts(reference)
+  if (!a || !b) return a === null && b !== null
+  for (let index = 0; index < 3; index++) if (a[index] !== b[index]) return a[index] < b[index]
+  return false
+}
+
+function realpathOr(file) {
+  try {
+    return realpathSync(file)
+  } catch {
+    return file
+  }
+}
+
+export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
+  if (env.GAZE_BINARY_PATH) return false
+  const registered = readJson(registryManifest(env))
+  if (!registered) return false
+  const bin = registered.bin?.[0]
+  const present = typeof bin === 'string' && existsSync(bin)
+  if (present && !npmManaged(bin)) return false
+  if (!present || olderVersion(registered.version, packageVersion(root))) return true
+  if (!binary || realpathOr(bin) !== realpathOr(binary)) return false
+  const plist = launchAgent(env)
+  if (!existsSync(plist)) return false
+  try {
+    return !readFileSync(plist, 'utf8').includes(`<string>${bin}</string>`)
+  } catch {
+    return true
+  }
+}
+
+export function dataDir(env = process.env) {
+  if (env.GAZE_DATA_DIR) return env.GAZE_DATA_DIR
+  if (env.GAZE_DB_PATH) return path.dirname(env.GAZE_DB_PATH)
+  return path.join(env.XDG_DATA_HOME || path.join(home(env), '.local', 'share'), 'gaze')
+}
+
+export function repairLock(env = process.env) {
+  return path.join(dataDir(env), 'repair.lock')
+}
+
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+function lockOwner(file) {
+  try {
+    return Number.parseInt(readFileSync(file, 'utf8').split('\n', 1)[0], 10)
+  } catch {
+    return null
+  }
+}
+
+function reclaim(file, now) {
+  let before
+  try {
+    before = statSync(file)
+  } catch {
+    return true
+  }
+  const age = now - before.mtimeMs
+  if (age < REPAIR_RETRY_MS || (age < ABANDONED_LOCK_MS && alive(lockOwner(file)))) return false
+  const moved = `${file}.${process.pid}.${randomBytes(6).toString('hex')}`
+  try {
+    renameSync(file, moved)
+  } catch {
+    return false
+  }
+  let after
+  try {
+    after = statSync(moved)
+  } catch {
+    return false
+  }
+  if (after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) {
+    try {
+      linkSync(moved, file)
+    } catch {}
+    rmSync(moved, { force: true })
+    return false
+  }
+  rmSync(moved, { force: true })
+  return true
+}
+
+function acquireLock(file, now = Date.now()) {
+  try {
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  } catch {
+    return false
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(file, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+      return true
+    } catch (error) {
+      if (error.code !== 'EEXIST') return false
+    }
+    if (!reclaim(file, now)) return false
+  }
+  return false
+}
+
+export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
+  const lock = repairLock(env)
+  if (!acquireLock(lock)) return false
+  try {
+    const child = spawn(process.execPath, [path.join(root, 'npm', 'install.js'), '--repair', lock], { env, detached: true, stdio: 'ignore' })
+    child.on('error', () => rmSync(lock, { force: true }))
+    child.unref()
+  } catch {
+    rmSync(lock, { force: true })
+    return false
+  }
+  warn?.(`gaze: the kit registration or the launchd daemon points to an older or missing gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
+  return true
+}
+
+export function refreshRegistration(binary, { env = process.env, warn = (message) => process.stderr.write(message) } = {}) {
+  const daemon = existsSync(launchAgent(env))
+  const steps = []
+  if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
+  if (daemon) steps.push(['daemon', 'install'])
+  for (const args of steps) {
+    const result = spawnSync(binary, args, { env, stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8' })
     if (result.status !== 0) {
       const detail = (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
       warn(`gaze: could not refresh the daemon with \`gaze ${args.join(' ')}\` (${detail}); run \`gaze setup && gaze daemon install\` by hand\n`)
@@ -305,11 +464,30 @@ export function refreshDaemon(binary, warn = (message) => process.stderr.write(m
   return true
 }
 
-if (invokedDirectly()) {
-  const [mode, root] = process.argv.slice(2)
+async function repair(lock) {
+  const problems = []
   try {
-    const binary = await ensureBinary(mode === '--proxy-child' ? { root } : {})
-    if (mode === '--postinstall') refreshDaemon(binary)
+    writeFileSync(lock, `${process.pid}\n`)
+    const binary = await ensureBinary({ warn: (message) => problems.push(message.trim()) })
+    if (refreshRegistration(binary, { warn: (message) => problems.push(message.trim()) })) {
+      if (!needsRepair(binary)) {
+        rmSync(lock, { force: true })
+        return
+      }
+      problems.push(`gaze setup and gaze daemon install finished, but ${registryManifest()} or ${launchAgent()} still does not point to ${binary}`)
+    }
+  } catch (error) {
+    problems.push(error.message)
+  }
+  writeFileSync(lock, `${process.pid}\n${new Date().toISOString()} ${problems.join('\n')}\n`)
+  process.exitCode = 1
+}
+
+async function main(mode, argument) {
+  if (mode === '--repair') return repair(argument)
+  try {
+    const binary = await ensureBinary(mode === '--proxy-child' ? { root: argument } : {})
+    if (mode === '--postinstall') refreshRegistration(binary)
   } catch (error) {
     if (mode === '--postinstall' && error instanceof NetworkError) {
       process.stderr.write(`gaze: could not download the binary during install (${error.message}); it will be downloaded the first time gaze runs\n`)
@@ -319,3 +497,5 @@ if (invokedDirectly()) {
     }
   }
 }
+
+if (invokedDirectly()) await main(...process.argv.slice(2))

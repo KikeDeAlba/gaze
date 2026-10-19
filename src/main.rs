@@ -535,10 +535,17 @@ fn run(command: Command) -> Result<Output> {
         Command::Daemon { action } => match action {
             DaemonAction::Install => {
                 let result = daemon::install()?;
-                Ok(Output::new(
-                    result.clone(),
-                    format!("Daemon cargado en launchd con pid {} ({})", result["pid"], result["plist"].as_str().unwrap_or_default()),
-                ))
+                let human = if result["ready"] == json!(true) {
+                    format!("Daemon cargado en launchd con pid {} y respondiendo en {}", result["pid"], result["socket"].as_str().unwrap_or_default())
+                } else {
+                    format!(
+                        "Daemon cargado en launchd con pid {}, pero aún no responde en {} (puede estar descargando el modelo); revisa {} y gaze daemon status",
+                        result["pid"],
+                        result["socket"].as_str().unwrap_or_default(),
+                        result["log"].as_str().unwrap_or_default()
+                    )
+                };
+                Ok(Output::new(result, human))
             }
             DaemonAction::Uninstall => {
                 let result = daemon::uninstall()?;

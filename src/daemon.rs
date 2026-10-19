@@ -126,6 +126,7 @@ impl Launchctl for SystemLaunchctl {
 const POLL: Duration = Duration::from_millis(200);
 const UNLOAD_POLLS: u32 = 50;
 const START_POLLS: u32 = 50;
+const READY_POLLS: u32 = 150;
 const BOOTSTRAP_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,20 +182,37 @@ fn unload(ctl: &dyn Launchctl, service: &str) -> Result<()> {
     Err(anyhow!("launchd no descargó {service} tras {} s", (POLL * UNLOAD_POLLS).as_secs()))
 }
 
-pub fn load(ctl: &dyn Launchctl, domain: &str, plist: &str) -> Result<u32> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Started {
+    pub pid: u32,
+    pub ready: bool,
+}
+
+pub fn load(ctl: &dyn Launchctl, domain: &str, plist: &str, ready: &dyn Fn() -> bool) -> Result<Started> {
     let service = format!("{domain}/{LABEL}");
     let mut failures = Vec::new();
     for attempt in 1..=BOOTSTRAP_ATTEMPTS {
         unload(ctl, &service)?;
+        ctl.run(&["enable", &service]);
         let output = ctl.run(&["bootstrap", domain, plist]);
         if !output.success {
             failures.push(format!("intento {attempt}: bootstrap falló: {}", output.stderr.trim()));
             continue;
         }
-        if let Some(pid) = wait_running(ctl, &service) {
-            return Ok(pid);
+        let Some(pid) = wait_running(ctl, &service) else {
+            failures.push(format!("intento {attempt}: {service} quedó sin pid tras {} s", (POLL * START_POLLS).as_secs()));
+            continue;
+        };
+        if wait_until(ctl, READY_POLLS, ready) {
+            return Ok(Started { pid, ready: true });
         }
-        failures.push(format!("intento {attempt}: {service} quedó sin pid tras {} s", (POLL * START_POLLS).as_secs()));
+        if let JobState::Loaded { pid: Some(pid) } = job_state(ctl, &service) {
+            return Ok(Started { pid, ready: false });
+        }
+        failures.push(format!(
+            "intento {attempt}: {service} arrancó con pid {pid} pero murió sin responder en el socket tras {} s",
+            (POLL * READY_POLLS).as_secs()
+        ));
     }
     Err(anyhow!("launchctl no pudo cargar {plist} en {domain}:\n{}", failures.join("\n")))
 }
@@ -216,19 +234,24 @@ pub fn install() -> Result<Value> {
     let domain = domain();
     unload(&ctl, &format!("{domain}/{LABEL}"))?;
     std::fs::write(&plist, render_plist(&bin.to_string_lossy()))?;
-    let pid = load(&ctl, &domain, &plist.to_string_lossy())?;
-    Ok(json!({"plist": plist, "label": LABEL, "socket": paths::socket_path(), "bin": bin, "pid": pid}))
+    let socket = paths::socket_path();
+    let started = load(&ctl, &domain, &plist.to_string_lossy(), &|| ping(&socket).is_some())?;
+    Ok(json!({"plist": plist, "label": LABEL, "socket": socket, "bin": bin, "pid": started.pid, "ready": started.ready, "log": paths::serve_log()}))
+}
+
+pub fn remove(ctl: &dyn Launchctl, service: &str, plist: &Path) -> Result<bool> {
+    unload(ctl, service)?;
+    let existed = plist.exists();
+    if existed {
+        std::fs::remove_file(plist)?;
+    }
+    Ok(existed)
 }
 
 pub fn uninstall() -> Result<Value> {
     let plist = paths::launch_agent();
-    let ctl = SystemLaunchctl;
-    unload(&ctl, &format!("{}/{LABEL}", domain()))?;
-    let existed = plist.exists();
-    if existed {
-        std::fs::remove_file(&plist)?;
-    }
-    Ok(json!({"plist": plist, "removed": existed}))
+    let removed = remove(&SystemLaunchctl, &format!("{}/{LABEL}", domain()), &plist)?;
+    Ok(json!({"plist": plist, "removed": removed}))
 }
 
 pub fn status() -> Value {
@@ -274,6 +297,7 @@ mod tests {
         startup_polls: Cell<u32>,
         starting: Cell<u32>,
         failing_bootstraps: Cell<u32>,
+        disabled: Cell<bool>,
         never_starts: bool,
         never_unloads: bool,
         calls: RefCell<Vec<String>>,
@@ -341,7 +365,14 @@ mod tests {
                     }
                     Self::ok(String::new())
                 }
+                "enable" => {
+                    self.disabled.set(false);
+                    Self::ok(String::new())
+                }
                 "bootstrap" => {
+                    if self.disabled.get() {
+                        return Self::fail("Bootstrap failed: 5: Input/output error");
+                    }
                     if self.loaded.get() || self.lingering.get() > 0 {
                         return Self::fail("Bootstrap failed: 5: Input/output error");
                     }
@@ -372,13 +403,14 @@ mod tests {
     fn waits_for_the_old_job_to_unload_before_bootstrapping() {
         let fake = FakeLaunchctl::running(100);
         fake.teardown_polls.set(4);
-        let pid = load(&fake, DOMAIN, PLIST).expect("loaded");
+        let pid = load(&fake, DOMAIN, PLIST, &|| true).expect("loaded").pid;
         assert_eq!(pid, 4242);
         let verbs = fake.verbs();
         let bootstrap = verbs.iter().position(|verb| verb == "bootstrap").expect("bootstrap");
         assert_eq!(verbs.iter().filter(|verb| *verb == "bootstrap").count(), 1);
         assert!(verbs[..bootstrap].contains(&"bootout".to_string()));
-        assert!(fake.calls.borrow()[bootstrap - 1].starts_with("print"));
+        assert_eq!(verbs[bootstrap - 1], "enable");
+        assert!(fake.calls.borrow()[bootstrap - 2].starts_with("print"));
         assert!(fake.pauses.get() >= 3);
     }
 
@@ -386,7 +418,7 @@ mod tests {
     fn retries_when_bootstrap_fails_with_eio() {
         let fake = FakeLaunchctl::default();
         fake.failing_bootstraps.set(2);
-        assert_eq!(load(&fake, DOMAIN, PLIST).expect("loaded"), 4242);
+        assert_eq!(load(&fake, DOMAIN, PLIST, &|| true).expect("loaded").pid, 4242);
         assert_eq!(fake.verbs().iter().filter(|verb| *verb == "bootstrap").count(), 3);
     }
 
@@ -394,7 +426,7 @@ mod tests {
     fn waits_until_the_job_has_a_pid() {
         let fake = FakeLaunchctl::default();
         fake.startup_polls.set(5);
-        assert_eq!(load(&fake, DOMAIN, PLIST).expect("loaded"), 4242);
+        assert_eq!(load(&fake, DOMAIN, PLIST, &|| true).expect("loaded").pid, 4242);
         assert!(fake.pauses.get() >= 4);
     }
 
@@ -402,7 +434,7 @@ mod tests {
     fn fails_when_bootstrap_never_succeeds() {
         let fake = FakeLaunchctl::default();
         fake.failing_bootstraps.set(BOOTSTRAP_ATTEMPTS);
-        let error = load(&fake, DOMAIN, PLIST).expect_err("must fail").to_string();
+        let error = load(&fake, DOMAIN, PLIST, &|| true).expect_err("must fail").to_string();
         assert!(error.contains("Input/output error"), "{error}");
         assert!(error.contains(PLIST), "{error}");
     }
@@ -410,7 +442,7 @@ mod tests {
     #[test]
     fn fails_when_the_job_never_gets_a_pid() {
         let fake = FakeLaunchctl { never_starts: true, ..FakeLaunchctl::default() };
-        let error = load(&fake, DOMAIN, PLIST).expect_err("must fail").to_string();
+        let error = load(&fake, DOMAIN, PLIST, &|| true).expect_err("must fail").to_string();
         assert!(error.contains("sin pid"), "{error}");
         assert_eq!(fake.verbs().iter().filter(|verb| *verb == "bootstrap").count(), BOOTSTRAP_ATTEMPTS as usize);
     }
@@ -419,9 +451,66 @@ mod tests {
     fn fails_when_the_old_job_never_unloads() {
         let fake = FakeLaunchctl { never_unloads: true, ..FakeLaunchctl::running(100) };
         fake.teardown_polls.set(UNLOAD_POLLS * 10);
-        let error = load(&fake, DOMAIN, PLIST).expect_err("must fail").to_string();
+        let error = load(&fake, DOMAIN, PLIST, &|| true).expect_err("must fail").to_string();
         assert!(error.contains("no descargó"), "{error}");
         assert!(!fake.verbs().contains(&"bootstrap".to_string()));
+    }
+
+    #[test]
+    fn enables_a_disabled_service_before_bootstrapping() {
+        let fake = FakeLaunchctl::default();
+        fake.disabled.set(true);
+        assert_eq!(load(&fake, DOMAIN, PLIST, &|| true).expect("loaded"), Started { pid: 4242, ready: true });
+        let verbs = fake.verbs();
+        assert_eq!(verbs.iter().filter(|verb| *verb == "bootstrap").count(), 1);
+        assert!(verbs.iter().position(|verb| verb == "enable") < verbs.iter().position(|verb| verb == "bootstrap"));
+    }
+
+    #[test]
+    fn waits_for_the_socket_before_declaring_the_daemon_healthy() {
+        let fake = FakeLaunchctl::default();
+        let pings = Cell::new(0);
+        let ready = || {
+            pings.set(pings.get() + 1);
+            pings.get() >= 4
+        };
+        assert_eq!(load(&fake, DOMAIN, PLIST, &ready).expect("loaded"), Started { pid: 4242, ready: true });
+        assert_eq!(pings.get(), 4);
+    }
+
+    #[test]
+    fn reports_a_live_job_that_never_answers_as_not_ready() {
+        let fake = FakeLaunchctl::default();
+        let started = load(&fake, DOMAIN, PLIST, &|| false).expect("loaded");
+        assert_eq!(started, Started { pid: 4242, ready: false });
+        assert_eq!(fake.verbs().iter().filter(|verb| *verb == "bootstrap").count(), 1);
+    }
+
+    #[test]
+    fn uninstall_fails_clearly_when_the_job_never_unloads() {
+        let fake = FakeLaunchctl { never_unloads: true, ..FakeLaunchctl::running(100) };
+        fake.teardown_polls.set(UNLOAD_POLLS * 10);
+        let dir = std::env::temp_dir().join(format!("gaze-uninstall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let plist = dir.join("com.kikedealba.gaze.plist");
+        std::fs::write(&plist, "<plist/>").expect("plist");
+        let error = remove(&fake, &format!("{DOMAIN}/{LABEL}"), &plist).expect_err("must fail").to_string();
+        assert!(error.contains("no descargó") && error.contains(LABEL), "{error}");
+        assert!(plist.exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn uninstall_removes_the_plist_once_the_job_is_gone() {
+        let fake = FakeLaunchctl::running(100);
+        fake.teardown_polls.set(3);
+        let dir = std::env::temp_dir().join(format!("gaze-uninstall-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let plist = dir.join("com.kikedealba.gaze.plist");
+        std::fs::write(&plist, "<plist/>").expect("plist");
+        assert!(remove(&fake, &format!("{DOMAIN}/{LABEL}"), &plist).expect("removed"));
+        assert!(!plist.exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

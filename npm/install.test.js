@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { ensureBinary, hopAllowed, needsRepair, registryManifest, repairLock, resolveTarget, startRepair } from './install.js'
+import { ensureBinary, hopAllowed, needsRepair, olderVersion, registryManifest, repairLock, resolveTarget, startRepair } from './install.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
@@ -19,12 +19,12 @@ const REGISTERING_SCRIPT = `#!/bin/sh
 self="$(cd "$(dirname "$0")" && pwd -P)/gaze"
 if [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi
 case "$1" in
-  setup) mkdir -p "$KIT_REGISTRY_DIR" && printf '{"version":"%s","bin":["%s"]}\\n' "$(cat "$(dirname "$self")/.version")" "$self" > "$KIT_REGISTRY_DIR/gaze.json" ;;
+  setup) mkdir -p "$KIT_REGISTRY_DIR" && printf '{"version":"%s","bin":["%s"]}\\n' "\${GAZE_FAKE_VERSION:-$(cat "$(dirname "$self")/.version")}" "$self" > "$KIT_REGISTRY_DIR/gaze.json" ;;
   daemon) printf '<plist><string>%s</string><string>serve</string></plist>\\n' "$self" > "$HOME/Library/LaunchAgents/com.kikedealba.gaze.plist" ;;
   *) echo "fake gaze $*" ;;
 esac
 `
-const NO_PROXY_ENV = { HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '', NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '', KIT_REGISTRY_DIR: '', XDG_CONFIG_HOME: '' }
+const NO_PROXY_ENV = { HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '', NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '', KIT_REGISTRY_DIR: '', XDG_CONFIG_HOME: '', XDG_DATA_HOME: '', GAZE_DATA_DIR: '', GAZE_DB_PATH: '' }
 const quiet = () => {}
 
 const scratch = mkdtempSync(path.join(tmpdir(), 'gaze-npm-test-'))
@@ -493,8 +493,8 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     return readFileSync(path.join(env.HOME, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'), 'utf8')
   }
 
-  async function settled(root) {
-    const lock = repairLock(root)
+  async function settled(env) {
+    const lock = repairLock(env)
     const deadline = Date.now() + 15_000
     while (existsSync(lock)) {
       if (Date.now() > deadline) throw new Error(`repair still running: ${readFileSync(lock, 'utf8')}`)
@@ -522,6 +522,8 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     await installVersion(VERSION, env)
     const current = await installVersion(VERSION, env)
     assert.equal(needsRepair(path.join(current, 'vendor', 'gaze'), { root: current, env }), false)
+    assert.equal(needsRepair(null, { root: current, env }), false)
+    rmSync(path.join(current, 'vendor'), { recursive: true, force: true })
     assert.equal(needsRepair(null, { root: current, env }), true)
     assert.equal(needsRepair(path.join(current, 'vendor', 'gaze'), { root: current, env: { ...env, GAZE_BINARY_PATH: '/bin/sh' } }), false)
   })
@@ -545,7 +547,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     const hook = await run(upgraded, ['hook', 'prompt'], env, '{}')
     assert.equal(hook.code, 0)
     assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`)
-    await settled(upgraded)
+    await settled(env)
 
     const binary = path.join(realpathSync(upgraded), 'vendor', 'gaze')
     assert.deepEqual(registered(env), { version: '9.9.9', bin: [binary] })
@@ -554,7 +556,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
 
     const next = await run(upgraded, ['hook', 'prompt'], env, '{}')
     assert.equal(next.stdout, 'fake gaze hook prompt\n')
-    assert.equal(existsSync(repairLock(upgraded)), false)
+    assert.equal(existsSync(repairLock(env)), false)
     assert.equal(readFileSync(env.GAZE_FAKE_LOG, 'utf8'), 'setup\ndaemon install\nhook prompt\n')
   })
 
@@ -565,7 +567,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     const result = await run(second, ['stats'], env)
     assert.equal(result.code, 0, result.stderr)
     assert.match(result.stderr, /refreshing them in the background/)
-    await settled(second)
+    await settled(env)
     rmSync(first, { recursive: true, force: true })
     const { bin, version } = registered(env)
     assert.equal(version, '9.9.8')
@@ -581,7 +583,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     const result = await run(root, ['setup'], env)
     assert.equal(result.code, 0, result.stderr)
     assert.doesNotMatch(result.stderr, /refreshing/)
-    assert.equal(existsSync(repairLock(root)), false)
+    assert.equal(existsSync(repairLock(env)), false)
   })
 
   test('a failed repair keeps its lock so hooks do not retry it on every run', { timeout: 30_000 }, async () => {
@@ -590,7 +592,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     const root = packageRoot({ version: '9.9.8' }, '9.9.8')
     const hook = await run(root, ['hook', 'prompt'], env, '{}')
     assert.equal(hook.code, 0)
-    const lock = repairLock(root)
+    const lock = repairLock(env)
     const deadline = Date.now() + 15_000
     while (!/HTTP 404/.test(existsSync(lock) ? readFileSync(lock, 'utf8') : '')) {
       assert.ok(Date.now() < deadline, 'the repair did not record its failure')
@@ -599,7 +601,115 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     assert.equal(startRepair({ root, env: { ...process.env, ...NO_PROXY_ENV, ...env } }), false)
     utimesSync(lock, new Date(0), new Date(0))
     assert.equal(startRepair({ root, env: { ...process.env, ...NO_PROXY_ENV, ...env, GAZE_DOWNLOAD_BASE: base } }), true)
-    await settled(root)
+    await settled(env)
     assert.equal(registered(env).version, '9.9.8')
+  })
+
+  test('olderVersion compares numeric versions', () => {
+    assert.equal(olderVersion('0.4.0', '0.4.1'), true)
+    assert.equal(olderVersion('0.10.0', '0.9.9'), false)
+    assert.equal(olderVersion('0.4.1', '0.4.1'), false)
+    assert.equal(olderVersion(undefined, '0.4.1'), true)
+  })
+
+  test('the repair lock lives in the data dir with mode 0600', async () => {
+    const env = machine()
+    await installVersion('9.9.7', env)
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const full = { ...process.env, ...NO_PROXY_ENV, ...env, GAZE_DOWNLOAD_BASE: base }
+    assert.equal(startRepair({ root, env: full }), true)
+    const lock = repairLock(env)
+    assert.equal(lock, path.join(env.HOME, '.local', 'share', 'gaze', 'repair.lock'))
+    assert.equal(statSync(lock).mode & 0o777, 0o600)
+    await settled(env)
+  })
+
+  test('does not repair when the manifest was removed, even with a plist', async () => {
+    const env = machine()
+    const root = await installVersion('9.9.7', env)
+    rmSync(registryManifest(env))
+    rmSync(path.join(root, 'vendor'), { recursive: true, force: true })
+    const upgraded = packageRoot({ version: '9.9.8' }, '9.9.8')
+    assert.equal(needsRepair(null, { root: upgraded, env }), false)
+    const result = await run(upgraded, ['stats'], env)
+    assert.equal(result.code, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /refreshing/)
+    assert.equal(existsSync(registryManifest(env)), false)
+  })
+
+  test('leaves a cargo or manual registration alone', async () => {
+    const env = machine()
+    const cargo = path.join(env.HOME, '.cargo', 'bin', 'gaze')
+    mkdirSync(path.dirname(cargo), { recursive: true })
+    writeFileSync(cargo, SCRIPT, { mode: 0o755 })
+    mkdirSync(env.KIT_REGISTRY_DIR, { recursive: true })
+    const manifest = JSON.stringify({ version: '0.0.1', bin: [cargo] })
+    writeFileSync(registryManifest(env), manifest)
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const result = await run(root, ['stats'], env)
+    assert.equal(result.code, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /refreshing/)
+    assert.equal(existsSync(repairLock(env)), false)
+    assert.equal(readFileSync(registryManifest(env), 'utf8'), manifest)
+  })
+
+  test('two npm installs do not take the registration back and forth', { timeout: 30_000 }, async () => {
+    const env = machine()
+    const first = await installVersion('9.9.8', env)
+    const same = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const sameRun = await run(same, ['stats'], env)
+    assert.equal(sameRun.code, 0, sameRun.stderr)
+    assert.doesNotMatch(sameRun.stderr, /refreshing/)
+    assert.equal(registered(env).bin[0], path.join(realpathSync(first), 'vendor', 'gaze'))
+
+    const newer = packageRoot({ version: '9.9.9' }, '9.9.9')
+    await run(newer, ['stats'], env)
+    await settled(env)
+    const winner = path.join(realpathSync(newer), 'vendor', 'gaze')
+    assert.equal(registered(env).bin[0], winner)
+
+    writeFileSync(env.GAZE_FAKE_LOG, '')
+    for (const root of [first, same, first]) {
+      const result = await run(root, ['stats'], env)
+      assert.doesNotMatch(result.stderr, /refreshing/)
+    }
+    assert.equal(existsSync(repairLock(env)), false)
+    assert.equal(registered(env).bin[0], winner)
+    assert.equal(readFileSync(env.GAZE_FAKE_LOG, 'utf8'), 'stats\nstats\nstats\n')
+  })
+
+  test('a repair that does not converge keeps a fresh lock instead of looping', { timeout: 30_000 }, async () => {
+    const env = machine()
+    await installVersion('9.9.7', env)
+    writeFileSync(env.GAZE_FAKE_LOG, '')
+    const mismatched = { ...env, GAZE_FAKE_VERSION: '9.9.0' }
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const started = Date.now()
+    const hook = await run(root, ['stats'], mismatched)
+    assert.equal(hook.code, 0, hook.stderr)
+    const lock = repairLock(env)
+    const deadline = Date.now() + 15_000
+    while (!/still does not point/.test(existsSync(lock) ? readFileSync(lock, 'utf8') : '')) {
+      assert.ok(Date.now() < deadline, 'the repair did not record that it did not converge')
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.ok(statSync(lock).mtimeMs >= started - 1000)
+    assert.equal(registered(env).version, '9.9.0')
+    const again = await run(root, ['stats'], mismatched)
+    assert.doesNotMatch(again.stderr, /refreshing/)
+    assert.deepEqual(readFileSync(env.GAZE_FAKE_LOG, 'utf8').trim().split('\n').sort(), ['daemon install', 'setup', 'stats', 'stats'])
+  })
+
+  test('an old lock whose owner is still alive is not taken over', async () => {
+    const env = machine()
+    await installVersion('9.9.7', env)
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const lock = repairLock(env)
+    mkdirSync(path.dirname(lock), { recursive: true })
+    writeFileSync(lock, `${process.pid}\n`)
+    utimesSync(lock, new Date(0), new Date(0))
+    assert.equal(startRepair({ root, env: { ...process.env, ...NO_PROXY_ENV, ...env } }), false)
+    assert.equal(readFileSync(lock, 'utf8'), `${process.pid}\n`)
+    rmSync(lock)
   })
 })

@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { accessSync, chmodSync, constants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,7 +24,7 @@ const TIMEOUT_MS = 120_000
 const NETWORK_EXIT = 3
 const UNWRITABLE = new Set(['EACCES', 'EPERM', 'EROFS'])
 const ORPHAN_AGE_MS = 10 * 60 * 1000
-const REFRESH_TIMEOUT_MS = 60_000
+const REFRESH_TIMEOUT_MS = 180_000
 const REPAIR_RETRY_MS = 10 * 60 * 1000
 
 export class InstallError extends Error {
@@ -310,26 +310,22 @@ function readJson(file) {
   }
 }
 
-export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
-  if (env.GAZE_BINARY_PATH) return false
-  const registered = readJson(registryManifest(env))
-  const plist = launchAgent(env)
-  const daemon = existsSync(plist)
-  if (!registered && !daemon) return false
-  if (!binary) return true
-  let real
-  try {
-    real = realpathSync(binary)
-  } catch {
-    return true
-  }
-  if (registered && (registered.version !== packageVersion(root) || registered.bin?.[0] !== real)) return true
-  if (!daemon) return false
-  try {
-    return !readFileSync(plist, 'utf8').includes(`<string>${real}</string>`)
-  } catch {
-    return true
-  }
+function npmManaged(bin) {
+  const vendor = path.dirname(bin)
+  return path.basename(vendor) === 'vendor' && readJson(path.join(path.dirname(vendor), 'package.json'))?.name === '@kikedealba/gaze'
+}
+
+function versionParts(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? ''))
+  return match ? match.slice(1).map(Number) : null
+}
+
+export function olderVersion(candidate, reference) {
+  const a = versionParts(candidate)
+  const b = versionParts(reference)
+  if (!a || !b) return a === null && b !== null
+  for (let index = 0; index < 3; index++) if (a[index] !== b[index]) return a[index] < b[index]
+  return false
 }
 
 function realpathOr(file) {
@@ -340,31 +336,103 @@ function realpathOr(file) {
   }
 }
 
-export function repairLock(root = ROOT) {
-  const id = createHash('sha256').update(realpathOr(root)).digest('hex').slice(0, 12)
-  return path.join(tmpdir(), `gaze-repair-${process.getuid?.() ?? 'user'}-${id}.lock`)
+export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
+  if (env.GAZE_BINARY_PATH) return false
+  const registered = readJson(registryManifest(env))
+  if (!registered) return false
+  const bin = registered.bin?.[0]
+  const present = typeof bin === 'string' && existsSync(bin)
+  if (present && !npmManaged(bin)) return false
+  if (!present || olderVersion(registered.version, packageVersion(root))) return true
+  if (!binary || realpathOr(bin) !== realpathOr(binary)) return false
+  const plist = launchAgent(env)
+  if (!existsSync(plist)) return false
+  try {
+    return !readFileSync(plist, 'utf8').includes(`<string>${bin}</string>`)
+  } catch {
+    return true
+  }
+}
+
+export function dataDir(env = process.env) {
+  if (env.GAZE_DATA_DIR) return env.GAZE_DATA_DIR
+  if (env.GAZE_DB_PATH) return path.dirname(env.GAZE_DB_PATH)
+  return path.join(env.XDG_DATA_HOME || path.join(home(env), '.local', 'share'), 'gaze')
+}
+
+export function repairLock(env = process.env) {
+  return path.join(dataDir(env), 'repair.lock')
+}
+
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+function lockOwner(file) {
+  try {
+    return Number.parseInt(readFileSync(file, 'utf8').split('\n', 1)[0], 10)
+  } catch {
+    return null
+  }
+}
+
+function reclaim(file, now) {
+  let before
+  try {
+    before = statSync(file)
+  } catch {
+    return true
+  }
+  if (now - before.mtimeMs < REPAIR_RETRY_MS || alive(lockOwner(file))) return false
+  const moved = `${file}.${process.pid}.${randomBytes(6).toString('hex')}`
+  try {
+    renameSync(file, moved)
+  } catch {
+    return false
+  }
+  let after
+  try {
+    after = statSync(moved)
+  } catch {
+    return false
+  }
+  if (after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) {
+    try {
+      linkSync(moved, file)
+    } catch {}
+    rmSync(moved, { force: true })
+    return false
+  }
+  rmSync(moved, { force: true })
+  return true
 }
 
 function acquireLock(file, now = Date.now()) {
+  try {
+    mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  } catch {
+    return false
+  }
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      writeFileSync(file, `${process.pid}\n`, { flag: 'wx' })
+      writeFileSync(file, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
       return true
     } catch (error) {
       if (error.code !== 'EEXIST') return false
     }
-    try {
-      if (now - statSync(file).mtimeMs < REPAIR_RETRY_MS) return false
-      rmSync(file, { force: true })
-    } catch {
-      return false
-    }
+    if (!reclaim(file, now)) return false
   }
   return false
 }
 
 export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
-  const lock = repairLock(root)
+  const lock = repairLock(env)
   if (!acquireLock(lock)) return false
   try {
     const child = spawn(process.execPath, [path.join(root, 'npm', 'install.js'), '--repair', lock], { env, detached: true, stdio: 'ignore' })
@@ -374,7 +442,7 @@ export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
     rmSync(lock, { force: true })
     return false
   }
-  warn?.(`gaze: the kit registration or the launchd daemon points to another gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
+  warn?.(`gaze: the kit registration or the launchd daemon points to an older or missing gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
   return true
 }
 
@@ -397,15 +465,19 @@ export function refreshRegistration(binary, { env = process.env, warn = (message
 async function repair(lock) {
   const problems = []
   try {
+    writeFileSync(lock, `${process.pid}\n`)
     const binary = await ensureBinary({ warn: (message) => problems.push(message.trim()) })
     if (refreshRegistration(binary, { warn: (message) => problems.push(message.trim()) })) {
-      rmSync(lock, { force: true })
-      return
+      if (!needsRepair(binary)) {
+        rmSync(lock, { force: true })
+        return
+      }
+      problems.push(`gaze setup and gaze daemon install finished, but ${registryManifest()} or ${launchAgent()} still does not point to ${binary}`)
     }
   } catch (error) {
     problems.push(error.message)
   }
-  writeFileSync(lock, `${new Date().toISOString()} ${problems.join('\n')}\n`)
+  writeFileSync(lock, `${process.pid}\n${new Date().toISOString()} ${problems.join('\n')}\n`)
   process.exitCode = 1
 }
 

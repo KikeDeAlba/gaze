@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build dependencies for onnxruntime and native-tls
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+      - run: cargo test --locked
+
+  npm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: versions have to agree
+        if: hashFiles('package.json') != ''
+        run: |
+          cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
+          npm_version="$(jq -r .version package.json)"
+          plugin_version="$(jq -r .version .claude-plugin/plugin.json)"
+          if [ "$cargo_version" != "$npm_version" ] || [ "$cargo_version" != "$plugin_version" ]; then
+            echo "Cargo.toml is $cargo_version, package.json is $npm_version, plugin.json is $plugin_version" >&2
+            exit 1
+          fi
+
+      - name: npm tests
+        if: hashFiles('package.json') != ''
+        run: npm run test:npm

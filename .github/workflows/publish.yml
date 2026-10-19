@@ -68,6 +68,12 @@ jobs:
           shasum -a 256 "$archive" > "$archive.sha256"
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
       - name: upload the assets to the release
         run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
         env:

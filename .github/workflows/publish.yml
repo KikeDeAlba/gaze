@@ -4,13 +4,13 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +31,8 @@ jobs:
   build:
     needs: check
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -49,9 +51,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
 
       - run: cargo build --release --locked
 
@@ -74,6 +76,9 @@ jobs:
   npm:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -83,12 +88,39 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: ${{ runner.temp }}/archives
+          merge-multiple: true
+
+      - name: embed the checksums of the built archives
+        env:
+          ARCHIVES: ${{ runner.temp }}/archives
+        run: |
+          version="$(jq -r .version package.json)"
+          assets='{}'
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            file="gaze-${version}-${target}.tar.gz"
+            sum="$(sha256sum "$ARCHIVES/$file" | cut -d ' ' -f 1)"
+            assets="$(jq -c --arg target "$target" --arg file "$file" --arg sum "$sum" '.[$target] = {file: $file, sha256: $sum}' <<< "$assets")"
+          done
+          jq -n --arg version "$version" --argjson assets "$assets" '{version: $version, assets: $assets}' > npm/checksums.json
+          jq -e '.assets | has("aarch64-apple-darwin") and has("x86_64-unknown-linux-gnu")' npm/checksums.json
+
       - name: install the tarball the way a person would, and run it
         run: |
           tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)"
           npm install -g --prefix "$RUNNER_TEMP/prefix" "$RUNNER_TEMP/$tarball"
           "$RUNNER_TEMP/prefix/bin/gaze" capabilities --json
 
-      - run: npm publish --provenance --access public
+      - name: publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = "true" ]; then
+            npm publish --provenance --access public --tag next
+          else
+            npm publish --provenance --access public
+          fi

@@ -41,7 +41,11 @@ jobs:
       - run: cargo test --locked
 
   npm:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +55,6 @@ jobs:
           node-version: 24
 
       - name: versions have to agree
-        if: hashFiles('package.json') != ''
         run: |
           cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
           npm_version="$(jq -r .version package.json)"
@@ -62,5 +65,4 @@ jobs:
           fi
 
       - name: npm tests
-        if: hashFiles('package.json') != ''
         run: npm run test:npm

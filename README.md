@@ -16,14 +16,36 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 
 ## Instalación
 
-Requiere Rust (1.88 o más nuevo) y macOS (el daemon usa launchd; el resto funciona en cualquier Unix).
+Plataformas con binario precompilado: macOS arm64 (Apple Silicon) y Linux x64. Requiere Node 24.5 o más nuevo. El daemon usa launchd, así que `gaze daemon install` solo aplica en macOS; el resto funciona en ambas.
 
 ```sh
-cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.3.0   # o, desde el clon: cargo install --path .
-gaze setup                        # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
-gaze daemon install               # daemon en launchd que mantiene el modelo cargado (hooks de ~15 ms)
+npm install -g @kikedealba/gaze && gaze setup   # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
+gaze daemon install                             # daemon en launchd que mantiene el modelo cargado (hooks de ~40 ms con el lanzador de npm)
 claude plugin marketplace add KikeDeAlba/gaze
-claude plugin install gaze@gaze   # hooks, skill y servidor MCP
+claude plugin install gaze@gaze                 # hooks, skill y servidor MCP
+```
+
+El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` lo genera el pipeline de publicación para cada target. Al instalarse, el `postinstall` descarga `gaze-<versión>-<target>.tar.gz` del release `v<versión>` en GitHub (solo por https y solo desde `github.com` y sus hosts de assets, con hasta 3 redirecciones y un tope de 200 MB), lo compara con ese hash y deja el binario en `vendor/gaze` dentro del paquete. Si el hash no coincide, falta `checksums.json` o el tar trae algo que no es un archivo normal, la instalación falla; si el problema es de red (sin conexión, HTTP o timeout), la instalación termina bien y avisa.
+
+El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postinstall` no corrió (por red, por `npm install --ignore-scripts` o porque npm bloqueó los scripts), **la primera ejecución de `gaze` descarga el binario**; por eso conviene que esa primera ejecución sea `gaze setup` y no un hook, que tiene pocos segundos. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado y avisa por stderr en cada ejecución.
+
+Tras actualizar o cambiar de Node, `gaze setup && gaze daemon install`: el manifiesto de kit y el plist de launchd guardan la ruta del binario dentro de `vendor/`, que cambia con el prefijo global de npm. El `postinstall` lo hace solo si ya existe `~/Library/LaunchAgents/com.kikedealba.gaze.plist`; si falla, solo avisa. `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar.
+
+Los hooks (`gaze hook …`) y `gaze mcp` nunca descargan: si todavía no hay binario, avisan por stderr y salen (0 los hooks, para no romper la sesión; 1 el MCP).
+
+Si npm no puede escribir en su prefijo global (`EACCES`), revisa `npm config get prefix` y usa uno de tu usuario: `npm config set prefix ~/.npm-global` y vuelve a instalar.
+
+Detrás de un proxy: si hay `HTTPS_PROXY` o `HTTP_PROXY` (o sus versiones en minúscula) y no está `NODE_USE_ENV_PROXY`, el instalador relanza la descarga en un proceso de Node con `NODE_USE_ENV_PROXY=1`, que hace que `fetch` use el proxy y respete `NO_PROXY`. El paquete exige Node 24.5 o más nuevo, la primera versión con `NODE_USE_ENV_PROXY`.
+
+El plugin de Claude Code (hooks, skill y MCP) se instala desde el marketplace de git, no desde npm; sus comandos llaman a `gaze` en el `PATH`.
+
+### Alternativa: compilar con cargo
+
+Requiere Rust 1.88 o más nuevo:
+
+```sh
+cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.4.0   # o, desde el clon: cargo install --path .
+gaze setup
 ```
 
 La primera vez que se calcula un embedding se descarga el modelo `multilingual-e5-small` (~120 MB) a `~/.cache/gaze`.
@@ -67,6 +89,7 @@ Con gaze activo, la memoria automática sobra. Según la documentación de Claud
 claude plugin uninstall gaze@gaze
 gaze daemon uninstall
 gaze uninstall          # quita el registro de kit; la base se queda en ~/.local/share/gaze
+npm uninstall -g @kikedealba/gaze
 ```
 
 ## Comandos
@@ -187,7 +210,10 @@ con `GAZE_HARVEST=1`, que apaga todos los hooks de gaze en esa sesión hija. El 
 cargo test                      # usa un embedder falso: no descarga modelos
 cargo clippy --all-targets -- -D warnings
 cargo build --release
+npm run test:npm                # lanzador e instalador de npm, contra un servidor local
 ```
+
+`GAZE_DOWNLOAD_BASE` cambia la URL base de los releases (por omisión `https://github.com/KikeDeAlba/gaze/releases/download`). Solo acepta https, salvo `http://127.0.0.1` y `http://localhost`, y avisa por stderr cuando se usa; las pruebas del instalador la apuntan a un servidor local y generan su propio `checksums.json`. `npm/checksums.json` no se versiona: para probar el paquete a mano, créalo con el formato `{"version":"<v>","assets":{"<target>":{"file":"gaze-<v>-<target>.tar.gz","sha256":"<hex>"}}}`.
 
 `GAZE_EMBEDDER=fake` sirve para probar la CLI sin modelo.
 

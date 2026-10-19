@@ -32,6 +32,19 @@ pub struct NewNode {
     pub attrs: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SourceMove {
+    pub from: String,
+    pub staging: String,
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Renamed {
+    pub id: String,
+    pub displaced: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WriteOutcome {
     pub id: String,
@@ -367,14 +380,7 @@ impl Store {
             names.push(text::fold(stem));
         }
         for name in names {
-            let waiting: Vec<String> = {
-                let mut stmt = self.conn.prepare("SELECT src FROM pending_links WHERE title = ?1 AND src != ?2")?;
-                stmt.query_map(params![name, id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
-            };
-            for src in waiting {
-                self.add_edge(&src, id, "link", 1.0, false)?;
-            }
-            self.conn.execute("DELETE FROM pending_links WHERE title = ?1 AND src != ?2", params![name, id])?;
+            self.claim_pending(id, &name)?;
         }
 
         self.conn.execute("DELETE FROM attrs WHERE node_id = ?1", [id])?;
@@ -407,6 +413,18 @@ impl Store {
         if let Some(head) = head {
             self.refresh_similar(id, project, head)?;
         }
+        Ok(())
+    }
+
+    fn claim_pending(&self, id: &str, name: &str) -> Result<()> {
+        let waiting: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT src FROM pending_links WHERE title = ?1 AND src != ?2")?;
+            stmt.query_map(params![name, id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        for src in waiting {
+            self.add_edge(&src, id, "link", 1.0, false)?;
+        }
+        self.conn.execute("DELETE FROM pending_links WHERE title = ?1 AND src != ?2", params![name, id])?;
         Ok(())
     }
 
@@ -515,17 +533,71 @@ impl Store {
 
     pub fn forget(&self, id: &str) -> Result<Node> {
         let node = self.require(id)?;
-        self.tx(|| {
-            self.delete_content(&node.id)?;
-            self.conn.execute("DELETE FROM edges WHERE src = ?1 OR dst = ?1", [&node.id])?;
-            self.conn.execute("DELETE FROM attrs WHERE node_id = ?1", [&node.id])?;
-            self.conn.execute("DELETE FROM pending_links WHERE src = ?1", [&node.id])?;
-            self.conn.execute("DELETE FROM injections WHERE node_id = ?1", [&node.id])?;
-            self.conn.execute("DELETE FROM ingest_files WHERE node_id = ?1", [&node.id])?;
-            self.conn.execute("DELETE FROM nodes WHERE id = ?1", [&node.id])?;
-            Ok(())
-        })?;
+        self.tx(|| self.delete_node(&node.id))?;
         Ok(node)
+    }
+
+    fn delete_node(&self, id: &str) -> Result<()> {
+        self.delete_content(id)?;
+        self.conn.execute("DELETE FROM edges WHERE src = ?1 OR dst = ?1", [id])?;
+        self.conn.execute("DELETE FROM attrs WHERE node_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM pending_links WHERE src = ?1", [id])?;
+        self.conn.execute("DELETE FROM injections WHERE node_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM ingest_files WHERE node_id = ?1", [id])?;
+        self.conn.execute("DELETE FROM nodes WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn rename_source_ref(&self, from: &str, to: &str) -> Result<Option<Renamed>> {
+        self.tx(|| self.rename_source_ref_inner(from, to))
+    }
+
+    pub fn move_source_refs(&self, moves: &[SourceMove]) -> Result<Vec<Option<Renamed>>> {
+        self.tx(|| {
+            let mut staged = Vec::with_capacity(moves.len());
+            for step in moves {
+                staged.push(self.rename_source_ref_inner(&step.from, &step.staging)?.is_some());
+            }
+            let mut outcomes = Vec::with_capacity(moves.len());
+            for (step, staged) in moves.iter().zip(staged) {
+                if !staged {
+                    outcomes.push(None);
+                    continue;
+                }
+                match &step.to {
+                    Some(to) => outcomes.push(self.rename_source_ref_inner(&step.staging, to)?),
+                    None => {
+                        let id: String = self.conn.query_row("SELECT id FROM nodes WHERE source_ref = ?1", [&step.staging], |r| r.get(0))?;
+                        self.delete_node(&id)?;
+                        self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [&step.staging])?;
+                        outcomes.push(Some(Renamed { id, displaced: None }));
+                    }
+                }
+            }
+            Ok(outcomes)
+        })
+    }
+
+    fn rename_source_ref_inner(&self, from: &str, to: &str) -> Result<Option<Renamed>> {
+        let Some(node) = self.by_source_ref(from)? else {
+            self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [from])?;
+            return Ok(None);
+        };
+        if from == to {
+            return Ok(Some(Renamed { id: node.id, displaced: None }));
+        }
+        let displaced = self.by_source_ref(to)?.map(|n| n.id).filter(|other| *other != node.id);
+        if let Some(other) = &displaced {
+            self.conn.execute("UPDATE OR IGNORE edges SET dst = ?1 WHERE dst = ?2 AND kind = 'link' AND src != ?1", params![node.id, other])?;
+            self.delete_node(other)?;
+        }
+        self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [to])?;
+        self.conn.execute("UPDATE nodes SET source_ref = ?2, updated_at = ?3 WHERE id = ?1", params![node.id, to, text::now_iso()])?;
+        self.conn.execute("UPDATE ingest_files SET path = ?2 WHERE path = ?1", params![from, to])?;
+        if let Some(stem) = to.rsplit('/').next().and_then(|f| f.strip_suffix(".md")).map(text::fold) {
+            self.claim_pending(&node.id, &stem)?;
+        }
+        Ok(Some(Renamed { id: node.id, displaced }))
     }
 
     pub fn link(&self, a: &str, b: &str) -> Result<(Node, Node)> {
@@ -967,6 +1039,26 @@ mod tests {
         assert_eq!((updated.action, updated.id.as_str()), ("updated", first.id.as_str()));
         let entry = store.remember(&e, note("dp", "entry", "Trabajo", "Arreglé DD-1905"), false).unwrap();
         assert!(store.neighbors(&entry.id).unwrap().iter().any(|n| n.id == first.id && n.edge_kind == "same-issue"));
+    }
+
+    #[test]
+    fn rename_source_ref_keeps_the_id_and_claims_links_to_the_new_name() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let mut doc = note("dp", "doc", "Infra", "Cuenta AWS");
+        doc.source = "inkwell".into();
+        doc.source_ref = Some("inkwell:dp/infra.md".into());
+        let moved = store.remember(&e, doc, false).unwrap();
+        store.conn.execute("INSERT INTO ingest_files (path, mtime, node_id) VALUES ('inkwell:dp/infra.md', 1, ?1)", [&moved.id]).unwrap();
+        let waiting = store.remember(&e, note("dp", "fact", "Pendiente", "Ver [[ops-guide]]"), false).unwrap();
+        assert!(store.neighbors(&moved.id).unwrap().is_empty());
+        let renamed = store.rename_source_ref("inkwell:dp/infra.md", "inkwell:dp/ops-guide.md").unwrap().unwrap();
+        assert_eq!(renamed, Renamed { id: moved.id.clone(), displaced: None });
+        assert_eq!(store.by_source_ref("inkwell:dp/ops-guide.md").unwrap().unwrap().id, moved.id);
+        assert!(store.neighbors(&moved.id).unwrap().iter().any(|n| n.id == waiting.id && n.edge_kind == "link"));
+        let path: String = store.conn.query_row("SELECT path FROM ingest_files WHERE node_id = ?1", [&moved.id], |r| r.get(0)).unwrap();
+        assert_eq!(path, "inkwell:dp/ops-guide.md");
+        assert!(store.rename_source_ref("inkwell:dp/missing.md", "inkwell:dp/other.md").unwrap().is_none());
     }
 
     #[test]

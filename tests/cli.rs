@@ -10,7 +10,10 @@ fn gaze(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
         .env("GAZE_SOCKET", dir.join("s.sock"))
         .env("KIT_REGISTRY_DIR", dir.join("tools.d"))
         .env("GAZE_EMBEDDER", "fake")
+        .env("INKWELL_DOCS_DIR", dir.join("docs"))
+        .env("INKWELL_DB_PATH", dir.join("inkwell.db"))
         .env("GAZE_PROJECT", "den")
+        .env("GAZE_BITA_BIN", "/nonexistent/bita")
         .env_remove("GAZE_HARVEST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -74,11 +77,34 @@ fn cli_contracts() {
     let setup = envelope(&gaze(d, &["setup", "--json"], None));
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(setup["data"]["manifest"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(manifest["subscribes"][0]["tool"], "bita");
+    assert_eq!(manifest["subscribes"][1]["tool"], "inkwell");
+    assert_eq!(manifest["subscribes"][1]["events"][0], "docs.changed");
+    assert_eq!(manifest["subscribes"][1]["command"][1], "inkwell-hook");
     assert_eq!(manifest["manifestVersion"], 1);
     assert_eq!(manifest["install"], "npm install -g @kikedealba/gaze && gaze setup");
     let native = std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap();
     assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
     assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
+}
+
+#[test]
+fn inkwell_hook_ingests_docs_changed_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let docs = d.join("docs");
+    std::fs::create_dir_all(docs.join("dp")).unwrap();
+    std::fs::write(docs.join("dp/infra.md"), "---\ntitle: Infraestructura\n---\n\nCuenta AWS de producción.\n").unwrap();
+    let event = serde_json::json!({
+        "docsRoot": docs, "commit": null, "kind": "page",
+        "changes": [{"action": "written", "relPath": "dp/infra.md"}, {"action": "written", "relPath": "../x.md"}],
+        "event": "docs.changed", "source": "inkwell", "firedAt": "2026-10-18T00:00:00Z"
+    });
+    let out = gaze(d, &["inkwell-hook"], Some(&event.to_string()));
+    let summary: Value = serde_json::from_str(out.trim().split_once(' ').unwrap().1.trim_start_matches("inkwell-hook ")).unwrap();
+    assert_eq!(summary["changes"][0]["result"], "created");
+    assert_eq!(summary["changes"][1]["result"], "ignored");
+    let found = envelope(&gaze(d, &["search", "cuenta aws", "--project", "global", "--json"], None));
+    assert_eq!(found["data"][0]["title"], "Infraestructura");
 }
 
 #[test]
@@ -92,4 +118,64 @@ fn hooks_are_silent_during_harvest() {
         .output()
         .unwrap();
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn inkwell_hook_survives_garbage_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for payload in [
+        "",
+        "not json",
+        "{",
+        "[]",
+        "null",
+        "\"docs\"",
+        "{\"event\":\"docs.changed\"}",
+        "{\"event\":\"docs.changed\",\"changes\":\"x\"}",
+        "{\"event\":\"docs.changed\",\"changes\":[null,1,{}]}",
+    ] {
+        let out = gaze(d, &["inkwell-hook"], Some(payload));
+        assert!(out.contains("inkwell-hook"), "payload {payload:?} gave {out:?}");
+    }
+    let found = envelope(&gaze(d, &["search", "nada", "--json"], None));
+    assert_eq!(found["data"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn inkwell_hook_exits_non_zero_when_a_change_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let docs = d.join("docs");
+    std::fs::create_dir_all(docs.join("dp")).unwrap();
+    std::fs::write(docs.join("dp/bad.md"), [0xff, 0xfe, 0x00]).unwrap();
+    std::fs::write(docs.join("dp/ok.md"), "# Ok\n\nBien.\n").unwrap();
+    let run = |relpaths: &[&str]| {
+        let changes: Vec<Value> = relpaths.iter().map(|rel| serde_json::json!({"action": "written", "relPath": rel})).collect();
+        let event = serde_json::json!({"event": "docs.changed", "docsRoot": docs, "changes": changes});
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gaze"))
+            .arg("inkwell-hook")
+            .env("GAZE_DATA_DIR", d)
+            .env("GAZE_CONFIG", d.join("config.toml"))
+            .env("GAZE_SOCKET", d.join("s.sock"))
+            .env("GAZE_EMBEDDER", "fake")
+            .env("GAZE_BITA_BIN", "/nonexistent/bita")
+            .env("INKWELL_DOCS_DIR", &docs)
+            .env("INKWELL_DB_PATH", d.join("inkwell.db"))
+            .env_remove("GAZE_HARVEST")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let failed = run(&["dp/bad.md", "dp/ok.md"]);
+    assert_eq!(failed.status.code(), Some(1));
+    let out = String::from_utf8(failed.stdout).unwrap();
+    let summary: Value = serde_json::from_str(out.trim().split_once(' ').unwrap().1.trim_start_matches("inkwell-hook ")).unwrap();
+    assert_eq!(summary["failed"], 1);
+    assert_eq!(summary["changes"][1]["result"], "created");
+    assert!(run(&["dp/ok.md"]).status.success());
 }

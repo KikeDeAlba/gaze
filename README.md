@@ -16,11 +16,11 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 
 ## Instalación
 
-Plataformas con binario precompilado: macOS arm64 (Apple Silicon) y Linux x64. Requiere Node 24 o más nuevo. El daemon usa launchd, así que `gaze daemon install` solo aplica en macOS; el resto funciona en ambas.
+Plataformas con binario precompilado: macOS arm64 (Apple Silicon) y Linux x64. Requiere Node 24.5 o más nuevo. El daemon usa launchd, así que `gaze daemon install` solo aplica en macOS; el resto funciona en ambas.
 
 ```sh
 npm install -g @kikedealba/gaze && gaze setup   # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
-gaze daemon install                             # daemon en launchd que mantiene el modelo cargado (hooks de ~15 ms)
+gaze daemon install                             # daemon en launchd que mantiene el modelo cargado (hooks de ~40 ms con el lanzador de npm)
 claude plugin marketplace add KikeDeAlba/gaze
 claude plugin install gaze@gaze                 # hooks, skill y servidor MCP
 ```
@@ -29,9 +29,13 @@ El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` 
 
 El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postinstall` no corrió (por red, por `npm install --ignore-scripts` o porque npm bloqueó los scripts), **la primera ejecución de `gaze` descarga el binario**; por eso conviene que esa primera ejecución sea `gaze setup` y no un hook, que tiene pocos segundos. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado y avisa por stderr en cada ejecución.
 
+Tras actualizar o cambiar de Node, `gaze setup && gaze daemon install`: el manifiesto de kit y el plist de launchd guardan la ruta del binario dentro de `vendor/`, que cambia con el prefijo global de npm. El `postinstall` lo hace solo si ya existe `~/Library/LaunchAgents/com.kikedealba.gaze.plist`; si falla, solo avisa. `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar.
+
+Los hooks (`gaze hook …`) y `gaze mcp` nunca descargan: si todavía no hay binario, avisan por stderr y salen (0 los hooks, para no romper la sesión; 1 el MCP).
+
 Si npm no puede escribir en su prefijo global (`EACCES`), revisa `npm config get prefix` y usa uno de tu usuario: `npm config set prefix ~/.npm-global` y vuelve a instalar.
 
-Detrás de un proxy: si hay `HTTPS_PROXY` o `HTTP_PROXY` (o sus versiones en minúscula) y no está `NODE_USE_ENV_PROXY`, el instalador relanza la descarga en un proceso de Node con `NODE_USE_ENV_PROXY=1`, que hace que `fetch` use el proxy y respete `NO_PROXY`. Requiere Node 24.5 o más nuevo; en versiones anteriores la variable se ignora y la descarga va directa.
+Detrás de un proxy: si hay `HTTPS_PROXY` o `HTTP_PROXY` (o sus versiones en minúscula) y no está `NODE_USE_ENV_PROXY`, el instalador relanza la descarga en un proceso de Node con `NODE_USE_ENV_PROXY=1`, que hace que `fetch` use el proxy y respete `NO_PROXY`. El paquete exige Node 24.5 o más nuevo, la primera versión con `NODE_USE_ENV_PROXY`.
 
 El plugin de Claude Code (hooks, skill y MCP) se instala desde el marketplace de git, no desde npm; sus comandos llaman a `gaze` en el `PATH`.
 

@@ -535,7 +535,10 @@ fn run(command: Command) -> Result<Output> {
         Command::Daemon { action } => match action {
             DaemonAction::Install => {
                 let result = daemon::install()?;
-                Ok(Output::new(result.clone(), format!("Daemon instalado en launchd ({})", result["plist"].as_str().unwrap_or_default())))
+                Ok(Output::new(
+                    result.clone(),
+                    format!("Daemon cargado en launchd con pid {} ({})", result["pid"], result["plist"].as_str().unwrap_or_default()),
+                ))
             }
             DaemonAction::Uninstall => {
                 let result = daemon::uninstall()?;
@@ -543,7 +546,16 @@ fn run(command: Command) -> Result<Output> {
             }
             DaemonAction::Status => {
                 let status = daemon::status();
-                let human = if status["running"] == json!(true) { format!("Corriendo (pid {})", status["pid"]) } else { "Apagado".to_string() };
+                let human = match status["state"].as_str().unwrap_or_default() {
+                    "running" => format!("Corriendo (pid {})", status["pid"]),
+                    "not-loaded" => {
+                        format!("Plist instalado pero no cargado en launchd ({}). Cárgalo con: gaze daemon install", paths::launch_agent().display())
+                    }
+                    "starting" => {
+                        format!("Cargado en launchd pero sin responder en el socket (pid {}); revisa {}", status["launchdPid"], paths::serve_log().display())
+                    }
+                    _ => "Apagado".to_string(),
+                };
                 Ok(Output::new(status, human))
             }
         },

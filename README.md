@@ -31,6 +31,8 @@ El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postins
 
 Tras actualizar o cambiar de Node, `gaze setup && gaze daemon install`: el manifiesto de kit y el plist de launchd guardan la ruta del binario dentro de `vendor/`, que cambia con el prefijo global de npm. El `postinstall` lo hace solo si ya existe `~/Library/LaunchAgents/com.kikedealba.gaze.plist`; si falla, solo avisa. `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar.
 
+`gaze daemon install` saca el job anterior de launchd, espera a que `launchctl print gui/<uid>/com.kikedealba.gaze` deje de encontrarlo, carga el plist y espera a que el job tenga pid; reintenta hasta 3 veces y, si no queda cargado, sale con error y el detalle de cada intento. `gaze daemon status` distingue entre corriendo, plist instalado pero no cargado en launchd, cargado sin responder todavía en el socket y apagado (campo `state`: `running`, `not-loaded`, `starting`, `stopped`).
+
 Los hooks (`gaze hook …`) y `gaze mcp` nunca descargan: si todavía no hay binario, avisan por stderr y salen (0 los hooks, para no romper la sesión; 1 el MCP).
 
 Si npm no puede escribir en su prefijo global (`EACCES`), revisa `npm config get prefix` y usa uno de tu usuario: `npm config set prefix ~/.npm-global` y vuelve a instalar.

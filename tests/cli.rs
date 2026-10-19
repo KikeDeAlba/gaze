@@ -13,6 +13,7 @@ fn gaze(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
         .env("INKWELL_DOCS_DIR", dir.join("docs"))
         .env("INKWELL_DB_PATH", dir.join("inkwell.db"))
         .env("GAZE_PROJECT", "den")
+        .env("GAZE_BITA_BIN", "/nonexistent/bita")
         .env_remove("GAZE_HARVEST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -139,4 +140,42 @@ fn inkwell_hook_survives_garbage_payloads() {
     }
     let found = envelope(&gaze(d, &["search", "nada", "--json"], None));
     assert_eq!(found["data"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn inkwell_hook_exits_non_zero_when_a_change_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let docs = d.join("docs");
+    std::fs::create_dir_all(docs.join("dp")).unwrap();
+    std::fs::write(docs.join("dp/bad.md"), [0xff, 0xfe, 0x00]).unwrap();
+    std::fs::write(docs.join("dp/ok.md"), "# Ok\n\nBien.\n").unwrap();
+    let run = |relpaths: &[&str]| {
+        let changes: Vec<Value> = relpaths.iter().map(|rel| serde_json::json!({"action": "written", "relPath": rel})).collect();
+        let event = serde_json::json!({"event": "docs.changed", "docsRoot": docs, "changes": changes});
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gaze"))
+            .arg("inkwell-hook")
+            .env("GAZE_DATA_DIR", d)
+            .env("GAZE_CONFIG", d.join("config.toml"))
+            .env("GAZE_SOCKET", d.join("s.sock"))
+            .env("GAZE_EMBEDDER", "fake")
+            .env("GAZE_BITA_BIN", "/nonexistent/bita")
+            .env("INKWELL_DOCS_DIR", &docs)
+            .env("INKWELL_DB_PATH", d.join("inkwell.db"))
+            .env_remove("GAZE_HARVEST")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(event.to_string().as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let failed = run(&["dp/bad.md", "dp/ok.md"]);
+    assert_eq!(failed.status.code(), Some(1));
+    let out = String::from_utf8(failed.stdout).unwrap();
+    let summary: Value = serde_json::from_str(out.trim().split_once(' ').unwrap().1.trim_start_matches("inkwell-hook ")).unwrap();
+    assert_eq!(summary["failed"], 1);
+    assert_eq!(summary["changes"][1]["result"], "created");
+    assert!(run(&["dp/ok.md"]).status.success());
 }

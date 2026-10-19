@@ -641,9 +641,15 @@ fn main() {
         }
         Command::InkwellHook => {
             let input = hooks::read_input();
-            let result = Store::open_default().and_then(|store| ingest::inkwell_event(&store, &embedder(), &input));
+            let result =
+                Store::open_default().and_then(|store| ingest::inkwell_event(&store, &embedder(), &input, &paths::inkwell_docs(), &project::bita_bin()));
             match result {
-                Ok(value) => println!("{} inkwell-hook {value}", text::now_iso()),
+                Ok(value) => {
+                    println!("{} inkwell-hook {value}", text::now_iso());
+                    if value["failed"].as_u64().unwrap_or(0) > 0 {
+                        std::process::exit(1);
+                    }
+                }
                 Err(error) => {
                     eprintln!("{} inkwell-hook: {error:#}", text::now_iso());
                     std::process::exit(1);

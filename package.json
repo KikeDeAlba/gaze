@@ -1,0 +1,52 @@
+{
+  "name": "@kikedealba/gaze",
+  "version": "0.3.0",
+  "description": "Per-project brain for coding agents: local knowledge store with hybrid vector search",
+  "license": "MIT",
+  "author": "Jesus Enrique De Alba Gaytan",
+  "homepage": "https://github.com/KikeDeAlba/gaze#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KikeDeAlba/gaze.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KikeDeAlba/gaze/issues"
+  },
+  "keywords": [
+    "memory",
+    "knowledge-base",
+    "vector-search",
+    "mcp",
+    "cli",
+    "claude-code",
+    "claude-code-plugin"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "bin": {
+    "gaze": "npm/gaze.js"
+  },
+  "files": [
+    "npm",
+    "!npm/*.test.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "postinstall": "node npm/install.js || true",
+    "test:npm": "node --test \"npm/*.test.js\""
+  }
+}

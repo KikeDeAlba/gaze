@@ -2,3 +2,6 @@
 .DS_Store
 *.log
 .claude/worktrees/
+/vendor
+/node_modules
+*.tgz

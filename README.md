@@ -25,7 +25,13 @@ claude plugin marketplace add KikeDeAlba/gaze
 claude plugin install gaze@gaze                 # hooks, skill y servidor MCP
 ```
 
-El paquete de npm no trae el binario: al instalarse descarga `gaze-<versión>-<target>.tar.gz` del release `v<versión>` en GitHub, verifica su SHA-256 y lo deja en `vendor/gaze` dentro del paquete. El comando `gaze` es un lanzador de Node que ejecuta ese binario; si falta (por ejemplo, con `npm install --ignore-scripts`), lo descarga en la primera ejecución. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado.
+El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` lo genera el pipeline de publicación para cada target. Al instalarse, el `postinstall` descarga `gaze-<versión>-<target>.tar.gz` del release `v<versión>` en GitHub (solo por https y solo desde `github.com` y sus hosts de assets, con hasta 3 redirecciones y un tope de 200 MB), lo compara con ese hash y deja el binario en `vendor/gaze` dentro del paquete. Si el hash no coincide, falta `checksums.json` o el tar trae algo que no es un archivo normal, la instalación falla; si el problema es de red (sin conexión, HTTP o timeout), la instalación termina bien y avisa.
+
+El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postinstall` no corrió (por red, por `npm install --ignore-scripts` o porque npm bloqueó los scripts), **la primera ejecución de `gaze` descarga el binario**; por eso conviene que esa primera ejecución sea `gaze setup` y no un hook, que tiene pocos segundos. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado y avisa por stderr en cada ejecución.
+
+Si npm no puede escribir en su prefijo global (`EACCES`), revisa `npm config get prefix` y usa uno de tu usuario: `npm config set prefix ~/.npm-global` y vuelve a instalar.
+
+Detrás de un proxy: si hay `HTTPS_PROXY` o `HTTP_PROXY` (o sus versiones en minúscula) y no está `NODE_USE_ENV_PROXY`, el instalador relanza la descarga en un proceso de Node con `NODE_USE_ENV_PROXY=1`, que hace que `fetch` use el proxy y respete `NO_PROXY`. Requiere Node 24.5 o más nuevo; en versiones anteriores la variable se ignora y la descarga va directa.
 
 El plugin de Claude Code (hooks, skill y MCP) se instala desde el marketplace de git, no desde npm; sus comandos llaman a `gaze` en el `PATH`.
 
@@ -203,7 +209,7 @@ cargo build --release
 npm run test:npm                # lanzador e instalador de npm, contra un servidor local
 ```
 
-`GAZE_DOWNLOAD_BASE` cambia la URL base de los releases (por omisión `https://github.com/KikeDeAlba/gaze/releases/download`); las pruebas del instalador la apuntan a un servidor local.
+`GAZE_DOWNLOAD_BASE` cambia la URL base de los releases (por omisión `https://github.com/KikeDeAlba/gaze/releases/download`). Solo acepta https, salvo `http://127.0.0.1` y `http://localhost`, y avisa por stderr cuando se usa; las pruebas del instalador la apuntan a un servidor local y generan su propio `checksums.json`. `npm/checksums.json` no se versiona: para probar el paquete a mano, créalo con el formato `{"version":"<v>","assets":{"<target>":{"file":"gaze-<v>-<target>.tar.gz","sha256":"<hex>"}}}`.
 
 `GAZE_EMBEDDER=fake` sirve para probar la CLI sin modelo.
 

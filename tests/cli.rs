@@ -75,6 +75,10 @@ fn cli_contracts() {
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(setup["data"]["manifest"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(manifest["subscribes"][0]["tool"], "bita");
     assert_eq!(manifest["manifestVersion"], 1);
+    assert_eq!(manifest["install"], "npm install -g @kikedealba/gaze && gaze setup");
+    let native = std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap();
+    assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
+    assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
 }
 
 #[test]

@@ -8,7 +8,7 @@ pub const CAPABILITIES: [&str; 8] =
     ["memory.search", "memory.write", "memory.graph.read", "memory.rules", "memory.ingest", "memory.import", "memory.hooks", "mcp.stdio"];
 
 pub const HOMEPAGE: &str = "https://github.com/KikeDeAlba/gaze";
-pub const INSTALL: &str = "cargo install --git https://github.com/KikeDeAlba/gaze --branch main && gaze setup";
+pub const INSTALL: &str = "npm install -g @kikedealba/gaze && gaze setup";
 
 pub fn capabilities() -> Value {
     json!({

@@ -449,7 +449,7 @@ impl DocsBatch<'_> {
             return;
         }
         let folder = rel.split('/').next().unwrap_or(GLOBAL);
-        if folder_project(self.store, inkwell_spaces(), folder) == GLOBAL {
+        if folder != "_no-project" && folder_project(self.store, inkwell_spaces(), folder) == GLOBAL {
             self.refreshed = true;
             let _ = project::refresh_projects_with(self.store, Path::new("/"), self.bita);
         }
@@ -1060,6 +1060,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
         let known = json!({"event": "docs.changed", "docsRoot": root, "changes": [{"action": "written", "relPath": "cliente-nuevo/a.md"}]});
         inkwell_event(&store, &e, &known, &root, &bin).unwrap();
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        std::fs::create_dir_all(root.join("_no-project/2026/10")).unwrap();
+        std::fs::write(root.join("_no-project/2026/10/c.md"), "# C\n\nTres.\n").unwrap();
+        let orphan = json!({"event": "docs.changed", "docsRoot": root, "changes": [{"action": "written", "relPath": "_no-project/2026/10/c.md"}]});
+        let result = inkwell_event(&store, &e, &orphan, &root, &bin).unwrap();
+        assert_eq!(result["changes"][0]["result"], "created");
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
 }

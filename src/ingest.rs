@@ -468,18 +468,55 @@ impl DocsBatch<'_> {
         }
     }
 
-    fn change(&mut self, change: &Value) -> Result<Value> {
+    fn moves(changes: &[Value]) -> Vec<(usize, String, String)> {
+        changes
+            .iter()
+            .enumerate()
+            .filter(|(_, change)| change["action"] == "moved")
+            .filter_map(|(index, change)| {
+                let rel = change["relPath"].as_str().and_then(inkwell_rel)?;
+                let from = change["from"].as_str().and_then(inkwell_rel)?;
+                (from != rel).then_some((index, from, rel))
+            })
+            .collect()
+    }
+
+    fn apply_moves(&mut self, changes: &[Value]) -> HashMap<usize, Result<Option<Renamed>>> {
+        let mut outcomes = HashMap::new();
+        let mut staged = Vec::new();
+        for (index, from, rel) in Self::moves(changes) {
+            let temporary = format!("inkwell-moving:{index}:{from}#");
+            match self.store.rename_source_ref(&format!("inkwell:{from}"), &temporary) {
+                Ok(Some(_)) => staged.push((index, from, rel, temporary)),
+                Ok(None) => {
+                    outcomes.insert(index, Ok(None));
+                }
+                Err(error) => {
+                    outcomes.insert(index, Err(error));
+                }
+            }
+        }
+        for (index, from, rel, temporary) in staged {
+            let outcome = self.store.rename_source_ref(&temporary, &format!("inkwell:{rel}"));
+            if outcome.is_err() {
+                let _ = self.store.rename_source_ref(&temporary, &format!("inkwell:{from}"));
+            }
+            outcomes.insert(index, outcome);
+        }
+        outcomes
+    }
+
+    fn change(&mut self, change: &Value, moved: Option<Result<Option<Renamed>>>) -> Result<Value> {
         let action = change["action"].as_str().unwrap_or_default();
-        let rel = change["relPath"].as_str().and_then(inkwell_rel);
+        let Some(raw) = change["relPath"].as_str() else { return Ok(json!({"result": "ignored"})) };
+        let rel = inkwell_rel(raw);
         let from = change["from"].as_str().and_then(inkwell_rel);
         match (action, rel) {
             ("written", Some(rel)) => self.write(&rel),
+            ("deleted", Some(rel)) if self.root.join(&rel).is_file() => self.write(&rel),
             ("deleted", Some(rel)) => Ok(json!({"result": if forget_inkwell(self.store, &rel)? { "removed" } else { "absent" }})),
             ("moved", Some(rel)) => {
-                let renamed = match &from {
-                    Some(from) if *from != rel => self.store.rename_source_ref(&format!("inkwell:{from}"), &format!("inkwell:{rel}"))?,
-                    _ => None,
-                };
+                let renamed = moved.transpose()?.flatten();
                 let mut written = self.write(&rel)?;
                 written["renamed"] = json!(renamed.is_some());
                 if let Some(Renamed { displaced: Some(displaced), .. }) = renamed {
@@ -512,17 +549,17 @@ pub fn inkwell_event(store: &Store, emb: &dyn Embedder, event: &Value, docs: &Pa
     let root_mismatch = canonical_or_raw(&root) != canonical_or_raw(docs);
     let mut batch = DocsBatch { store, emb, root, bita, refreshed: false };
     let mut failed = 0;
-    let results: Vec<Value> = event["changes"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+    let changes = event["changes"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut moved = batch.apply_moves(changes);
+    let results: Vec<Value> = changes
         .iter()
-        .map(|change| {
+        .enumerate()
+        .map(|(index, change)| {
             let mut summary = json!({"action": change["action"], "relPath": change["relPath"]});
             if !change["from"].is_null() {
                 summary["from"] = change["from"].clone();
             }
-            match batch.change(change) {
+            match batch.change(change, moved.remove(&index)) {
                 Ok(Value::Object(fields)) => {
                     for (key, value) in fields {
                         summary[key] = value;
@@ -1067,5 +1104,74 @@ mod tests {
         let result = inkwell_event(&store, &e, &orphan, &root, &bin).unwrap();
         assert_eq!(result["changes"][0]["result"], "created");
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn inkwell_moves_without_a_string_rel_path_keep_the_origin() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dp")).unwrap();
+        std::fs::write(root.join("dp/a.md"), "# A\n\nTexto.\n").unwrap();
+        docs_changed(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": "dp/a.md"}]))).unwrap();
+        let result = docs_changed(
+            &store,
+            &e,
+            &docs_event(root, json!([{"action": "moved", "from": "dp/a.md"}, {"action": "moved", "relPath": 7, "from": "dp/a.md"}, {"action": "moved", "relPath": null, "from": "dp/a.md"}])),
+        )
+        .unwrap();
+        assert!(result["changes"].as_array().unwrap().iter().all(|c| c["result"] == "ignored" && c.get("fromRemoved").is_none()));
+        assert!(store.by_source_ref("inkwell:dp/a.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn inkwell_chained_and_swapped_moves_keep_every_node() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dp")).unwrap();
+        for name in ["a", "b", "x", "y"] {
+            std::fs::write(root.join(format!("dp/{name}.md")), format!("# {name}\n\nContenido {name}.\n")).unwrap();
+            docs_changed(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": format!("dp/{name}.md")}]))).unwrap();
+        }
+        let id = |rel: &str| store.by_source_ref(&format!("inkwell:{rel}")).unwrap().map(|n| n.id);
+        let (a, b, x, y) = (id("dp/a.md").unwrap(), id("dp/b.md").unwrap(), id("dp/x.md").unwrap(), id("dp/y.md").unwrap());
+
+        std::fs::rename(root.join("dp/b.md"), root.join("dp/c.md")).unwrap();
+        std::fs::rename(root.join("dp/a.md"), root.join("dp/b.md")).unwrap();
+        std::fs::rename(root.join("dp/x.md"), root.join("dp/tmp")).unwrap();
+        std::fs::rename(root.join("dp/y.md"), root.join("dp/x.md")).unwrap();
+        std::fs::rename(root.join("dp/tmp"), root.join("dp/y.md")).unwrap();
+        let result = docs_changed(
+            &store,
+            &e,
+            &docs_event(
+                root,
+                json!([
+                    {"action": "moved", "relPath": "dp/b.md", "from": "dp/a.md"},
+                    {"action": "moved", "relPath": "dp/c.md", "from": "dp/b.md"},
+                    {"action": "moved", "relPath": "dp/y.md", "from": "dp/x.md"},
+                    {"action": "moved", "relPath": "dp/x.md", "from": "dp/y.md"},
+                ]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(result["failed"], 0);
+        assert!(result["changes"].as_array().unwrap().iter().all(|c| c["renamed"] == true && c.get("displaced").is_none()), "{result}");
+        assert_eq!(inkwell_count(&store), 4);
+        assert_eq!(id("dp/a.md"), None);
+        assert_eq!(id("dp/b.md"), Some(a.clone()));
+        assert_eq!(id("dp/c.md"), Some(b));
+        assert_eq!(id("dp/y.md"), Some(x));
+        assert_eq!(id("dp/x.md"), Some(y.clone()));
+        assert!(store.get(&y).unwrap().unwrap().body.contains("Contenido y"));
+        let staged: i64 = store.conn.query_row("SELECT COUNT(*) FROM nodes WHERE source_ref LIKE 'inkwell-moving:%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(staged, 0);
+
+        let stale = docs_changed(&store, &e, &docs_event(root, json!([{"action": "deleted", "relPath": "dp/b.md"}]))).unwrap();
+        assert_eq!(stale["changes"][0]["result"], "unchanged");
+        assert_eq!(id("dp/b.md"), Some(a));
     }
 }

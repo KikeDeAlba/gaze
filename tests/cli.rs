@@ -74,11 +74,34 @@ fn cli_contracts() {
     let setup = envelope(&gaze(d, &["setup", "--json"], None));
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(setup["data"]["manifest"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(manifest["subscribes"][0]["tool"], "bita");
+    assert_eq!(manifest["subscribes"][1]["tool"], "inkwell");
+    assert_eq!(manifest["subscribes"][1]["events"][0], "docs.changed");
+    assert_eq!(manifest["subscribes"][1]["command"][1], "inkwell-hook");
     assert_eq!(manifest["manifestVersion"], 1);
     assert_eq!(manifest["install"], "npm install -g @kikedealba/gaze && gaze setup");
     let native = std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap();
     assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
     assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
+}
+
+#[test]
+fn inkwell_hook_ingests_docs_changed_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let docs = d.join("docs");
+    std::fs::create_dir_all(docs.join("dp")).unwrap();
+    std::fs::write(docs.join("dp/infra.md"), "---\ntitle: Infraestructura\n---\n\nCuenta AWS de producción.\n").unwrap();
+    let event = serde_json::json!({
+        "docsRoot": docs, "commit": null, "kind": "page",
+        "changes": [{"action": "written", "relPath": "dp/infra.md"}, {"action": "written", "relPath": "../x.md"}],
+        "event": "docs.changed", "source": "inkwell", "firedAt": "2026-10-18T00:00:00Z"
+    });
+    let out = gaze(d, &["inkwell-hook"], Some(&event.to_string()));
+    let summary: Value = serde_json::from_str(out.trim().split_once(' ').unwrap().1.trim_start_matches("inkwell-hook ")).unwrap();
+    assert_eq!(summary["changes"][0]["result"], "created");
+    assert_eq!(summary["changes"][1]["result"], "ignored");
+    let found = envelope(&gaze(d, &["search", "cuenta aws", "--project", "global", "--json"], None));
+    assert_eq!(found["data"][0]["title"], "Infraestructura");
 }
 
 #[test]

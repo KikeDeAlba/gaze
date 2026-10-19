@@ -401,10 +401,195 @@ pub fn bita_event(store: &Store, emb: &dyn Embedder, event: &Value, bita: &str) 
     Ok(json!({"event": name, "entry": id, "node": outcome, "note": note}))
 }
 
+fn inkwell_rel(raw: &str) -> Option<String> {
+    let path = Path::new(raw);
+    if raw.is_empty() || path.is_absolute() || !raw.ends_with(".md") {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        let part = match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(part) => part,
+            _ => return None,
+        };
+        let part = part.to_str()?;
+        if part.starts_with('.') || part.ends_with(".assets") {
+            return None;
+        }
+        parts.push(part);
+    }
+    Some(parts.join("/"))
+}
+
+fn forget_inkwell(store: &Store, rel: &str) -> Result<bool> {
+    let key = format!("inkwell:{rel}");
+    store.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [&key])?;
+    match store.by_source_ref(&key)? {
+        Some(node) => {
+            store.forget(&node.id)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+fn write_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, rel: &str) -> Result<Value> {
+    let path = root.join(rel);
+    if !path.is_file() {
+        let removed = forget_inkwell(store, rel)?;
+        return Ok(json!({"result": if removed { "removed" } else { "absent" }}));
+    }
+    match inkwell_note(store, emb, root, &path)? {
+        Some((id, action)) => Ok(json!({"result": action, "id": id})),
+        None => Ok(json!({"result": "skipped"})),
+    }
+}
+
+fn inkwell_change(store: &Store, emb: &dyn Embedder, root: &Path, change: &Value) -> Result<Value> {
+    let action = change["action"].as_str().unwrap_or_default();
+    let Some(rel) = change["relPath"].as_str().and_then(inkwell_rel) else { return Ok(json!({"result": "ignored"})) };
+    match action {
+        "written" => write_inkwell(store, emb, root, &rel),
+        "deleted" => Ok(json!({"result": if forget_inkwell(store, &rel)? { "removed" } else { "absent" }})),
+        "moved" => {
+            let from = change["from"].as_str().and_then(inkwell_rel);
+            let removed = match &from {
+                Some(from) => forget_inkwell(store, from)?,
+                None => false,
+            };
+            let mut written = write_inkwell(store, emb, root, &rel)?;
+            written["fromRemoved"] = json!(removed);
+            Ok(written)
+        }
+        _ => Ok(json!({"result": "ignored"})),
+    }
+}
+
+pub fn inkwell_event(store: &Store, emb: &dyn Embedder, event: &Value) -> Result<Value> {
+    let name = event["event"].as_str().unwrap_or("docs.changed");
+    if name != "docs.changed" {
+        return Ok(json!({"event": name, "skipped": true}));
+    }
+    let root = event["docsRoot"].as_str().map(PathBuf::from).unwrap_or_else(paths::inkwell_docs);
+    let mut failed = 0;
+    let results: Vec<Value> = event["changes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|change| {
+            let mut summary = json!({"action": change["action"], "relPath": change["relPath"]});
+            if !change["from"].is_null() {
+                summary["from"] = change["from"].clone();
+            }
+            match inkwell_change(store, emb, &root, change) {
+                Ok(Value::Object(fields)) => {
+                    for (key, value) in fields {
+                        summary[key] = value;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    failed += 1;
+                    summary["result"] = json!("error");
+                    summary["error"] = json!(format!("{error:#}"));
+                }
+            }
+            summary
+        })
+        .collect();
+    Ok(json!({"event": name, "docsRoot": root, "commit": event["commit"], "failed": failed, "changes": results}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::embed::FakeEmbedder;
+
+    fn docs_event(root: &Path, changes: Value) -> Value {
+        json!({"docsRoot": root, "commit": null, "kind": "page", "changes": changes, "event": "docs.changed", "source": "inkwell", "firedAt": "2026-10-18T00:00:00Z"})
+    }
+
+    #[test]
+    fn inkwell_docs_events_write_delete_and_move_notes() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dp")).unwrap();
+        std::fs::write(root.join("dp/infra.md"), "---\ntitle: Infra\n---\n\nCuenta AWS de producción.\n").unwrap();
+        let written = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": "dp/infra.md"}]))).unwrap();
+        assert_eq!(written["changes"][0]["result"], "created");
+        let node = store.by_source_ref("inkwell:dp/infra.md").unwrap().unwrap();
+        assert!(node.body.contains("Cuenta AWS"));
+        std::fs::write(root.join("dp/infra.md"), "---\ntitle: Infra\n---\n\nCuenta AWS de staging.\n").unwrap();
+        let updated = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": "dp/infra.md"}]))).unwrap();
+        assert_eq!(updated["changes"][0]["result"], "updated");
+        assert!(store.by_source_ref("inkwell:dp/infra.md").unwrap().unwrap().body.contains("staging"));
+
+        std::fs::rename(root.join("dp/infra.md"), root.join("dp/aws.md")).unwrap();
+        let moved = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "moved", "relPath": "dp/aws.md", "from": "dp/infra.md"}]))).unwrap();
+        assert_eq!(moved["changes"][0]["fromRemoved"], true);
+        assert_eq!(moved["changes"][0]["from"], "dp/infra.md");
+        assert!(store.by_source_ref("inkwell:dp/infra.md").unwrap().is_none());
+        assert!(store.by_source_ref("inkwell:dp/aws.md").unwrap().unwrap().body.contains("staging"));
+
+        std::fs::remove_file(root.join("dp/aws.md")).unwrap();
+        let deleted = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "deleted", "relPath": "dp/aws.md"}]))).unwrap();
+        assert_eq!(deleted["changes"][0]["result"], "removed");
+        assert!(store.by_source_ref("inkwell:dp/aws.md").unwrap().is_none());
+        let again = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "deleted", "relPath": "dp/aws.md"}]))).unwrap();
+        assert_eq!(again["changes"][0]["result"], "absent");
+    }
+
+    #[test]
+    fn inkwell_written_events_for_missing_files_forget_the_note() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("dp")).unwrap();
+        std::fs::write(root.join("dp/old.md"), "# Old\n\nTexto viejo.\n").unwrap();
+        inkwell_event(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": "dp/old.md"}]))).unwrap();
+        std::fs::remove_file(root.join("dp/old.md")).unwrap();
+        let result = inkwell_event(&store, &e, &docs_event(root, json!([{"action": "written", "relPath": "dp/old.md"}]))).unwrap();
+        assert_eq!(result["changes"][0]["result"], "removed");
+        assert!(store.by_source_ref("inkwell:dp/old.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn inkwell_events_ignore_invalid_paths_and_keep_going_after_errors() {
+        let store = Store::in_memory().unwrap();
+        let e = FakeEmbedder;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("docs");
+        std::fs::create_dir_all(root.join("dp/page.assets")).unwrap();
+        std::fs::write(dir.path().join("secret.md"), "# Secret\n\nFuera.\n").unwrap();
+        std::fs::write(root.join("dp/page.assets/a.md"), "# Asset\n").unwrap();
+        std::fs::write(root.join("dp/img.png"), "png").unwrap();
+        std::fs::write(root.join("dp/bad.md"), [0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(root.join("dp/ok.md"), "# Ok\n\nBien.\n").unwrap();
+        let absolute = dir.path().join("secret.md").to_string_lossy().to_string();
+        let changes = json!([
+            {"action": "written", "relPath": "../secret.md"},
+            {"action": "written", "relPath": absolute},
+            {"action": "written", "relPath": "dp/../../secret.md"},
+            {"action": "written", "relPath": "dp/page.assets/a.md"},
+            {"action": "written", "relPath": "dp/img.png"},
+            {"action": "deleted", "relPath": null},
+            {"action": "renamed", "relPath": "dp/ok.md"},
+            {"action": "written", "relPath": "dp/bad.md"},
+            {"action": "written", "relPath": "dp/ok.md"},
+        ]);
+        let result = inkwell_event(&store, &e, &docs_event(&root, changes)).unwrap();
+        let outcomes: Vec<&str> = result["changes"].as_array().unwrap().iter().map(|c| c["result"].as_str().unwrap()).collect();
+        assert_eq!(outcomes, ["ignored", "ignored", "ignored", "ignored", "ignored", "ignored", "ignored", "error", "created"]);
+        let total: i64 = store.conn.query_row("SELECT COUNT(*) FROM nodes WHERE source = 'inkwell'", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(inkwell_rel("./dp/x.md").as_deref(), Some("dp/x.md"));
+        assert_eq!(result["failed"], 1);
+    }
 
     #[test]
     fn inkwell_folders_follow_the_bita_project_of_their_space() {

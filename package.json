@@ -46,7 +46,7 @@
     "access": "public"
   },
   "scripts": {
-    "postinstall": "node npm/install.js || true",
+    "postinstall": "node npm/install.js --postinstall",
     "test:npm": "node --test \"npm/*.test.js\""
   }
 }

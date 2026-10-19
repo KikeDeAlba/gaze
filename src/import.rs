@@ -251,7 +251,8 @@ mod tests {
     fn imports_memories_with_links_and_kinds() {
         unsafe { std::env::set_var("GAZE_BITA_BIN", "/nonexistent/bita") };
         let store = Store::in_memory().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        assert!(!skip_dir(&encode(&dir.path().canonicalize().unwrap().to_string_lossy())), "the fixture must live outside a skipped temp dir");
         let root = dir.path().join("projects");
         let work = dir.path().canonicalize().unwrap().join("work/app");
         std::fs::create_dir_all(work.join(".git")).unwrap();

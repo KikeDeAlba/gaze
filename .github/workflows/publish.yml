@@ -1,0 +1,94 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the tag and the manifests have to agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
+          npm_version="$(jq -r .version package.json)"
+          plugin_version="$(jq -r .version .claude-plugin/plugin.json)"
+          for found in "$cargo_version" "$npm_version" "$plugin_version"; do
+            if [ "$tag" != "$found" ]; then
+              echo "the release is $tag and the manifests say $cargo_version (Cargo.toml), $npm_version (package.json), $plugin_version (plugin.json)" >&2
+              exit 1
+            fi
+          done
+
+  build:
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build dependencies for onnxruntime and native-tls
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --locked
+
+      - name: smoke test the binary
+        run: ./target/release/gaze capabilities --json | jq -e .ok
+
+      - name: package the binary
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="gaze-${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C target/release gaze
+          shasum -a 256 "$archive" > "$archive.sha256"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: upload the assets to the release
+        run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  npm:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: install the tarball the way a person would, and run it
+        run: |
+          tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)"
+          npm install -g --prefix "$RUNNER_TEMP/prefix" "$RUNNER_TEMP/$tarball"
+          "$RUNNER_TEMP/prefix/bin/gaze" capabilities --json
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -23,7 +23,7 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=24.5"
   },
   "os": [
     "darwin",

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -14,7 +14,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
 const TARGETS = ['aarch64-apple-darwin', 'x86_64-unknown-linux-gnu']
 const SUPPORTED = { 'darwin-arm64': 'aarch64-apple-darwin', 'linux-x64': 'x86_64-unknown-linux-gnu' }[`${process.platform}-${process.arch}`]
-const SCRIPT = '#!/bin/sh\nif [ "$1" = "die" ]; then kill -TERM $$; fi\necho "fake gaze $*"\nexit "${GAZE_FAKE_EXIT:-0}"\n'
+const SCRIPT = '#!/bin/sh\nif [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi\nif [ "$1" = "die" ]; then kill -TERM $$; fi\nif [ "$1" = "cat" ]; then exec cat; fi\necho "fake gaze $*"\nexit "${GAZE_FAKE_EXIT:-0}"\n'
 const NO_PROXY_ENV = { HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '', NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '' }
 const quiet = () => {}
 
@@ -26,6 +26,7 @@ let requests = []
 let server
 let base
 let port
+const home = mkdtempSync(path.join(scratch, 'home-'))
 
 function tarball(name, populate) {
   const source = mkdtempSync(path.join(scratch, `${name}-`))
@@ -61,9 +62,10 @@ function install(root, options = {}) {
   return ensureBinary({ root, platform: 'linux', arch: 'x64', warn: quiet, ...options, env: { GAZE_DOWNLOAD_BASE: base, ...options.env } })
 }
 
-function node(file, args, env = {}) {
+function node(file, args, env = {}, input) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [file, ...args], { env: { ...process.env, ...NO_PROXY_ENV, GAZE_DOWNLOAD_BASE: base, GAZE_BINARY_PATH: '', ...env } })
+    const child = spawn(process.execPath, [file, ...args], { env: { ...process.env, ...NO_PROXY_ENV, HOME: home, GAZE_DOWNLOAD_BASE: base, GAZE_BINARY_PATH: '', ...env } })
+    if (input !== undefined) child.stdin.end(input)
     let stdout = ''
     let stderr = ''
     child.stdout.on('data', (chunk) => (stdout += chunk))
@@ -72,13 +74,13 @@ function node(file, args, env = {}) {
   })
 }
 
-function run(root, args, env) {
-  return node(path.join(root, 'npm', 'gaze.js'), args, env)
+function run(root, args, env, input) {
+  return node(path.join(root, 'npm', 'gaze.js'), args, env, input)
 }
 
 function vendorEntries(root) {
   const vendor = path.join(root, 'vendor')
-  return existsSync(vendor) ? readdirSync(vendor) : []
+  return existsSync(vendor) ? readdirSync(vendor).sort() : []
 }
 
 before(async () => {
@@ -166,8 +168,52 @@ describe('ensureBinary', () => {
     assert.equal(binary, path.join(root, 'vendor', 'gaze'))
     assert.equal(statSync(binary).mode & 0o777, 0o755)
     assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
-    assert.deepEqual(vendorEntries(root), ['gaze'])
+    assert.deepEqual(vendorEntries(root), ['.version', 'gaze'])
     assert.deepEqual(requests, [`/v${VERSION}/${asset('x86_64-unknown-linux-gnu')}`, `/files/${asset('x86_64-unknown-linux-gnu')}`])
+  })
+
+  test('writes vendor/.version and reinstalls when it belongs to another version', async () => {
+    const root = packageRoot()
+    mkdirSync(path.join(root, 'vendor'))
+    writeFileSync(path.join(root, 'vendor', 'gaze'), '#!/bin/sh\necho old\n', { mode: 0o755 })
+    writeFileSync(path.join(root, 'vendor', '.version'), '9.9.8\n')
+    await install(root)
+    assert.equal(readFileSync(path.join(root, 'vendor', '.version'), 'utf8'), `${VERSION}\n`)
+    assert.equal(readFileSync(path.join(root, 'vendor', 'gaze'), 'utf8'), SCRIPT)
+    assert.equal(requests.length, 2)
+
+    requests = []
+    await install(root)
+    assert.equal(requests.length, 0)
+  })
+
+  test('reinstalls a vendor binary without a version stamp', async () => {
+    const root = packageRoot()
+    mkdirSync(path.join(root, 'vendor'))
+    writeFileSync(path.join(root, 'vendor', 'gaze'), '#!/bin/sh\necho old\n', { mode: 0o755 })
+    await install(root)
+    assert.equal(readFileSync(path.join(root, 'vendor', 'gaze'), 'utf8'), SCRIPT)
+  })
+
+  test('removes install directories orphaned more than 10 minutes ago', async () => {
+    const root = packageRoot()
+    const vendor = path.join(root, 'vendor')
+    mkdirSync(path.join(vendor, '.install-old'), { recursive: true })
+    writeFileSync(path.join(vendor, '.install-old', 'partial.tar.gz'), 'x')
+    mkdirSync(path.join(vendor, '.install-recent'))
+    const stale = new Date(Date.now() - 11 * 60 * 1000)
+    utimesSync(path.join(vendor, '.install-old'), stale, stale)
+    await install(root)
+    assert.deepEqual(vendorEntries(root), ['.install-recent', '.version', 'gaze'])
+  })
+
+  test('offline mode never downloads', async () => {
+    const root = packageRoot()
+    assert.equal(await install(root, { offline: true }), null)
+    mkdirSync(path.join(root, 'vendor'))
+    writeFileSync(path.join(root, 'vendor', 'gaze'), SCRIPT, { mode: 0o755 })
+    assert.equal(await install(root, { offline: true }), path.join(root, 'vendor', 'gaze'))
+    assert.equal(requests.length, 0)
   })
 
   test('fails on a checksum mismatch and leaves no binary behind', async () => {
@@ -261,6 +307,55 @@ describe('gaze shim', { skip: SUPPORTED ? false : `no release target for ${proce
     assert.equal(requests.length, 0)
   })
 
+  test('forwards stdin to the binary', async () => {
+    const root = packageRoot()
+    const result = await run(root, ['cat'], {}, '{"session_id":"s"}\n')
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(result.stdout, '{"session_id":"s"}\n')
+  })
+
+  test('runs GAZE_BINARY_PATH without downloading', async () => {
+    const root = packageRoot(null)
+    const custom = path.join(scratch, 'custom-shim-gaze')
+    writeFileSync(custom, SCRIPT, { mode: 0o755 })
+    const result = await run(root, ['stats'], { GAZE_BINARY_PATH: custom, GAZE_FAKE_EXIT: '4' })
+    assert.equal(result.code, 4, result.stderr)
+    assert.equal(result.stdout, 'fake gaze stats\n')
+    assert.match(result.stderr, /using GAZE_BINARY_PATH=/)
+    assert.equal(requests.length, 0)
+    assert.deepEqual(vendorEntries(root), [])
+  })
+
+  test('a hook without a binary exits 0 quickly and does not download', async () => {
+    const root = packageRoot()
+    const started = Date.now()
+    const result = await run(root, ['hook', 'prompt'], {}, '{}')
+    assert.equal(result.code, 0)
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`)
+    assert.match(result.stderr, /^gaze: the gaze binary is not installed yet; run `gaze setup`/)
+    assert.equal(result.stdout, '')
+    assert.equal(requests.length, 0)
+    assert.deepEqual(vendorEntries(root), [])
+  })
+
+  test('mcp without a binary exits 1 and does not download', async () => {
+    const root = packageRoot()
+    const result = await run(root, ['mcp'])
+    assert.equal(result.code, 1)
+    assert.match(result.stderr, /not installed yet/)
+    assert.equal(requests.length, 0)
+  })
+
+  test('a hook still runs a vendor binary from an older version', async () => {
+    const root = packageRoot()
+    mkdirSync(path.join(root, 'vendor'))
+    writeFileSync(path.join(root, 'vendor', 'gaze'), SCRIPT, { mode: 0o755 })
+    writeFileSync(path.join(root, 'vendor', '.version'), '9.9.8\n')
+    const result = await run(root, ['hook', 'prompt'])
+    assert.equal(result.stdout, 'fake gaze hook prompt\n')
+    assert.equal(requests.length, 0)
+  })
+
   test('propagates the signal that terminated the binary', async () => {
     const root = packageRoot()
     const result = await run(root, ['die'])
@@ -282,7 +377,7 @@ describe('gaze shim', { skip: SUPPORTED ? false : `no release target for ${proce
       assert.equal(result.code, 0, result.stderr)
       assert.equal(result.stdout, 'fake gaze stats\n')
     }
-    assert.deepEqual(vendorEntries(root), ['gaze'])
+    assert.deepEqual(vendorEntries(root), ['.version', 'gaze'])
   })
 
   test('fails with a clear error when the package directory is not writable', { skip: process.getuid?.() === 0 }, async () => {
@@ -332,6 +427,36 @@ describe('install.js', () => {
     assert.notEqual(result.code, 0)
     assert.match(result.stderr, /^gaze: Checksum mismatch for /m)
     assert.deepEqual(vendorEntries(root), [])
+  })
+
+  test('--postinstall refreshes the manifest and daemon when the launch agent exists', { skip: !SUPPORTED }, async () => {
+    const root = packageRoot()
+    const agentHome = mkdtempSync(path.join(scratch, 'home-'))
+    mkdirSync(path.join(agentHome, 'Library', 'LaunchAgents'), { recursive: true })
+    writeFileSync(path.join(agentHome, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'), '<plist/>')
+    const log = path.join(scratch, `calls-${path.basename(root)}`)
+    const result = await installScript(root, ['--postinstall'], { HOME: agentHome, GAZE_FAKE_LOG: log })
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(readFileSync(log, 'utf8'), 'setup\ndaemon install\n')
+  })
+
+  test('--postinstall only warns when the daemon refresh fails', { skip: !SUPPORTED }, async () => {
+    const root = packageRoot()
+    const agentHome = mkdtempSync(path.join(scratch, 'home-'))
+    mkdirSync(path.join(agentHome, 'Library', 'LaunchAgents'), { recursive: true })
+    writeFileSync(path.join(agentHome, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'), '<plist/>')
+    const result = await installScript(root, ['--postinstall'], { HOME: agentHome, GAZE_FAKE_EXIT: '2' })
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stderr, /could not refresh the daemon with `gaze setup` \(exit 2\); run `gaze setup && gaze daemon install` by hand/)
+    assert.ok(existsSync(path.join(root, 'vendor', 'gaze')))
+  })
+
+  test('--postinstall leaves the daemon alone without a launch agent', { skip: !SUPPORTED }, async () => {
+    const root = packageRoot()
+    const log = path.join(scratch, `calls-${path.basename(root)}`)
+    const result = await installScript(root, ['--postinstall'], { GAZE_FAKE_LOG: log })
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(existsSync(log), false)
   })
 
   test('--postinstall fails without checksums.json', async () => {

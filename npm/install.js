@@ -1,6 +1,7 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { accessSync, chmodSync, constants, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -22,6 +23,8 @@ const ATTEMPTS = 3
 const TIMEOUT_MS = 120_000
 const NETWORK_EXIT = 3
 const UNWRITABLE = new Set(['EACCES', 'EPERM', 'EROFS'])
+const ORPHAN_AGE_MS = 10 * 60 * 1000
+const REFRESH_TIMEOUT_MS = 60_000
 
 export class InstallError extends Error {
   constructor(message) {
@@ -56,6 +59,30 @@ function executable(file) {
     return true
   } catch {
     return false
+  }
+}
+
+function vendorVersion(root) {
+  try {
+    return readFileSync(path.join(root, 'vendor', '.version'), 'utf8').trim()
+  } catch {
+    return null
+  }
+}
+
+function removeOrphans(vendor, now = Date.now()) {
+  let entries
+  try {
+    entries = readdirSync(vendor)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith('.install-')) continue
+    const file = path.join(vendor, entry)
+    try {
+      if (now - statSync(file).mtimeMs > ORPHAN_AGE_MS) rmSync(file, { recursive: true, force: true })
+    } catch {}
   }
 }
 
@@ -200,10 +227,11 @@ export async function ensureBinary(options = {}) {
   }
   const root = options.root ?? ROOT
   const binary = vendorBinary(root)
-  if (executable(binary)) return binary
+  const version = packageVersion(root)
+  if (executable(binary) && vendorVersion(root) === version) return binary
+  if (options.offline) return executable(binary) ? binary : null
 
   const target = resolveTarget(options.platform, options.arch)
-  const version = packageVersion(root)
   const { asset, sha256 } = readChecksum(root, version, target)
   if (proxied(env)) return downloadThroughProxy(root, env)
   const { base, custom } = downloadBase(env, warn)
@@ -216,6 +244,7 @@ export async function ensureBinary(options = {}) {
   let work
   try {
     mkdirSync(vendor, { recursive: true })
+    removeOrphans(vendor)
     work = mkdtempSync(path.join(vendor, '.install-'))
   } catch (error) {
     throw unwritable(error, vendor)
@@ -239,7 +268,10 @@ export async function ensureBinary(options = {}) {
     }
     if (!stats.isFile()) throw new InstallError(`${asset} has a gaze entry that is not a regular file`)
     chmodSync(extracted, 0o755)
+    const stamp = path.join(work, '.version')
+    writeFileSync(stamp, `${version}\n`)
     renameSync(extracted, binary)
+    renameSync(stamp, path.join(vendor, '.version'))
   } catch (error) {
     throw unwritable(error, vendor)
   } finally {
@@ -256,10 +288,28 @@ function invokedDirectly() {
   }
 }
 
+export function launchAgent() {
+  return path.join(homedir(), 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist')
+}
+
+export function refreshDaemon(binary, warn = (message) => process.stderr.write(message)) {
+  if (!existsSync(launchAgent())) return false
+  for (const args of [['setup'], ['daemon', 'install']]) {
+    const result = spawnSync(binary, args, { stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8' })
+    if (result.status !== 0) {
+      const detail = (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
+      warn(`gaze: could not refresh the daemon with \`gaze ${args.join(' ')}\` (${detail}); run \`gaze setup && gaze daemon install\` by hand\n`)
+      return false
+    }
+  }
+  return true
+}
+
 if (invokedDirectly()) {
   const [mode, root] = process.argv.slice(2)
   try {
-    await ensureBinary(mode === '--proxy-child' ? { root } : {})
+    const binary = await ensureBinary(mode === '--proxy-child' ? { root } : {})
+    if (mode === '--postinstall') refreshDaemon(binary)
   } catch (error) {
     if (mode === '--postinstall' && error instanceof NetworkError) {
       process.stderr.write(`gaze: could not download the binary during install (${error.message}); it will be downloaded the first time gaze runs\n`)

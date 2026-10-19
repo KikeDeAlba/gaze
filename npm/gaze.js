@@ -4,15 +4,24 @@ import { ensureBinary } from './install.js'
 
 const FORWARDED = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']
 
+const args = process.argv.slice(2)
+const QUICK_EXIT = { hook: 0, mcp: 1 }
+
+const quick = Object.hasOwn(QUICK_EXIT, args[0])
+
 let binary
 try {
-  binary = await ensureBinary()
+  binary = await ensureBinary({ offline: quick })
 } catch (error) {
   process.stderr.write(`gaze: ${error.message}\n`)
-  process.exit(1)
+  process.exit(quick ? QUICK_EXIT[args[0]] : 1)
+}
+if (!binary) {
+  process.stderr.write('gaze: the gaze binary is not installed yet; run `gaze setup` once to download it\n')
+  process.exit(QUICK_EXIT[args[0]])
 }
 
-const child = spawn(binary, process.argv.slice(2), { stdio: 'inherit' })
+const child = spawn(binary, args, { stdio: 'inherit' })
 const relays = FORWARDED.map((signal) => {
   const relay = () => child.kill(signal)
   process.on(signal, relay)

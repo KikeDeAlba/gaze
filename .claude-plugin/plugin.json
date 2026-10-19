@@ -1,6 +1,6 @@
 {
   "name": "gaze",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Cerebro local por proyecto con búsqueda híbrida: reglas, notas atómicas y cosecha automática para Claude Code.",
   "author": {
     "name": "Jesus Enrique De Alba Gaytan"

@@ -117,6 +117,8 @@ enum Command {
     Hook { event: String },
     #[command(about = "Recibe eventos de bita por stdin")]
     BitaHook,
+    #[command(about = "Recibe eventos de inkwell por stdin")]
+    InkwellHook,
     #[command(about = "Vuelve a calcular embeddings")]
     Reindex {
         #[arg(long)]
@@ -212,6 +214,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Daemon { .. } => "daemon",
         Command::Hook { .. } => "hook",
         Command::BitaHook => "bita-hook",
+        Command::InkwellHook => "inkwell-hook",
         Command::Reindex { .. } => "reindex",
         Command::HarvestRun { .. } => "harvest-run",
     }
@@ -571,7 +574,7 @@ fn run(command: Command) -> Result<Output> {
             let done = store.reindex(&embedder(), all)?;
             Ok(Output::new(json!({"reindexed": done}), format!("{done} notas con embeddings nuevos.")))
         }
-        Command::Mcp | Command::Serve { .. } | Command::Hook { .. } | Command::BitaHook | Command::HarvestRun { .. } => unreachable!(),
+        Command::Mcp | Command::Serve { .. } | Command::Hook { .. } | Command::BitaHook | Command::InkwellHook | Command::HarvestRun { .. } => unreachable!(),
     }
 }
 
@@ -631,6 +634,24 @@ fn main() {
                 Ok(value) => println!("{} bita-hook {value}", text::now_iso()),
                 Err(error) => {
                     eprintln!("{} bita-hook: {error:#}", text::now_iso());
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Command::InkwellHook => {
+            let input = hooks::read_input();
+            let result =
+                Store::open_default().and_then(|store| ingest::inkwell_event(&store, &embedder(), &input, &paths::inkwell_docs(), &project::bita_bin()));
+            match result {
+                Ok(value) => {
+                    println!("{} inkwell-hook {value}", text::now_iso());
+                    if value["failed"].as_u64().unwrap_or(0) > 0 {
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("{} inkwell-hook: {error:#}", text::now_iso());
                     std::process::exit(1);
                 }
             }

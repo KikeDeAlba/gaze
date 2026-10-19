@@ -31,7 +31,8 @@ pub fn manifest(bin: &str) -> Value {
         "capabilities": CAPABILITIES,
         "emits": [],
         "subscribes": [
-            {"tool": "bita", "events": ["stop", "amend", "delete"], "command": [bin, "bita-hook"]}
+            {"tool": "bita", "events": ["stop", "amend", "delete"], "command": [bin, "bita-hook"]},
+            {"tool": "inkwell", "events": ["docs.changed"], "command": [bin, "inkwell-hook"]}
         ],
         "mcp": {"stdio": [bin, "mcp"]},
         "homepage": HOMEPAGE,

@@ -32,6 +32,13 @@ pub struct NewNode {
     pub attrs: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SourceMove {
+    pub from: String,
+    pub staging: String,
+    pub to: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Renamed {
     pub id: String,
@@ -542,6 +549,36 @@ impl Store {
     }
 
     pub fn rename_source_ref(&self, from: &str, to: &str) -> Result<Option<Renamed>> {
+        self.tx(|| self.rename_source_ref_inner(from, to))
+    }
+
+    pub fn move_source_refs(&self, moves: &[SourceMove]) -> Result<Vec<Option<Renamed>>> {
+        self.tx(|| {
+            let mut staged = Vec::with_capacity(moves.len());
+            for step in moves {
+                staged.push(self.rename_source_ref_inner(&step.from, &step.staging)?.is_some());
+            }
+            let mut outcomes = Vec::with_capacity(moves.len());
+            for (step, staged) in moves.iter().zip(staged) {
+                if !staged {
+                    outcomes.push(None);
+                    continue;
+                }
+                match &step.to {
+                    Some(to) => outcomes.push(self.rename_source_ref_inner(&step.staging, to)?),
+                    None => {
+                        let id: String = self.conn.query_row("SELECT id FROM nodes WHERE source_ref = ?1", [&step.staging], |r| r.get(0))?;
+                        self.delete_node(&id)?;
+                        self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [&step.staging])?;
+                        outcomes.push(Some(Renamed { id, displaced: None }));
+                    }
+                }
+            }
+            Ok(outcomes)
+        })
+    }
+
+    fn rename_source_ref_inner(&self, from: &str, to: &str) -> Result<Option<Renamed>> {
         let Some(node) = self.by_source_ref(from)? else {
             self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [from])?;
             return Ok(None);
@@ -549,21 +586,17 @@ impl Store {
         if from == to {
             return Ok(Some(Renamed { id: node.id, displaced: None }));
         }
-        let stem = to.rsplit('/').next().and_then(|f| f.strip_suffix(".md")).map(text::fold);
-        let displaced = self.tx(|| {
-            let displaced = self.by_source_ref(to)?.map(|n| n.id).filter(|other| *other != node.id);
-            if let Some(other) = &displaced {
-                self.conn.execute("UPDATE OR IGNORE edges SET dst = ?1 WHERE dst = ?2 AND kind = 'link' AND src != ?1", params![node.id, other])?;
-                self.delete_node(other)?;
-            }
-            self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [to])?;
-            self.conn.execute("UPDATE nodes SET source_ref = ?2, updated_at = ?3 WHERE id = ?1", params![node.id, to, text::now_iso()])?;
-            self.conn.execute("UPDATE ingest_files SET path = ?2 WHERE path = ?1", params![from, to])?;
-            if let Some(stem) = &stem {
-                self.claim_pending(&node.id, stem)?;
-            }
-            Ok(displaced)
-        })?;
+        let displaced = self.by_source_ref(to)?.map(|n| n.id).filter(|other| *other != node.id);
+        if let Some(other) = &displaced {
+            self.conn.execute("UPDATE OR IGNORE edges SET dst = ?1 WHERE dst = ?2 AND kind = 'link' AND src != ?1", params![node.id, other])?;
+            self.delete_node(other)?;
+        }
+        self.conn.execute("DELETE FROM ingest_files WHERE path = ?1", [to])?;
+        self.conn.execute("UPDATE nodes SET source_ref = ?2, updated_at = ?3 WHERE id = ?1", params![node.id, to, text::now_iso()])?;
+        self.conn.execute("UPDATE ingest_files SET path = ?2 WHERE path = ?1", params![from, to])?;
+        if let Some(stem) = to.rsplit('/').next().and_then(|f| f.strip_suffix(".md")).map(text::fold) {
+            self.claim_pending(&node.id, &stem)?;
+        }
         Ok(Some(Renamed { id: node.id, displaced }))
     }
 

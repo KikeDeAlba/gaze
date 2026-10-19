@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -156,6 +156,28 @@ describe('gaze shim', { skip: SUPPORTED ? false : `no release target for ${proce
     assert.equal(result.code, 1)
     assert.match(result.stderr, /^gaze: Checksum mismatch for /)
     assert.equal(existsSync(path.join(root, 'vendor', 'gaze')), false)
+  })
+
+  test('survives concurrent first runs without corrupting vendor/', async () => {
+    const root = packageRoot()
+    const results = await Promise.all([1, 2, 3, 4, 5].map(() => run(root, ['stats'])))
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stdout, 'fake gaze stats\n')
+    }
+    assert.deepEqual(readdirSync(path.join(root, 'vendor')), ['gaze'])
+  })
+
+  test('fails with a clear error when the package directory is not writable', { skip: process.getuid?.() === 0 }, async () => {
+    const root = packageRoot()
+    chmodSync(root, 0o555)
+    try {
+      const result = await run(root, ['stats'])
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /^gaze: .*EACCES/)
+    } finally {
+      chmodSync(root, 0o755)
+    }
   })
 })
 

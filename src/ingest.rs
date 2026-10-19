@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use crate::embed::Embedder;
 use crate::paths;
 use crate::project;
-use crate::store::{GLOBAL, NewNode, Renamed, Store};
+use crate::store::{GLOBAL, NewNode, Renamed, SourceMove, Store};
 use crate::text;
 
 pub fn frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
@@ -98,6 +98,8 @@ impl IngestReport {
         }
     }
 }
+
+const MOVING: &str = "inkwell-moving:";
 
 fn inkwell_spaces() -> &'static HashMap<String, i64> {
     static SPACES: OnceLock<HashMap<String, i64>> = OnceLock::new();
@@ -214,6 +216,7 @@ pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path)
 pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: bool, bita: &str) -> Result<IngestReport> {
     let _ = project::refresh_projects_with(store, root, bita);
     let mut report = IngestReport { source: "inkwell".into(), ..Default::default() };
+    let stranded = recover_moving(store, root)?;
     let mut files = Vec::new();
     walk_md(root, &mut files);
     files.sort();
@@ -239,8 +242,34 @@ pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: 
             eprintln!("inkwell: {}/{}", index + 1, files.len());
         }
     }
-    report.removed = remove_missing(store, "inkwell:", &present)?;
+    report.removed = stranded + remove_missing(store, "inkwell:", &present)?;
     Ok(report)
+}
+
+fn recover_moving(store: &Store, root: &Path) -> Result<usize> {
+    let staged: Vec<(String, String)> = {
+        let mut stmt = store.conn.prepare("SELECT id, source_ref FROM nodes WHERE source_ref LIKE ?1 || '%'")?;
+        stmt.query_map([MOVING], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    let mut forgotten = 0;
+    for (id, staging) in staged {
+        let from = staging.strip_prefix(MOVING).and_then(|rest| rest.split_once(':')).and_then(|(_, from)| from.strip_suffix('#')).and_then(inkwell_rel);
+        let restore = match from {
+            Some(rel) if root.join(&rel).is_file() && store.by_source_ref(&format!("inkwell:{rel}"))?.is_none() => Some(rel),
+            _ => None,
+        };
+        match restore {
+            Some(rel) => {
+                store.rename_source_ref(&staging, &format!("inkwell:{rel}"))?;
+            }
+            None => {
+                store.forget(&id)?;
+                forgotten += 1;
+            }
+        }
+    }
+    store.conn.execute("DELETE FROM ingest_files WHERE path LIKE ?1 || '%'", [MOVING])?;
+    Ok(forgotten)
 }
 
 fn remove_missing(store: &Store, prefix: &str, present: &HashSet<String>) -> Result<usize> {
@@ -468,49 +497,40 @@ impl DocsBatch<'_> {
         }
     }
 
-    fn moves(changes: &[Value]) -> Vec<(usize, String, String)> {
+    fn moves(changes: &[Value]) -> Vec<(usize, SourceMove)> {
         changes
             .iter()
             .enumerate()
             .filter(|(_, change)| change["action"] == "moved")
             .filter_map(|(index, change)| {
-                let rel = change["relPath"].as_str().and_then(inkwell_rel)?;
+                let raw = change["relPath"].as_str()?;
                 let from = change["from"].as_str().and_then(inkwell_rel)?;
-                (from != rel).then_some((index, from, rel))
+                let to = inkwell_rel(raw);
+                (to.as_ref() != Some(&from)).then(|| {
+                    (
+                        index,
+                        SourceMove { staging: format!("{MOVING}{index}:{from}#"), from: format!("inkwell:{from}"), to: to.map(|to| format!("inkwell:{to}")) },
+                    )
+                })
             })
             .collect()
     }
 
     fn apply_moves(&mut self, changes: &[Value]) -> HashMap<usize, Result<Option<Renamed>>> {
-        let mut outcomes = HashMap::new();
-        let mut staged = Vec::new();
-        for (index, from, rel) in Self::moves(changes) {
-            let temporary = format!("inkwell-moving:{index}:{from}#");
-            match self.store.rename_source_ref(&format!("inkwell:{from}"), &temporary) {
-                Ok(Some(_)) => staged.push((index, from, rel, temporary)),
-                Ok(None) => {
-                    outcomes.insert(index, Ok(None));
-                }
-                Err(error) => {
-                    outcomes.insert(index, Err(error));
-                }
+        let (indexes, moves): (Vec<usize>, Vec<SourceMove>) = Self::moves(changes).into_iter().unzip();
+        match self.store.move_source_refs(&moves) {
+            Ok(outcomes) => indexes.into_iter().zip(outcomes.into_iter().map(Ok)).collect(),
+            Err(error) => {
+                let message = format!("{error:#}");
+                indexes.into_iter().map(|index| (index, Err(anyhow::anyhow!("{message}")))).collect()
             }
         }
-        for (index, from, rel, temporary) in staged {
-            let outcome = self.store.rename_source_ref(&temporary, &format!("inkwell:{rel}"));
-            if outcome.is_err() {
-                let _ = self.store.rename_source_ref(&temporary, &format!("inkwell:{from}"));
-            }
-            outcomes.insert(index, outcome);
-        }
-        outcomes
     }
 
     fn change(&mut self, change: &Value, moved: Option<Result<Option<Renamed>>>) -> Result<Value> {
         let action = change["action"].as_str().unwrap_or_default();
         let Some(raw) = change["relPath"].as_str() else { return Ok(json!({"result": "ignored"})) };
         let rel = inkwell_rel(raw);
-        let from = change["from"].as_str().and_then(inkwell_rel);
         match (action, rel) {
             ("written", Some(rel)) => self.write(&rel),
             ("deleted", Some(rel)) if self.root.join(&rel).is_file() => self.write(&rel),
@@ -525,10 +545,7 @@ impl DocsBatch<'_> {
                 Ok(written)
             }
             ("moved", None) => {
-                let removed = match &from {
-                    Some(from) => forget_inkwell(self.store, from)?,
-                    None => false,
-                };
+                let removed = moved.transpose()?.flatten().is_some();
                 Ok(json!({"result": if removed { "removed" } else { "ignored" }, "fromRemoved": removed}))
             }
             _ => Ok(json!({"result": "ignored"})),
@@ -1173,5 +1190,108 @@ mod tests {
         let stale = docs_changed(&store, &e, &docs_event(root, json!([{"action": "deleted", "relPath": "dp/b.md"}]))).unwrap();
         assert_eq!(stale["changes"][0]["result"], "unchanged");
         assert_eq!(id("dp/b.md"), Some(a));
+    }
+
+    fn seed(store: &Store, root: &Path, names: &[&str]) -> Vec<String> {
+        std::fs::create_dir_all(root.join("dp/page.assets")).unwrap();
+        names
+            .iter()
+            .map(|name| {
+                std::fs::write(root.join(format!("dp/{name}.md")), format!("# {name}\n\nContenido {name}.\n")).unwrap();
+                docs_changed(store, &FakeEmbedder, &docs_event(root, json!([{"action": "written", "relPath": format!("dp/{name}.md")}]))).unwrap();
+                store.by_source_ref(&format!("inkwell:dp/{name}.md")).unwrap().unwrap().id
+            })
+            .collect()
+    }
+
+    fn staged_count(store: &Store) -> i64 {
+        store.conn.query_row("SELECT COUNT(*) FROM nodes WHERE source_ref LIKE 'inkwell-moving:%'", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn inkwell_moves_roll_back_together_when_one_fails() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ids = seed(&store, root, &["a", "b"]);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE UPDATE OF source_ref ON nodes WHEN NEW.source_ref = 'inkwell:dp/c.md' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        std::fs::rename(root.join("dp/b.md"), root.join("dp/c.md")).unwrap();
+        std::fs::rename(root.join("dp/a.md"), root.join("dp/b.md")).unwrap();
+        let result = docs_changed(
+            &store,
+            &FakeEmbedder,
+            &docs_event(
+                root,
+                json!([{"action": "moved", "relPath": "dp/b.md", "from": "dp/a.md"}, {"action": "moved", "relPath": "dp/c.md", "from": "dp/b.md"}]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(result["failed"], 2);
+        assert!(result["changes"].as_array().unwrap().iter().all(|c| c["result"] == "error"));
+        assert_eq!(store.by_source_ref("inkwell:dp/a.md").unwrap().unwrap().id, ids[0]);
+        assert_eq!(store.by_source_ref("inkwell:dp/b.md").unwrap().unwrap().id, ids[1]);
+        assert!(store.by_source_ref("inkwell:dp/c.md").unwrap().is_none());
+        assert_eq!(staged_count(&store), 0);
+        assert_eq!(inkwell_count(&store), 2);
+        let marks: Vec<String> = {
+            let mut stmt = store.conn.prepare("SELECT path FROM ingest_files ORDER BY path").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(marks, ["inkwell:dp/a.md", "inkwell:dp/b.md"]);
+    }
+
+    #[test]
+    fn inkwell_moves_out_of_the_docs_tree_run_with_the_other_moves() {
+        for order in [[0, 1], [1, 0]] {
+            let store = Store::in_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let ids = seed(&store, root, &["a", "b"]);
+            std::fs::rename(root.join("dp/b.md"), root.join("dp/page.assets/x.md")).unwrap();
+            std::fs::rename(root.join("dp/a.md"), root.join("dp/b.md")).unwrap();
+            let moves = [
+                json!({"action": "moved", "relPath": "dp/b.md", "from": "dp/a.md"}),
+                json!({"action": "moved", "relPath": "dp/page.assets/x.md", "from": "dp/b.md"}),
+            ];
+            let changes: Vec<Value> = order.iter().map(|i| moves[*i].clone()).collect();
+            let result = docs_changed(&store, &FakeEmbedder, &docs_event(root, json!(changes))).unwrap();
+            assert_eq!(result["failed"], 0, "{order:?}: {result}");
+            assert_eq!(store.by_source_ref("inkwell:dp/b.md").unwrap().unwrap().id, ids[0], "{order:?}");
+            assert!(store.get(&ids[1]).unwrap().is_none(), "{order:?}");
+            assert!(store.by_source_ref("inkwell:dp/a.md").unwrap().is_none());
+            assert_eq!(inkwell_count(&store), 1);
+            assert_eq!(staged_count(&store), 0);
+        }
+    }
+
+    #[test]
+    fn inkwell_ingest_recovers_stranded_moving_keys() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ids = seed(&store, root, &["a", "gone", "taken"]);
+        std::fs::remove_file(root.join("dp/gone.md")).unwrap();
+        for (id, from) in ids.iter().zip(["a", "gone", "taken"]) {
+            store.conn.execute("UPDATE nodes SET source_ref = ?2 WHERE id = ?1", rusqlite::params![id, format!("inkwell-moving:3:dp/{from}.md#")]).unwrap();
+            store
+                .conn
+                .execute("UPDATE ingest_files SET path = ?2 WHERE node_id = ?1", rusqlite::params![id, format!("inkwell-moving:3:dp/{from}.md#")])
+                .unwrap();
+        }
+        let squatter = seed(&store, root, &["taken"]).remove(0);
+        let report = ingest_inkwell(&store, &FakeEmbedder, root, false, "/nonexistent/bita").unwrap();
+        assert_eq!((report.created, report.removed), (0, 2));
+        assert_eq!(store.by_source_ref("inkwell:dp/a.md").unwrap().unwrap().id, ids[0]);
+        assert_eq!(store.by_source_ref("inkwell:dp/taken.md").unwrap().unwrap().id, squatter);
+        assert!(store.get(&ids[1]).unwrap().is_none());
+        assert!(store.get(&ids[2]).unwrap().is_none());
+        assert_eq!(staged_count(&store), 0);
+        let stray: i64 = store.conn.query_row("SELECT COUNT(*) FROM ingest_files WHERE path LIKE 'inkwell-moving:%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stray, 0);
     }
 }

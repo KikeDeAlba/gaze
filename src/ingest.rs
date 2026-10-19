@@ -216,7 +216,10 @@ pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path)
 pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: bool, bita: &str) -> Result<IngestReport> {
     let _ = project::refresh_projects_with(store, root, bita);
     let mut report = IngestReport { source: "inkwell".into(), ..Default::default() };
-    let stranded = recover_moving(store, root)?;
+    let stranded = recover_moving(store, root).unwrap_or_else(|error| {
+        eprintln!("inkwell: recover moving keys: {error:#}");
+        0
+    });
     let mut files = Vec::new();
     walk_md(root, &mut files);
     files.sort();
@@ -1274,9 +1277,9 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let ids = seed(&store, root, &["a", "gone", "taken"]);
+        let ids = seed(&store, root, &["a:b#c", "gone", "taken"]);
         std::fs::remove_file(root.join("dp/gone.md")).unwrap();
-        for (id, from) in ids.iter().zip(["a", "gone", "taken"]) {
+        for (id, from) in ids.iter().zip(["a:b#c", "gone", "taken"]) {
             store.conn.execute("UPDATE nodes SET source_ref = ?2 WHERE id = ?1", rusqlite::params![id, format!("inkwell-moving:3:dp/{from}.md#")]).unwrap();
             store
                 .conn
@@ -1286,12 +1289,31 @@ mod tests {
         let squatter = seed(&store, root, &["taken"]).remove(0);
         let report = ingest_inkwell(&store, &FakeEmbedder, root, false, "/nonexistent/bita").unwrap();
         assert_eq!((report.created, report.removed), (0, 2));
-        assert_eq!(store.by_source_ref("inkwell:dp/a.md").unwrap().unwrap().id, ids[0]);
+        assert_eq!(store.by_source_ref("inkwell:dp/a:b#c.md").unwrap().unwrap().id, ids[0]);
+        assert_eq!(report.unchanged, 2);
         assert_eq!(store.by_source_ref("inkwell:dp/taken.md").unwrap().unwrap().id, squatter);
         assert!(store.get(&ids[1]).unwrap().is_none());
         assert!(store.get(&ids[2]).unwrap().is_none());
         assert_eq!(staged_count(&store), 0);
         let stray: i64 = store.conn.query_row("SELECT COUNT(*) FROM ingest_files WHERE path LIKE 'inkwell-moving:%'", [], |r| r.get(0)).unwrap();
         assert_eq!(stray, 0);
+    }
+
+    #[test]
+    fn inkwell_ingest_keeps_going_when_staging_recovery_fails() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ids = seed(&store, root, &["a", "b"]);
+        store.conn.execute("UPDATE nodes SET source_ref = 'inkwell-moving:0:dp/a.md#' WHERE id = ?1", [&ids[0]]).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE UPDATE OF source_ref ON nodes WHEN OLD.source_ref LIKE 'inkwell-moving:%' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        let report = ingest_inkwell(&store, &FakeEmbedder, root, false, "/nonexistent/bita").unwrap();
+        assert_eq!((report.scanned, report.created, report.unchanged, report.failed), (2, 1, 1, 0));
+        assert_eq!(store.by_source_ref("inkwell:dp/b.md").unwrap().unwrap().id, ids[1]);
     }
 }

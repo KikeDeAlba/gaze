@@ -16,14 +16,26 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 
 ## Instalación
 
-Requiere Rust (1.88 o más nuevo) y macOS (el daemon usa launchd; el resto funciona en cualquier Unix).
+Plataformas con binario precompilado: macOS arm64 (Apple Silicon) y Linux x64. Requiere Node 24 o más nuevo. El daemon usa launchd, así que `gaze daemon install` solo aplica en macOS; el resto funciona en ambas.
+
+```sh
+npm install -g @kikedealba/gaze && gaze setup   # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
+gaze daemon install                             # daemon en launchd que mantiene el modelo cargado (hooks de ~15 ms)
+claude plugin marketplace add KikeDeAlba/gaze
+claude plugin install gaze@gaze                 # hooks, skill y servidor MCP
+```
+
+El paquete de npm no trae el binario: al instalarse descarga `gaze-<versión>-<target>.tar.gz` del release `v<versión>` en GitHub, verifica su SHA-256 y lo deja en `vendor/gaze` dentro del paquete. El comando `gaze` es un lanzador de Node que ejecuta ese binario; si falta (por ejemplo, con `npm install --ignore-scripts`), lo descarga en la primera ejecución. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado.
+
+El plugin de Claude Code (hooks, skill y MCP) se instala desde el marketplace de git, no desde npm; sus comandos llaman a `gaze` en el `PATH`.
+
+### Alternativa: compilar con cargo
+
+Requiere Rust 1.88 o más nuevo:
 
 ```sh
 cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.3.0   # o, desde el clon: cargo install --path .
-gaze setup                        # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
-gaze daemon install               # daemon en launchd que mantiene el modelo cargado (hooks de ~15 ms)
-claude plugin marketplace add KikeDeAlba/gaze
-claude plugin install gaze@gaze   # hooks, skill y servidor MCP
+gaze setup
 ```
 
 La primera vez que se calcula un embedding se descarga el modelo `multilingual-e5-small` (~120 MB) a `~/.cache/gaze`.
@@ -67,6 +79,7 @@ Con gaze activo, la memoria automática sobra. Según la documentación de Claud
 claude plugin uninstall gaze@gaze
 gaze daemon uninstall
 gaze uninstall          # quita el registro de kit; la base se queda en ~/.local/share/gaze
+npm uninstall -g @kikedealba/gaze
 ```
 
 ## Comandos
@@ -187,7 +200,10 @@ con `GAZE_HARVEST=1`, que apaga todos los hooks de gaze en esa sesión hija. El 
 cargo test                      # usa un embedder falso: no descarga modelos
 cargo clippy --all-targets -- -D warnings
 cargo build --release
+npm run test:npm                # lanzador e instalador de npm, contra un servidor local
 ```
+
+`GAZE_DOWNLOAD_BASE` cambia la URL base de los releases (por omisión `https://github.com/KikeDeAlba/gaze/releases/download`); las pruebas del instalador la apuntan a un servidor local.
 
 `GAZE_EMBEDDER=fake` sirve para probar la CLI sin modelo.
 

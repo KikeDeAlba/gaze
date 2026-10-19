@@ -1,7 +1,7 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { accessSync, chmodSync, constants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -26,6 +26,7 @@ const UNWRITABLE = new Set(['EACCES', 'EPERM', 'EROFS'])
 const ORPHAN_AGE_MS = 10 * 60 * 1000
 const REFRESH_TIMEOUT_MS = 180_000
 const REPAIR_RETRY_MS = 10 * 60 * 1000
+const ABANDONED_LOCK_MS = 60 * 60 * 1000
 
 export class InstallError extends Error {
   constructor(message) {
@@ -389,7 +390,8 @@ function reclaim(file, now) {
   } catch {
     return true
   }
-  if (now - before.mtimeMs < REPAIR_RETRY_MS || alive(lockOwner(file))) return false
+  const age = now - before.mtimeMs
+  if (age < REPAIR_RETRY_MS || (age < ABANDONED_LOCK_MS && alive(lockOwner(file)))) return false
   const moved = `${file}.${process.pid}.${randomBytes(6).toString('hex')}`
   try {
     renameSync(file, moved)

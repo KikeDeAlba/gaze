@@ -80,7 +80,7 @@ gaze ingest --source inkwell
 
 Las carpetas de inkwell sin vínculo con bita nunca crean un proyecto: se asignan a un proyecto o grupo conocido; si no, al proyecto conocido cuyo nombre normalizado sea el prefijo más largo del nombre de la carpeta; si no, a `global`. Las entradas que caen en `global` usan el `project`/`projectId` del frontmatter si es conocido.
 
-Es incremental por fecha de modificación. Las entradas de bita llegan solas por eventos (`gaze bita-hook`, suscrito a `stop`, `amend` y `delete`).
+Es incremental por fecha de modificación. Las entradas de bita llegan solas por eventos (`gaze bita-hook`, suscrito a `stop`, `amend` y `delete`). Los cambios de páginas y notas de inkwell también: `gaze inkwell-hook` está suscrito a `docs.changed` y, por cada cambio, ingiere el archivo escrito (`written`), olvida la nota borrada (`deleted`, o un `written` cuyo archivo ya no existe) y reemplaza la clave al mover (`moved`). Ignora rutas absolutas, con `..`, que no sean `.md` o que estén bajo carpetas `.assets`.
 
 ### Apagar la memoria automática de Claude
 

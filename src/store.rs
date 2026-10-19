@@ -549,9 +549,9 @@ impl Store {
         if from == to {
             return Ok(Some(Renamed { id: node.id, displaced: None }));
         }
-        let displaced = self.by_source_ref(to)?.map(|n| n.id).filter(|other| *other != node.id);
         let stem = to.rsplit('/').next().and_then(|f| f.strip_suffix(".md")).map(text::fold);
-        self.tx(|| {
+        let displaced = self.tx(|| {
+            let displaced = self.by_source_ref(to)?.map(|n| n.id).filter(|other| *other != node.id);
             if let Some(other) = &displaced {
                 self.conn.execute("UPDATE OR IGNORE edges SET dst = ?1 WHERE dst = ?2 AND kind = 'link' AND src != ?1", params![node.id, other])?;
                 self.delete_node(other)?;
@@ -562,7 +562,7 @@ impl Store {
             if let Some(stem) = &stem {
                 self.claim_pending(&node.id, stem)?;
             }
-            Ok(())
+            Ok(displaced)
         })?;
         Ok(Some(Renamed { id: node.id, displaced }))
     }

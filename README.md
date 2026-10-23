@@ -16,11 +16,11 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 
 ## Instalación
 
-Plataformas con binario precompilado: macOS arm64 (Apple Silicon), Linux x64 y Windows x64. Requiere Node 24.5 o más nuevo. En macOS el daemon usa launchd y en Windows una tarea programada (`gaze-daemon`); si tu equipo tiene antivirus o EDR corporativo, lee [Windows con antivirus o EDR corporativo](#windows-con-antivirus-o-edr-corporativo).
+Plataformas con binario precompilado: macOS arm64 (Apple Silicon), Linux x64 y arm64, y Windows x64. Requiere Node 24.5 o más nuevo. El daemon usa launchd en macOS, una unidad de usuario de systemd en Linux y una tarea programada (`gaze-daemon`) en Windows; si tu equipo tiene antivirus o EDR corporativo, lee [Windows con antivirus o EDR corporativo](#windows-con-antivirus-o-edr-corporativo).
 
 ```sh
 npm install -g @kikedealba/gaze && gaze setup   # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
-gaze daemon install                             # daemon en launchd que mantiene el modelo cargado (hooks de ~40 ms con el lanzador de npm)
+gaze daemon install                             # daemon (launchd, systemd o tarea programada) que mantiene el modelo cargado (hooks de ~40 ms con el lanzador de npm)
 claude plugin marketplace add KikeDeAlba/gaze
 claude plugin install gaze@gaze                 # hooks, skill y servidor MCP
 ```
@@ -32,7 +32,7 @@ El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` 
 | macOS y Linux | `gaze-<versión>-<target>.tar.gz` | `vendor/gaze` dentro del paquete | `vendor/.version` |
 | Windows | `gaze-<versión>-x86_64-pc-windows-msvc.exe`, sin comprimir | `vendor\<versión>\gaze.exe` dentro del paquete | `vendor\<versión>\.verified` |
 
-En Windows no hay zip, tar, renames ni directorios temporales: el instalador verifica el sha256 del `.exe` contra `npm/checksums.json` y lo escribe una sola vez en su destino final, junto con `.verified`. Las versiones viejas de `vendor\` se borran en cuanto se puede. Así se reduce lo que dispara la heurística por comportamiento de un antivirus: Check Point Harmony Endpoint Anti-Ransomware marcó la instalación de 0.6.1.
+En Windows la instalación del binario no usa zip, tar, renames ni directorios temporales: el instalador verifica el sha256 del `.exe` contra `npm/checksums.json` y lo escribe una sola vez en su destino final, junto con `.verified`. Las versiones viejas de `vendor\` se borran en cuanto se puede. Así se reduce lo que dispara la heurística por comportamiento de un antivirus: Check Point Harmony Endpoint Anti-Ransomware marcó la instalación de 0.6.1.
 
 El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postinstall` no corrió (por red, por `npm install --ignore-scripts` o porque npm bloqueó los scripts), **la primera ejecución de `gaze` descarga el binario**; por eso conviene que esa primera ejecución sea `gaze setup` y no un hook, que tiene pocos segundos. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado y avisa por stderr en cada ejecución.
 
@@ -46,7 +46,7 @@ El manifiesto de kit (`~/.config/kikedealba/tools.d/gaze.json`) y el plist de la
 
 El manifiesto y el plist apuntan al binario nativo y no al lanzador del `PATH` (`~/Library/pnpm/bin/gaze` o `<prefijo>/bin/gaze`): launchd arranca el daemon con `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, donde no está el `node` de nvm, Volta o Homebrew, y el lanzador dejaría un proceso de Node residente (~44 MB) junto al daemon. Con el binario nativo, Den y kit tampoco pagan los ~24 ms del lanzador en cada llamada.
 
-Si hace falta a mano: `gaze setup && gaze daemon install`. En macOS y Linux, `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar. En Windows no hay `.version`: la versión es el nombre de la carpeta, y `.verified` registra el sha256, el tamaño y la fecha del `.exe` ya verificado; si el exe no coincide con `checksums.json`, se vuelve a descargar. El `postinstall` y la reparación reapuntan al exe nuevo las integraciones de los agentes (el manifiesto de kit y la tarea programada).
+Si hace falta a mano: `gaze setup && gaze daemon install`. En macOS y Linux, `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar. En Windows no hay `.version`: la versión es el nombre de la carpeta, y `.verified` registra el sha256, el tamaño y la fecha del `.exe` ya verificado; si el exe no coincide con `checksums.json`, se vuelve a descargar. El `postinstall` y la reparación reapuntan al exe nuevo las integraciones de los agentes (hooks y MCP de Codex, Gemini, OpenCode, Antigravity y Claude Desktop), conservando el modo de cada archivo; si alguna no se puede reescribir, avisan con el nombre del archivo y conservan la versión vieja del exe hasta que corras `gaze setup`.
 
 `gaze daemon install` saca el job anterior de launchd, espera hasta 10 s a que `launchctl print gui/<uid>/com.kikedealba.gaze` deje de encontrarlo, lo habilita (`launchctl enable`, por si se deshabilitó), carga el plist, espera hasta 10 s a que el job tenga pid y hasta 30 s a que responda en el socket. Reintenta hasta 3 veces y, si no queda cargado, sale con error y el detalle de cada intento. Si el job sigue vivo pero aún no responde (la primera vez puede estar descargando el modelo), termina bien y lo dice. En el peor caso tarda unos 160 s. `gaze daemon uninstall` falla con un error claro si launchd no descarga el job, y entonces no borra el plist. `gaze daemon status` distingue entre corriendo, plist instalado pero no cargado en launchd, cargado sin responder todavía en el socket y apagado (campo `state`: `running`, `not-loaded`, `starting`, `stopped`).
 
@@ -67,7 +67,7 @@ cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.6.2   #
 gaze setup
 ```
 
-La primera vez que se calcula un embedding se descarga el modelo `multilingual-e5-small` (~120 MB) a `~/.cache/gaze`.
+La primera vez que se calcula un embedding se descarga el modelo `multilingual-e5-small` (~470 MB) a la caché de gaze (`~/.cache/gaze` en macOS y Linux, `%LOCALAPPDATA%\gaze\cache` en Windows, o `GAZE_CACHE_DIR`).
 
 ### Windows con antivirus o EDR corporativo
 

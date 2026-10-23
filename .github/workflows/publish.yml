@@ -39,8 +39,6 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
@@ -128,7 +126,7 @@ jobs:
         run: |
           version="$(jq -r .version package.json)"
           assets='{}'
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
             ext=tar.gz
             if [ "$target" = "x86_64-pc-windows-msvc" ]; then ext=zip; fi
             file="gaze-${version}-${target}.${ext}"
@@ -136,7 +134,7 @@ jobs:
             assets="$(jq -c --arg target "$target" --arg file "$file" --arg sum "$sum" '.[$target] = {file: $file, sha256: $sum}' <<< "$assets")"
           done
           jq -n --arg version "$version" --argjson assets "$assets" '{version: $version, assets: $assets}' > npm/checksums.json
-          jq -e '.assets | length == 5' npm/checksums.json
+          jq -e '.assets | length == 4' npm/checksums.json
 
       - name: install the tarball the way a person would, and run it
         run: |

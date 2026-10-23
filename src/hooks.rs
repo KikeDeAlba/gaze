@@ -461,6 +461,16 @@ pub fn parse_learnings(raw: &str) -> Vec<Value> {
     serde_json::from_str::<Vec<Value>>(&text[start..=end]).unwrap_or_default()
 }
 
+pub fn private_dir(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir.to_path_buf())
+}
+
 fn log(message: &str) {
     println!("{} {message}", text::now_iso());
 }
@@ -486,7 +496,7 @@ pub fn harvest_run(store: &Store, emb: &dyn Embedder, transcript: &Path, session
         return Ok(());
     };
     let env = [(HARVEST_ENV, "1"), ("BITA_NO_HOOKS", "1"), ("KIT_NO_EVENTS", "1")];
-    let text = match agents::run(agent, &prompt, cfg.model.as_deref(), &std::env::temp_dir(), Duration::from_secs(cfg.timeout_seconds), &env)? {
+    let text = match agents::run(agent, &prompt, cfg.model.as_deref(), &private_dir(&paths::harvest_dir())?, Duration::from_secs(cfg.timeout_seconds), &env)? {
         agents::Outcome::Text(text) => text,
         agents::Outcome::TimedOut => {
             log(&format!("harvest {session}: {} timed out", agent.id()));
@@ -576,6 +586,15 @@ mod tests {
         assert!(!needs_background_refresh(&project::Project { source: "cache:default".into(), ..fresh.clone() }));
         assert!(!needs_background_refresh(&project::Project { repo: None, ..fresh.clone() }));
         assert!(!needs_background_refresh(&project::Project { slug: "gaze".into(), ..fresh }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harvest_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = private_dir(&dir.path().join("harvest")).unwrap();
+        assert_eq!(std::fs::metadata(target).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]

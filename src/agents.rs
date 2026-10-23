@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -63,25 +63,24 @@ impl Agent {
     }
 }
 
-pub fn detect(flag: Option<&str>, present: &dyn Fn(&str) -> bool, keys: &[String]) -> Agent {
+pub fn detect(flag: Option<&str>, present: &dyn Fn(&str) -> bool) -> Agent {
     if let Some(agent) = flag.and_then(Agent::parse) {
         return agent;
     }
     if present("ANTIGRAVITY_CONVERSATION_ID") {
         return Agent::Antigravity;
     }
-    if present("GEMINI_PROJECT_DIR") || present("GEMINI_CLI") {
+    if present("GEMINI_SESSION_ID") || present("GEMINI_PROJECT_DIR") {
         return Agent::Gemini;
     }
-    if keys.iter().any(|key| key.starts_with("CODEX_")) {
+    if present("CODEX_THREAD_ID") {
         return Agent::Codex;
     }
     Agent::Claude
 }
 
 pub fn detect_from_env(flag: Option<&str>) -> Agent {
-    let keys: Vec<String> = std::env::vars_os().filter(|(_, v)| !v.is_empty()).filter_map(|(k, _)| k.into_string().ok()).collect();
-    detect(flag, &|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()), &keys)
+    detect(flag, &|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
 }
 
 pub fn headless() -> bool {
@@ -92,7 +91,7 @@ pub fn headless() -> bool {
 pub struct Invocation {
     pub program: String,
     pub args: Vec<String>,
-    pub stdin: Option<String>,
+    pub stdin: String,
     pub env: Vec<(String, String)>,
 }
 
@@ -102,12 +101,23 @@ pub fn invocation(agent: Agent, bin: &str, prompt: &str, model: Option<&str>, cw
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let mut env = Vec::new();
-    let (args, stdin) = match agent {
+    let mut stdin = prompt.to_string();
+    let args = match agent {
         Agent::Claude => {
             let mut args = owned(&["-p", "--model", model.unwrap_or(CLAUDE_DEFAULT_MODEL), "--output-format", "json"]);
-            args.extend(owned(&["--tools", "", "--strict-mcp-config", "--no-session-persistence", "--disable-slash-commands"]));
+            args.extend(owned(&[
+                "--permission-mode",
+                "plan",
+                "--setting-sources",
+                "user",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--no-session-persistence",
+                "--disable-slash-commands",
+            ]));
             env.push(("CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string(), "1".to_string()));
-            (args, Some(prompt.to_string()))
+            args
         }
         Agent::Codex => {
             let mut args = owned(&["exec", "--json", "-C"]);
@@ -117,34 +127,46 @@ pub fn invocation(agent: Agent, bin: &str, prompt: &str, model: Option<&str>, cw
                 args.extend(owned(&["-m", model]));
             }
             args.push("-".into());
-            (args, Some(prompt.to_string()))
+            args
         }
         Agent::Gemini => {
             let mut args = owned(&["-o", "json", "--approval-mode", "plan"]);
             if let Some(model) = model {
                 args.extend(owned(&["-m", model]));
             }
-            env.push(("GEMINI_CLI_TRUST_WORKSPACE".to_string(), "true".to_string()));
-            (args, Some(prompt.to_string()))
+            args
         }
         Agent::Antigravity => {
-            let mut args = owned(&["-p", prompt, "--output-format", "json"]);
+            let mut args = owned(&["--mode", "plan", "--input-format", "stream-json", "--output-format", "stream-json"]);
             if let Some(model) = model {
                 args.extend(owned(&["--model", model]));
             }
-            (args, None)
+            args.push("-p=".into());
+            stdin = format!("{}\n", serde_json::json!({"event": "user", "message": {"content": prompt}}));
+            args
         }
         Agent::Opencode => {
-            let mut args = owned(&["run", "--format", "json"]);
+            let mut args = owned(&["run", "--format", "json", "--agent", "plan"]);
             if let Some(model) = model {
                 args.extend(owned(&["-m", model]));
             }
-            args.push(prompt.to_string());
-            (args, None)
+            args
         }
     };
     env.push((HEADLESS_ENV.to_string(), "1".to_string()));
     Invocation { program: bin.to_string(), args, stdin, env }
+}
+
+pub const ENV_NAMES: [&str; 12] =
+    ["PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemRoot", "SYSTEMROOT", "TMP", "TEMP", "TMPDIR", "LANG", "ComSpec"];
+pub const ENV_PREFIXES: [&str; 10] = ["LC_", "XDG_", "ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_", "GEMINI_", "GOOGLE_", "OPENCODE_", "ANTIGRAVITY_"];
+
+pub fn allowed_env(name: &str) -> bool {
+    ENV_NAMES.iter().any(|allowed| allowed.eq_ignore_ascii_case(name)) || ENV_PREFIXES.iter().any(|prefix| name.to_ascii_uppercase().starts_with(prefix))
+}
+
+pub fn child_env(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter().filter(|(name, _)| name.to_str().is_some_and(allowed_env)).collect()
 }
 
 fn lenient_json(stdout: &str) -> Option<Value> {
@@ -165,15 +187,21 @@ fn json_lines(stdout: &str) -> impl Iterator<Item = Value> + '_ {
 pub fn parse_output(agent: Agent, stdout: &str) -> Option<String> {
     match agent {
         Agent::Claude => lenient_json(stdout)?["result"].as_str().map(str::to_string),
-        Agent::Gemini | Agent::Antigravity => lenient_json(stdout)?["response"].as_str().map(str::to_string),
+        Agent::Gemini => lenient_json(stdout)?["response"].as_str().map(str::to_string),
+        Agent::Antigravity => json_lines(stdout)
+            .filter(|event| event["event"] == "result")
+            .filter_map(|event| event["result"]["response"].as_str().map(str::to_string))
+            .last()
+            .or_else(|| lenient_json(stdout)?["response"].as_str().map(str::to_string)),
         Agent::Codex => json_lines(stdout)
             .filter(|event| event["type"] == "item.completed" && event["item"]["type"] == "agent_message")
             .filter_map(|event| event["item"]["text"].as_str().map(str::to_string))
             .last(),
         Agent::Opencode => {
-            let parts: Vec<String> =
-                json_lines(stdout).filter(|event| event["type"] == "text").filter_map(|event| event["part"]["text"].as_str().map(str::to_string)).collect();
-            if parts.is_empty() { None } else { Some(parts.join("")) }
+            let texts: Vec<Value> = json_lines(stdout).filter(|event| event["type"] == "text").collect();
+            let last = texts.last()?["part"]["messageID"].clone();
+            let parts: Vec<&str> = texts.iter().filter(|event| event["part"]["messageID"] == last).filter_map(|event| event["part"]["text"].as_str()).collect();
+            Some(parts.concat())
         }
     }
 }
@@ -207,18 +235,24 @@ pub enum Outcome {
     Failed(String),
 }
 
+fn drain<R: Read + Send + 'static>(source: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(mut source) = source {
+            let _ = source.read_to_end(&mut out);
+        }
+        out
+    })
+}
+
 pub fn run(agent: Agent, prompt: &str, model: Option<&str>, cwd: &Path, timeout: Duration, extra_env: &[(&str, &str)]) -> Result<Outcome> {
     let bin = bin_override(agent).unwrap_or_else(|| agent.bin().to_string());
     let path = std::env::var_os("PATH");
     let program = resolve_program(&bin, path.as_deref(), cfg!(windows));
     let spec = invocation(agent, &program.to_string_lossy(), prompt, model, cwd);
     let mut command = Command::new(&program);
-    command
-        .args(&spec.args)
-        .current_dir(cwd)
-        .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(&spec.args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).env_clear();
+    command.envs(child_env(std::env::vars_os()));
     for (key, value) in extra_env.iter().copied().chain(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
         command.env(key, value);
     }
@@ -229,22 +263,34 @@ pub fn run(agent: Agent, prompt: &str, model: Option<&str>, cwd: &Path, timeout:
         }
     }
     let mut child = command.spawn().with_context(|| format!("spawn {}", program.display()))?;
-    if let Some(input) = &spec.stdin {
-        child.stdin.take().context("stdin")?.write_all(input.as_bytes())?;
-    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let input = spec.stdin.into_bytes();
+    let mut pipe = child.stdin.take().context("stdin")?;
+    let writer = std::thread::spawn(move || match pipe.write_all(&input) {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error),
+        _ => Ok(()),
+    });
     let started = Instant::now();
-    while child.try_wait()?.is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
         if started.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
             return Ok(Outcome::TimedOut);
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let written = writer.join().unwrap_or(Ok(()));
+    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    if !status.success() {
+        return Ok(Outcome::Failed(stderr));
     }
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        return Ok(Outcome::Failed(String::from_utf8_lossy(&output.stderr).into_owned()));
+    if let Err(error) = written {
+        return Ok(Outcome::Failed(format!("stdin: {error}; {stderr}")));
     }
     match parse_output(agent, &stdout) {
         Some(text) => Ok(Outcome::Text(text)),
@@ -257,13 +303,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn keys(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
     fn detect_with(flag: Option<&str>, vars: &[&str]) -> Agent {
-        let list = keys(vars);
-        detect(flag, &|name| list.iter().any(|k| k == name), &list)
+        detect(flag, &|name| vars.contains(&name))
     }
 
     #[test]
@@ -277,36 +318,58 @@ mod tests {
     }
 
     #[test]
-    fn detects_the_harness_from_flag_then_env() {
+    fn detects_the_harness_from_flag_then_exact_markers() {
         assert_eq!(detect_with(Some("codex"), &["CLAUDECODE"]), Agent::Codex);
-        assert_eq!(detect_with(Some("bogus"), &["GEMINI_CLI"]), Agent::Gemini);
-        assert_eq!(detect_with(None, &["ANTIGRAVITY_CONVERSATION_ID", "GEMINI_CLI", "CLAUDECODE"]), Agent::Antigravity);
+        assert_eq!(detect_with(Some("bogus"), &["GEMINI_SESSION_ID"]), Agent::Gemini);
+        assert_eq!(detect_with(None, &["ANTIGRAVITY_CONVERSATION_ID", "GEMINI_SESSION_ID", "CLAUDECODE"]), Agent::Antigravity);
         assert_eq!(detect_with(None, &["GEMINI_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CLAUDECODE"]), Agent::Gemini);
         assert_eq!(detect_with(None, &["CODEX_THREAD_ID", "CLAUDECODE"]), Agent::Codex);
-        assert_eq!(detect_with(None, &["CLAUDECODE"]), Agent::Claude);
+        assert_eq!(detect_with(None, &["CODEX_HOME", "GEMINI_CLI", "CLAUDECODE"]), Agent::Claude);
         assert_eq!(detect_with(None, &[]), Agent::Claude);
     }
 
     #[test]
-    fn invocations_mirror_the_kit_table() {
+    fn invocations_send_the_prompt_by_stdin_in_read_only_modes() {
         let cwd = Path::new("/tmp/w");
-        let claude = invocation(Agent::Claude, "claude", "P", None, cwd);
-        assert_eq!(&claude.args[..5], &["-p", "--model", "haiku", "--output-format", "json"]);
-        assert_eq!(claude.stdin.as_deref(), Some("P"));
-        let codex = invocation(Agent::Codex, "codex", "P", Some("o4"), cwd);
+        let secret = "TRANSCRIPT-SECRET";
+        let claude = invocation(Agent::Claude, "claude", secret, None, cwd);
+        assert_eq!(&claude.args[..9], &["-p", "--model", "haiku", "--output-format", "json", "--permission-mode", "plan", "--setting-sources", "user"]);
+        let codex = invocation(Agent::Codex, "codex", secret, Some("o4"), cwd);
         assert_eq!(codex.args, ["exec", "--json", "-C", "/tmp/w", "--skip-git-repo-check", "--sandbox", "read-only", "-m", "o4", "-"]);
-        assert_eq!(codex.stdin.as_deref(), Some("P"));
-        let gemini = invocation(Agent::Gemini, "gemini", "P", None, cwd);
+        let gemini = invocation(Agent::Gemini, "gemini", secret, None, cwd);
         assert_eq!(gemini.args, ["-o", "json", "--approval-mode", "plan"]);
-        assert!(gemini.env.contains(&("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into())));
-        let agy = invocation(Agent::Antigravity, "agy", "P", Some("m"), cwd);
-        assert_eq!(agy.args, ["-p", "P", "--output-format", "json", "--model", "m"]);
-        assert_eq!(agy.stdin, None);
-        let opencode = invocation(Agent::Opencode, "opencode", "P", Some("a/b"), cwd);
-        assert_eq!(opencode.args, ["run", "--format", "json", "-m", "a/b", "P"]);
+        assert!(!gemini.env.iter().any(|(k, _)| k == "GEMINI_CLI_TRUST_WORKSPACE"));
+        let agy = invocation(Agent::Antigravity, "agy", secret, Some("m"), cwd);
+        assert_eq!(agy.args, ["--mode", "plan", "--input-format", "stream-json", "--output-format", "stream-json", "--model", "m", "-p="]);
+        let line: Value = serde_json::from_str(agy.stdin.trim()).unwrap();
+        assert_eq!(line, json!({"event": "user", "message": {"content": secret}}));
+        let opencode = invocation(Agent::Opencode, "opencode", secret, Some("a/b"), cwd);
+        assert_eq!(opencode.args, ["run", "--format", "json", "--agent", "plan", "-m", "a/b"]);
         for spec in [claude, codex, gemini, agy, opencode] {
             assert!(spec.env.contains(&(HEADLESS_ENV.into(), "1".into())));
+            assert!(spec.args.iter().all(|arg| !arg.contains(secret)), "{:?}", spec.args);
+            assert!(spec.stdin.contains(secret));
         }
+    }
+
+    #[test]
+    fn child_env_keeps_only_the_allow_list() {
+        let vars = [
+            "PATH",
+            "HOME",
+            "Path",
+            "SystemRoot",
+            "LC_ALL",
+            "XDG_CONFIG_HOME",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_CLOUD_PROJECT",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "NPM_TOKEN",
+        ]
+        .map(|name| (std::ffi::OsString::from(name), std::ffi::OsString::from("v")));
+        let kept: Vec<String> = child_env(vars).into_iter().map(|(k, _)| k.into_string().unwrap()).collect();
+        assert_eq!(kept, ["PATH", "HOME", "Path", "SystemRoot", "LC_ALL", "XDG_CONFIG_HOME", "ANTHROPIC_API_KEY", "GOOGLE_CLOUD_PROJECT"]);
     }
 
     #[test]
@@ -322,10 +385,21 @@ mod tests {
         .join("\n");
         assert_eq!(parse_output(Agent::Codex, &codex).as_deref(), Some("last"));
         assert_eq!(parse_output(Agent::Gemini, &format!("Loaded cached credentials.\n{}", json!({"response": "g"}))).as_deref(), Some("g"));
-        assert_eq!(parse_output(Agent::Antigravity, &json!({"response": "a", "conversation_id": "c"}).to_string()).as_deref(), Some("a"));
-        let opencode = [json!({"type": "text", "part": {"text": "he"}}), json!({"type": "tool"}), json!({"type": "text", "part": {"text": "llo"}})]
-            .map(|v| v.to_string())
-            .join("\n");
+        let agy = [
+            json!({"event": "init", "conversation_id": "c"}),
+            json!({"event": "result", "result": {"conversation_id": "c", "status": "SUCCESS", "response": "a"}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        assert_eq!(parse_output(Agent::Antigravity, &agy).as_deref(), Some("a"));
+        let opencode = [
+            json!({"type": "text", "part": {"messageID": "m1", "text": "PONG"}}),
+            json!({"type": "step_finish"}),
+            json!({"type": "text", "part": {"messageID": "m2", "text": "he"}}),
+            json!({"type": "text", "part": {"messageID": "m2", "text": "llo"}}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
         assert_eq!(parse_output(Agent::Opencode, &opencode).as_deref(), Some("hello"));
         assert_eq!(parse_output(Agent::Opencode, ""), None);
     }
@@ -342,18 +416,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn runs_a_fake_agent_with_the_headless_guard() {
+    fn runs_fake_agents_without_deadlocks_or_leaked_env() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-claude");
-        std::fs::write(&script, "#!/bin/sh\ncat >/dev/null\nprintf '{\"result\":\"%s\"}' \"$KIT_HEADLESS\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        unsafe { std::env::set_var("GAZE_HARVEST_BIN", &script) };
-        let outcome = run(Agent::Claude, "hola", None, dir.path(), Duration::from_secs(10), &[]).unwrap();
-        unsafe { std::env::remove_var("GAZE_HARVEST_BIN") };
-        match outcome {
-            Outcome::Text(text) => assert_eq!(text, "1"),
-            _ => panic!("expected text"),
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let guard = script("guard", "cat >/dev/null\nprintf '{\"result\":\"%s|%s\"}' \"$KIT_HEADLESS\" \"${GITHUB_TOKEN:-none}\"");
+        let noisy = script("noisy", "head -c 2000000 /dev/zero | tr '\\0' x >&2\ncat >/dev/null\nprintf '{\"result\":\"ok\"}'");
+        let deaf = script("deaf", "printf '{\"result\":\"early\"}'");
+        let failing = script("failing", "cat >/dev/null\necho boom >&2\nexit 3");
+        let big = "y".repeat(4_000_000);
+        unsafe { std::env::set_var("GITHUB_TOKEN", "leak") };
+        let cases: [(&PathBuf, &str, &str); 4] = [(&guard, "hola", "1|none"), (&noisy, &big, "ok"), (&deaf, &big, "early"), (&failing, "x", "FAILED:boom")];
+        for (bin, prompt, expected) in cases {
+            unsafe { std::env::set_var("GAZE_HARVEST_BIN", bin) };
+            let outcome = run(Agent::Claude, prompt, None, dir.path(), Duration::from_secs(20), &[]).unwrap();
+            let got = match outcome {
+                Outcome::Text(text) => text,
+                Outcome::Failed(stderr) => format!("FAILED:{}", stderr.trim()),
+                Outcome::TimedOut => "TIMEOUT".into(),
+            };
+            assert_eq!(got, expected, "{}", bin.display());
         }
+        unsafe { std::env::remove_var("GAZE_HARVEST_BIN") };
+        unsafe { std::env::remove_var("GITHUB_TOKEN") };
     }
 }

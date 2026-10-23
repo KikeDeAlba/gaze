@@ -166,8 +166,20 @@ fn frontmatter_project(store: &Store, meta: &BTreeMap<String, String>) -> Option
 }
 
 pub fn slash_rel(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/")
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => crate::paths::simplify(path.to_path_buf()),
+    };
+    let mut head = String::new();
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => head.push_str(&prefix.as_os_str().to_string_lossy()),
+            std::path::Component::RootDir => head.push('/'),
+            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
+        }
+    }
+    format!("{head}{}", parts.join("/"))
 }
 
 pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path) -> Result<Option<(String, &'static str)>> {
@@ -1277,6 +1289,22 @@ mod tests {
             assert!(store.by_source_ref("inkwell:dp/a.md").unwrap().is_none());
             assert_eq!(inkwell_count(&store), 1);
             assert_eq!(staged_count(&store), 0);
+        }
+    }
+
+    #[test]
+    fn slash_rel_keeps_paths_outside_the_root_single_rooted() {
+        let root = Path::new("/docs");
+        assert_eq!(slash_rel(root, Path::new("/docs/dp/a.md")), "dp/a.md");
+        assert_eq!(slash_rel(root, Path::new("dp/a.md")), "dp/a.md");
+        #[cfg(unix)]
+        assert_eq!(slash_rel(root, Path::new("/tmp/x.md")), "/tmp/x.md");
+        #[cfg(windows)]
+        {
+            let root = Path::new(r"C:\docs");
+            assert_eq!(slash_rel(root, Path::new(r"C:\docs\dp\a.md")), "dp/a.md");
+            assert_eq!(slash_rel(root, Path::new(r"C:\tmp\x.md")), "C:/tmp/x.md");
+            assert_eq!(slash_rel(root, Path::new(r"\\?\D:\tmp\x.md")), "D:/tmp/x.md");
         }
     }
 

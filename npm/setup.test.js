@@ -52,7 +52,8 @@ describe('arguments', () => {
   test('quotes the binary for posix shells and PowerShell', () => {
     assert.equal(shellCommand(['/usr/local/bin/gaze'], 'linux'), '/usr/local/bin/gaze')
     assert.equal(shellCommand(["/tmp/it's here/gaze"], 'darwin'), `'/tmp/it'\\''s here/gaze'`)
-    assert.equal(shellCommand(["C:\\Users\\o'neil\\gaze.exe"], 'win32'), "& 'C:\\Users\\o''neil\\gaze.exe'")
+    assert.equal(shellCommand(['C:\\Users\\ana\\gaze.exe'], 'win32'), 'C:\\Users\\ana\\gaze.exe')
+    assert.equal(shellCommand(["C:\\Program Files\\o'neil\\gaze.exe"], 'win32'), `"C:\\Program Files\\o'neil\\gaze.exe"`)
   })
 })
 
@@ -134,7 +135,7 @@ describe('integration', () => {
 })
 
 describe('launcher and old installs', () => {
-  test('uses the bare gaze command only when gaze on the PATH is this shim', async () => {
+  test('uses the bare gaze command only when gaze on the PATH is this shim', { skip: process.platform === 'win32' }, async () => {
     const { home } = sandbox()
     const ours = path.join(home, 'ours')
     const other = path.join(home, 'other')
@@ -152,28 +153,24 @@ describe('launcher and old installs', () => {
     assert.deepEqual(commands(spec.codex.hooks.SessionStart), ['gaze hook session-start --harness codex'])
   })
 
-  test('recognizes Windows npm shims that point to this package', () => {
+  test('always uses the absolute vendor binary on Windows', async () => {
     const { home } = sandbox()
-    const bin = path.join(home, 'npm')
-    mkdirSync(bin)
-    const cmd = path.join(bin, 'gaze.cmd')
-    const shim = path.win32.join(bin, 'node_modules', '@kikedealba', 'gaze', 'npm', 'gaze.js')
-    writeFileSync(cmd, `@"%dp0%\\node.exe" "%dp0%\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js" %*\r\n`)
-    assert.equal(pointsToShim(cmd, shim, 'win32'), true)
-    assert.equal(pointsToShim(cmd, path.win32.join(bin, 'elsewhere', 'gaze.js'), 'win32'), false)
+    const ctx = platformContext({ platform: 'win32', home, env: { USERPROFILE: home, PATH: '' } })
+    assert.deepEqual(await launcher('C:\\pkg\\vendor\\gaze.exe', { ctx }), ['C:\\pkg\\vendor\\gaze.exe'])
   })
 
   test('tells gaze hooks apart from foreign ones regardless of the path', () => {
-    assert.equal(ownHook("'/old/node/lib/node_modules/@kikedealba/gaze/vendor/gaze' hook prompt --harness codex"), true)
-    assert.equal(ownHook('/old/vendor/gaze hook session-start --harness codex'), true)
-    assert.equal(ownHook('gaze hook prompt --harness codex'), true)
-    assert.equal(ownHook("& 'C:\\old\\vendor\\gaze.exe' hook prompt --harness codex"), true)
-    assert.equal(ownHook('bita hook prompt --harness codex'), false)
-    assert.equal(ownHook('notgaze hook prompt --harness codex'), false)
-    assert.equal(ownHook('gaze hook prompt --harness gemini'), false)
+    assert.equal(ownHook("'/old/node/lib/node_modules/@kikedealba/gaze/vendor/gaze' hook prompt --harness codex", 'codex'), true)
+    assert.equal(ownHook('/old/vendor/gaze hook session-start --harness codex', 'codex'), true)
+    assert.equal(ownHook('gaze hook prompt --harness codex', 'codex'), true)
+    assert.equal(ownHook("& 'C:\\old\\vendor\\gaze.exe' hook prompt --harness codex", 'codex'), true)
+    assert.equal(ownHook('"C:\\Program Files\\gaze\\vendor\\gaze.exe" hook prompt --harness gemini', 'gemini'), true)
+    assert.equal(ownHook('bita hook prompt --harness codex', 'codex'), false)
+    assert.equal(ownHook('notgaze hook prompt --harness codex', 'codex'), false)
+    assert.equal(ownHook('gaze hook prompt --harness gemini', 'codex'), false)
     const existing = { UserPromptSubmit: [{ hooks: [{ command: 'gaze hook prompt --harness codex' }] }, { hooks: [{ command: 'other' }] }] }
-    assert.deepEqual(purgeHooks(existing, new Set(['gaze hook prompt --harness codex'])).removed, 0)
-    assert.deepEqual(purgeHooks(existing).hooks, { UserPromptSubmit: [{ hooks: [{ command: 'other' }] }] })
+    assert.deepEqual(purgeHooks(existing, 'codex', new Set(['gaze hook prompt --harness codex'])).removed, 0)
+    assert.deepEqual(purgeHooks(existing, 'codex').hooks, { UserPromptSubmit: [{ hooks: [{ command: 'other' }] }] })
   })
 
   test('setup replaces codex hooks from an older vendor path and uninstall removes them', async () => {
@@ -195,15 +192,45 @@ describe('launcher and old installs', () => {
     assert.deepEqual(readJson(file).hooks, { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'keep me' }] }] })
     assert.equal(existsSync(path.join(home, '.codex', 'config.toml')) && readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').includes('mcp_servers.gaze'), false)
   })
+
+  test('setup drops gaze hooks for gemini from another path and uninstall removes them', async () => {
+    const { home, options } = sandbox()
+    const settings = path.join(home, '.gemini', 'settings.json')
+    mkdirSync(path.dirname(settings), { recursive: true })
+    const foreign = { type: 'command', command: 'other hook' }
+    writeFileSync(settings, JSON.stringify({ theme: 'dark', hooks: { BeforeAgent: [{ hooks: [{ type: 'command', command: '/old/vendor/gaze hook prompt --harness gemini' }] }, { hooks: [foreign] }] } }))
+    const { steps } = await installAgents(['gemini'], { binary: BINARY, version: '1.2.3' }, options)
+    assert.ok(steps.some((step) => step.agent === 'gemini' && step.item === 'old hooks' && step.state === 'removed'))
+    assert.deepEqual(readJson(settings), { theme: 'dark', hooks: { BeforeAgent: [{ hooks: [foreign] }] } })
+    const extension = path.join(home, '.gemini', 'extensions', 'gaze', 'hooks', 'hooks.json')
+    assert.deepEqual(commands(readJson(extension).hooks.BeforeAgent), [`'${BINARY}' hook prompt --harness gemini`])
+
+    writeFileSync(settings, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: "'/older/vendor/gaze' hook session-start --harness gemini" }] }], BeforeAgent: [{ hooks: [foreign] }] } }))
+    const removed = await uninstallAgents(['gemini'], { binary: '/newer/vendor/gaze', version: '1.2.3' }, options)
+    assert.ok(removed.steps.some((step) => step.item === 'old hooks' && step.state === 'removed'))
+    assert.deepEqual(readJson(settings).hooks, { BeforeAgent: [{ hooks: [foreign] }] })
+    assert.equal(existsSync(path.dirname(path.dirname(extension))), false)
+  })
 })
 
-describe('runSetup', { skip: process.platform === 'win32' }, () => {
+describe('runSetup', () => {
+  function nativeSandbox() {
+    const home = realpathSync(mkdtempSync(path.join(tmpdir(), 'gaze-setup-run-')))
+    const env = { HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'AppData', 'Roaming'), LOCALAPPDATA: path.join(home, 'AppData', 'Local'), PATH: '' }
+    return { home, options: { ctx: platformContext({ home, env }), locate: async () => null, exec: async () => '' } }
+  }
+
   function fakeBinary(exit = 0) {
     const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'gaze-setup-bin-')))
-    const file = path.join(dir, 'gaze')
-    writeFileSync(file, `#!/bin/sh\necho "$*" >> "${dir}/log"\nif [ "$2" = "--json" ]; then echo '{"ok":true,"command":"'$1'","data":{"manifest":"m"}}'; else echo "native $1"; fi\nexit ${exit}\n`)
-    chmodSync(file, 0o755)
-    return { file, log: () => readFileSync(path.join(dir, 'log'), 'utf8').trim().split('\n') }
+    const log = path.join(dir, 'log')
+    const script = path.join(dir, 'fake.mjs')
+    writeFileSync(script, `import { appendFileSync } from 'node:fs'
+const args = process.argv.slice(2)
+appendFileSync(${JSON.stringify(log)}, args.join(' ') + '\\n')
+process.stdout.write(args[1] === '--json' ? JSON.stringify({ ok: true, command: args[0], data: { manifest: 'm' } }) + '\\n' : 'native ' + args[0] + '\\n')
+process.exitCode = ${exit}
+`)
+    return { file: path.join(dir, process.platform === 'win32' ? 'gaze.exe' : 'gaze'), native: [process.execPath, script], log: () => readFileSync(log, 'utf8').trim().split('\n') }
   }
 
   function capture() {
@@ -212,10 +239,10 @@ describe('runSetup', { skip: process.platform === 'win32' }, () => {
   }
 
   test('runs the native setup and adds the integration steps to the JSON envelope', async () => {
-    const { home, options } = sandbox()
+    const { home, options } = nativeSandbox()
     const bin = fakeBinary()
     const io = capture()
-    const code = await runSetup(['setup', '--agents', 'codex', '--json'], bin.file, { ...io, version: '1.2.3', install: options })
+    const code = await runSetup(['setup', '--agents', 'codex', '--json'], bin.file, { ...io, native: bin.native, version: '1.2.3', install: options })
     assert.equal(code, 0, io.out.stderr)
     assert.deepEqual(bin.log(), ['setup --json'])
     const result = JSON.parse(io.out.stdout)
@@ -225,11 +252,11 @@ describe('runSetup', { skip: process.platform === 'win32' }, () => {
   })
 
   test('--remove runs the native uninstall and removes the integrations', async () => {
-    const { home, options } = sandbox()
+    const { home, options } = nativeSandbox()
     const bin = fakeBinary()
-    await runSetup(['setup', '--agents', 'codex'], bin.file, { ...capture(), version: '1.2.3', install: options })
+    await runSetup(['setup', '--agents', 'codex'], bin.file, { ...capture(), native: bin.native, version: '1.2.3', install: options })
     const io = capture()
-    const code = await runSetup(['setup', '--remove', '--agents', 'codex'], bin.file, { ...io, version: '1.2.3', install: options })
+    const code = await runSetup(['setup', '--remove', '--agents', 'codex'], bin.file, { ...io, native: bin.native, version: '1.2.3', install: options })
     assert.equal(code, 0, io.out.stderr)
     assert.deepEqual(bin.log(), ['setup', 'uninstall'])
     assert.match(io.out.stdout, /codex +mcp gaze: quitado/)
@@ -237,9 +264,9 @@ describe('runSetup', { skip: process.platform === 'win32' }, () => {
   })
 
   test('stops before the integrations when the native step fails', async () => {
-    const { home, options } = sandbox()
+    const { home, options } = nativeSandbox()
     const bin = fakeBinary(4)
-    const code = await runSetup(['setup', '--agents', 'codex'], bin.file, { ...capture(), version: '1.2.3', install: options })
+    const code = await runSetup(['setup', '--agents', 'codex'], bin.file, { ...capture(), native: bin.native, version: '1.2.3', install: options })
     assert.equal(code, 4)
     assert.equal(existsSync(path.join(home, '.codex')), false)
   })
@@ -247,7 +274,7 @@ describe('runSetup', { skip: process.platform === 'win32' }, () => {
   test('rejects unknown agents before touching anything', async () => {
     const bin = fakeBinary()
     const io = capture()
-    assert.equal(await runSetup(['setup', '--agents', 'cursor'], bin.file, io), 2)
+    assert.equal(await runSetup(['setup', '--agents', 'cursor'], bin.file, { ...io, native: bin.native }), 2)
     assert.match(io.out.stderr, /agente desconocido: cursor/)
     assert.equal(existsSync(path.join(path.dirname(bin.file), 'log')), false)
   })

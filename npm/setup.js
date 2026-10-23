@@ -65,7 +65,7 @@ export function selection(names, known, fallback) {
 }
 
 export function shellCommand(parts, platform = process.platform) {
-  if (platform === 'win32') return `& ${parts.map((part) => `'${part.replace(/['‘’‚‛]/g, (match) => match + match)}'`).join(' ')}`
+  if (platform === 'win32') return parts.map((part) => (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(part) ? part : `"${part}"`)).join(' ')
   return parts.map((part) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(part) ? part : `'${part.replace(/'/g, `'\\''`)}'`)).join(' ')
 }
 
@@ -73,38 +73,36 @@ function packageVersion() {
   return JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version
 }
 
-export function pointsToShim(found, shim = SHIM, platform = process.platform) {
-  if (realpathOr(found) === realpathOr(shim)) return true
-  if (platform !== 'win32') return false
-  try {
-    const text = readFileSync(found, 'utf8').toLowerCase()
-    return text.includes(path.win32.relative(path.win32.dirname(found), shim).toLowerCase())
-  } catch {
-    return false
-  }
+export function pointsToShim(found, shim = SHIM) {
+  return realpathOr(found) === realpathOr(shim)
 }
 
 export async function launcher(binary, { ctx, shim = SHIM } = {}) {
   const { platformContext, which } = await import('@kikedealba/kit/platform')
   const context = ctx ?? platformContext()
+  if (context.platform === 'win32') return [binary]
   const found = await which(TOOL, context)
-  return found && pointsToShim(found, shim, context.platform) ? [TOOL] : [binary]
+  return found && pointsToShim(found, shim) ? [TOOL] : [binary]
 }
 
-const OWN_HOOK = /(?:^|[\s'"/\\&])gaze(?:\.exe|\.cmd)?'?\s+hook\s+(?:session-start|prompt|harvest)\s+--harness\s+codex\s*$/
-
-export function ownHook(command) {
-  return typeof command === 'string' && OWN_HOOK.test(command)
+export const HOOK_FILES = {
+  codex: (homes) => path.join(homes.codex, 'hooks.json'),
+  gemini: (homes) => path.join(homes.gemini, 'settings.json'),
 }
 
-export function purgeHooks(existing, keep = new Set()) {
+export function ownHook(command, harness) {
+  const pattern = new RegExp(`(?:^|[\\s'"/\\\\&])gaze(?:\\.exe|\\.cmd)?['"]?\\s+hook\\s+(?:session-start|prompt|harvest)\\s+--harness\\s+${harness}\\s*$`)
+  return typeof command === 'string' && pattern.test(command)
+}
+
+export function purgeHooks(existing, harness, keep = new Set()) {
   const hooks = typeof existing === 'object' && existing !== null ? { ...existing } : {}
   let removed = 0
   for (const [event, groups] of Object.entries(hooks)) {
     if (!Array.isArray(groups)) continue
     const kept = groups.filter((group) => {
       const list = Array.isArray(group?.hooks) ? group.hooks.map((hook) => hook?.command) : []
-      const stale = list.length > 0 && list.every((command) => ownHook(command) && !keep.has(command))
+      const stale = list.length > 0 && list.every((command) => ownHook(command, harness) && !keep.has(command))
       if (stale) removed += 1
       return !stale
     })
@@ -114,8 +112,12 @@ export function purgeHooks(existing, keep = new Set()) {
   return { hooks, removed }
 }
 
-function purgeCodexHooks(agents, options, keep) {
-  const file = path.join(agents.agentHomes(options.ctx, options.homes).codex, 'hooks.json')
+function hookCommands(spec, harness) {
+  return new Set(Object.values(spec[harness].hooks).flatMap((groups) => groups.flatMap((group) => group.hooks.map((hook) => hook.command))))
+}
+
+function purgeOldHooks(agents, harness, options, keep) {
+  const file = HOOK_FILES[harness](agents.agentHomes(options.ctx, options.homes))
   if (!existsSync(file)) return null
   let value
   try {
@@ -123,10 +125,11 @@ function purgeCodexHooks(agents, options, keep) {
   } catch {
     return null
   }
-  const { hooks, removed } = purgeHooks(value.hooks, keep)
+  if (typeof value !== 'object' || value === null || Array.isArray(value) || value.hooks === undefined) return null
+  const { hooks, removed } = purgeHooks(value.hooks, harness, keep)
   if (removed === 0) return null
   writeFileSync(file, `${JSON.stringify({ ...value, hooks }, null, 2)}\n`)
-  return { agent: 'codex', item: 'old hooks', state: 'removed', detail: `removed ${removed} gaze hooks from another install in ${file}`, path: file }
+  return { agent: harness, item: 'old hooks', state: 'removed', detail: `removed ${removed} gaze hooks from another install in ${file}`, path: file }
 }
 
 export function integration({ command, version = packageVersion(), platform = process.platform }) {
@@ -177,9 +180,8 @@ export async function installAgents(wanted, source, options = {}) {
   const others = targets.filter((agent) => agent !== 'claude')
   if (others.length === 0) return { targets, steps }
   const spec = await specFor(source, options)
-  if (others.includes('codex')) {
-    const keep = new Set(Object.values(spec.codex.hooks).flatMap((groups) => groups.flatMap((group) => group.hooks.map((hook) => hook.command))))
-    const purged = purgeCodexHooks(agents, options, keep)
+  for (const harness of Object.keys(HOOK_FILES).filter((agent) => others.includes(agent))) {
+    const purged = purgeOldHooks(agents, harness, options, harness === 'codex' ? hookCommands(spec, harness) : new Set())
     if (purged) steps.push(purged)
   }
   steps.push(...(await agents.installIntegration(spec, { ...options, agents: others })))
@@ -200,8 +202,8 @@ export async function uninstallAgents(wanted, source, options = {}) {
   if (others.length === 0) return { targets, steps }
   const spec = await specFor(source, options)
   steps.push(...(await agents.uninstallIntegration(spec, { ...options, agents: others })))
-  if (others.includes('codex')) {
-    const purged = purgeCodexHooks(agents, options, new Set())
+  for (const harness of Object.keys(HOOK_FILES).filter((agent) => others.includes(agent))) {
+    const purged = purgeOldHooks(agents, harness, options, new Set())
     if (purged) steps.push(purged)
   }
   return { targets, steps }
@@ -214,8 +216,9 @@ export function formatSteps(steps, removing) {
   return `Integraciones:\n${lines.join('\n')}\n`
 }
 
-function runBinary(binary, args, json) {
-  const result = spawnSync(binary, json ? [...args, '--json'] : args, { stdio: ['inherit', json ? 'pipe' : 'inherit', 'inherit'], encoding: 'utf8', windowsHide: true })
+function runBinary(command, args, json) {
+  const [binary, ...prefix] = command
+  const result = spawnSync(binary, [...prefix, ...(json ? [...args, '--json'] : args)], { stdio: ['inherit', json ? 'pipe' : 'inherit', 'inherit'], encoding: 'utf8', windowsHide: true })
   if (result.error) throw new Error(`no se pudo correr ${binary}: ${result.error.message}`)
   return { code: result.status ?? 1, stdout: result.stdout ?? '' }
 }
@@ -252,7 +255,7 @@ export async function runSetup(argv, binary, options = {}) {
     fail(`gaze: ${error.message}\n`)
     return 2
   }
-  const native = runBinary(binary, [removing ? 'uninstall' : 'setup'], parsed.json)
+  const native = runBinary(options.native ?? [binary], [removing ? 'uninstall' : 'setup'], parsed.json)
   if (native.code !== 0) {
     if (parsed.json) write(native.stdout)
     return native.code

@@ -166,13 +166,13 @@ describe('resolveTarget', () => {
   test('maps the supported platforms to release targets', () => {
     assert.equal(resolveTarget('darwin', 'arm64'), 'aarch64-apple-darwin')
     assert.equal(resolveTarget('linux', 'x64'), 'x86_64-unknown-linux-gnu')
-    assert.equal(resolveTarget('darwin', 'x64'), 'x86_64-apple-darwin')
+    assert.throws(() => resolveTarget('darwin', 'x64'), /no prebuilt binary for darwin-x64/)
     assert.equal(resolveTarget('linux', 'arm64'), 'aarch64-unknown-linux-gnu')
     assert.equal(resolveTarget('win32', 'x64'), 'x86_64-pc-windows-msvc')
   })
 
   test('rejects an unsupported platform with a clear error', async () => {
-    assert.throws(() => resolveTarget('win32', 'arm64'), /no prebuilt binary for win32-arm64 \(supported: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64\)/)
+    assert.throws(() => resolveTarget('win32', 'arm64'), /no prebuilt binary for win32-arm64 \(supported: darwin-arm64, linux-x64, linux-arm64, win32-x64\)/)
     const root = packageRoot()
     await assert.rejects(install(root, { platform: 'freebsd', arch: 'x64' }), /no prebuilt binary for freebsd-x64/)
     assert.equal(requests.length, 0)

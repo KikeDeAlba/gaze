@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::agents::{self, Agent};
 use crate::embed::{self, Embedder, SocketEmbedder};
 use crate::paths;
 use crate::project;
@@ -68,7 +69,7 @@ const FILLER: [&str; 22] = [
 ];
 
 pub fn disabled() -> bool {
-    std::env::var(HARVEST_ENV).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    std::env::var(HARVEST_ENV).map(|v| !v.is_empty() && v != "0").unwrap_or(false) || agents::headless()
 }
 
 pub fn read_input() -> Value {
@@ -77,11 +78,21 @@ pub fn read_input() -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::Null)
 }
 
-fn input_cwd(input: &Value) -> PathBuf {
+pub fn project_dir(agent: Agent) -> Option<PathBuf> {
+    agent
+        .project_dir_var()
+        .into_iter()
+        .chain(["CLAUDE_PROJECT_DIR", "GEMINI_PROJECT_DIR"])
+        .find_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+fn input_cwd(input: &Value, agent: Agent) -> PathBuf {
     input["cwd"]
         .as_str()
+        .filter(|c| !c.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
+        .or_else(|| project_dir(agent))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
 }
 
@@ -129,9 +140,9 @@ pub fn session_context(rules: &[Node], budget: usize) -> String {
     out
 }
 
-pub fn session_start(store: &Store, input: &Value) -> Result<Option<Value>> {
+pub fn session_start(store: &Store, input: &Value, agent: Agent) -> Result<Option<Value>> {
     let started = Instant::now();
-    let cwd = input_cwd(input);
+    let cwd = input_cwd(input, agent);
     let project = resolve_for_hook(store, &cwd)?;
     let rules = store.active_rules(&project.slug)?;
     let context = session_context(&rules, store.cfg.hooks.rules_tokens);
@@ -255,19 +266,29 @@ fn resolve_for_hook(store: &Store, cwd: &Path) -> Result<project::Project> {
     Ok(project)
 }
 
+#[cfg(unix)]
 pub fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
-pub fn prompt(store: &Store, input: &Value) -> Result<Option<Value>> {
+#[cfg(windows)]
+pub fn detach(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+pub fn prompt(store: &Store, input: &Value, agent: Agent) -> Result<Option<Value>> {
     let started = Instant::now();
     let prompt = input["prompt"].as_str().unwrap_or_default();
     let cfg = &store.cfg.hooks;
     if trivial_prompt(prompt, cfg.prompt_min_chars) {
         return Ok(None);
     }
-    let cwd = input_cwd(input);
+    let cwd = input_cwd(input, agent);
     let project = resolve_for_hook(store, &cwd)?;
     let session = session_id(input);
     let already = store.injected(&session)?;
@@ -304,10 +325,13 @@ pub fn prompt(store: &Store, input: &Value) -> Result<Option<Value>> {
         return Ok(None);
     }
     store.record_injection(&session, "prompt", &ids, estimate_tokens(&context), started.elapsed().as_millis())?;
-    Ok(Some(hook_output("UserPromptSubmit", &context)))
+    Ok(Some(hook_output(agent.prompt_event(), &context)))
 }
 
-pub fn harvest(input: &Value) -> Result<()> {
+pub fn harvest(input: &Value, agent: Agent) -> Result<()> {
+    if agent != Agent::Claude {
+        return Ok(());
+    }
     let Some(transcript) = input["transcript_path"].as_str() else { return Ok(()) };
     let exe = std::env::current_exe()?;
     let _ = std::fs::create_dir_all(paths::data_dir());
@@ -315,7 +339,7 @@ pub fn harvest(input: &Value) -> Result<()> {
     let mut command = Command::new(exe);
     command
         .args(["harvest-run", "--transcript", transcript, "--session", &session_id(input), "--cwd"])
-        .arg(input_cwd(input))
+        .arg(input_cwd(input, agent))
         .env(HARVEST_ENV, "1")
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -437,6 +461,16 @@ pub fn parse_learnings(raw: &str) -> Vec<Value> {
     serde_json::from_str::<Vec<Value>>(&text[start..=end]).unwrap_or_default()
 }
 
+pub fn private_dir(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir.to_path_buf())
+}
+
 fn log(message: &str) {
     println!("{} {message}", text::now_iso());
 }
@@ -457,50 +491,23 @@ pub fn harvest_run(store: &Store, emb: &dyn Embedder, transcript: &Path, session
     let tail: String = chars[chars.len().saturating_sub(cfg.max_chars)..].iter().collect();
     let project = project::resolve(store, cwd, false)?;
     let prompt = harvest_prompt(&project.slug, &known_projects(store), &tail);
-    let claude = std::env::var("GAZE_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-    let mut child = Command::new(&claude)
-        .args([
-            "-p",
-            "--model",
-            &cfg.model,
-            "--output-format",
-            "json",
-            "--tools",
-            "",
-            "--strict-mcp-config",
-            "--no-session-persistence",
-            "--disable-slash-commands",
-        ])
-        .env(HARVEST_ENV, "1")
-        .env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
-        .env("BITA_NO_HOOKS", "1")
-        .env("KIT_NO_EVENTS", "1")
-        .current_dir(std::env::temp_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawn {claude}"))?;
-    child.stdin.take().context("stdin")?.write_all(prompt.as_bytes())?;
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if started.elapsed() > Duration::from_secs(cfg.timeout_seconds) {
-            let _ = child.kill();
-            log(&format!("harvest {session}: claude timed out"));
+    let Some(agent) = Agent::parse(&cfg.agent) else {
+        log(&format!("harvest {session}: unknown harvest agent {:?}", cfg.agent));
+        return Ok(());
+    };
+    let env = [(HARVEST_ENV, "1"), ("BITA_NO_HOOKS", "1"), ("KIT_NO_EVENTS", "1")];
+    let text = match agents::run(agent, &prompt, cfg.model.as_deref(), &private_dir(&paths::harvest_dir())?, Duration::from_secs(cfg.timeout_seconds), &env)? {
+        agents::Outcome::Text(text) => text,
+        agents::Outcome::TimedOut => {
+            log(&format!("harvest {session}: {} timed out", agent.id()));
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        log(&format!("harvest {session}: claude failed: {}", text::truncate(&String::from_utf8_lossy(&output.stderr), 300)));
-        return Ok(());
-    }
-    let learnings = parse_learnings(&stdout);
+        agents::Outcome::Failed(stderr) => {
+            log(&format!("harvest {session}: {} failed: {}", agent.id(), text::truncate(&stderr, 300)));
+            return Ok(());
+        }
+    };
+    let learnings = parse_learnings(&text);
     let mut saved = Vec::new();
     for item in learnings.into_iter().take(cfg.max_items) {
         let kind = item["kind"].as_str().unwrap_or("fact");
@@ -581,6 +588,15 @@ mod tests {
         assert!(!needs_background_refresh(&project::Project { slug: "gaze".into(), ..fresh }));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn harvest_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = private_dir(&dir.path().join("harvest")).unwrap();
+        assert_eq!(std::fs::metadata(target).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
     #[test]
     fn hook_output_shape() {
         let out = hook_output("SessionStart", "x");
@@ -604,7 +620,15 @@ mod tests {
         store.cfg.hooks.prompt_margin = 0.0;
         let e = FakeEmbedder;
         unsafe { std::env::set_var("GAZE_EMBEDDER", "fake") };
-        store.conn.execute("INSERT INTO project_cache (cwd, project, source, resolved_at) VALUES ('/', 'den', 'test', ?1)", [project::now_secs()]).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = crate::paths::canonical(work.path()).to_string_lossy().into_owned();
+        store
+            .conn
+            .execute(
+                "INSERT INTO project_cache (cwd, project, source, resolved_at) VALUES (?1, 'den', 'test', ?2)",
+                rusqlite::params![cwd, project::now_secs()],
+            )
+            .unwrap();
         for i in 0..6 {
             store
                 .remember(
@@ -634,22 +658,27 @@ mod tests {
                 false,
             )
             .unwrap();
-        let input = json!({"session_id": "s1", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": "/"});
-        let out = prompt(&store, &input).unwrap().expect("should inject");
+        let input = json!({"session_id": "s1", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": cwd});
+        let out = prompt(&store, &input, Agent::Claude).unwrap().expect("should inject");
         let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
         assert!(estimate_tokens(context) <= 150, "{}", estimate_tokens(context));
         let lines = context.lines().count() - 1;
         assert!((1..=3).contains(&lines));
         assert!(!context.contains("facturas"));
-        let again = prompt(&store, &input).unwrap();
+        let again = prompt(&store, &input, Agent::Claude).unwrap();
         if let Some(v) = again {
             let second = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
             for line in context.lines().skip(1) {
                 assert!(!second.contains(line));
             }
         }
-        let unrelated = json!({"session_id": "s2", "prompt": "escribe un poema sobre gatos y la luna llena", "cwd": "/"});
-        assert!(prompt(&store, &unrelated).unwrap().is_none());
+        let unrelated = json!({"session_id": "s2", "prompt": "escribe un poema sobre gatos y la luna llena", "cwd": cwd});
+        assert!(prompt(&store, &unrelated, Agent::Claude).unwrap().is_none());
+        let gemini =
+            prompt(&store, &json!({"session_id": "s3", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": cwd}), Agent::Gemini)
+                .unwrap()
+                .expect("gemini should inject");
+        assert_eq!(gemini["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
     }
 
     #[test]

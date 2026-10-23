@@ -1,7 +1,5 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -107,25 +105,21 @@ impl Embedder for LocalModel {
 }
 
 pub fn socket_alive(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    crate::ipc::alive(path)
 }
 
 pub fn socket_request(path: &Path, request: &Value, timeout: Duration) -> Result<Value> {
-    let mut stream = UnixStream::connect(path).with_context(|| format!("connect {}", path.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
-    stream.write_all(&line)?;
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
+    let response = crate::ipc::request(path, &line, timeout).with_context(|| format!("connect {}", path.display()))?;
     let value: Value = serde_json::from_str(&response).context("daemon response")?;
     if value["ok"] != json!(true) {
         return Err(anyhow!("daemon error: {}", value["error"].as_str().unwrap_or("unknown")));
     }
     Ok(value)
 }
+
+pub const SOCKET_BATCH: usize = 32;
 
 pub struct SocketEmbedder {
     pub path: PathBuf,
@@ -137,10 +131,14 @@ impl Embedder for SocketEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let response = socket_request(&self.path, &json!({"op": "embed", "mode": mode.as_str(), "texts": texts}), self.timeout)?;
-        let vectors: Vec<Vec<f32>> = serde_json::from_value(response["vectors"].clone())?;
-        if vectors.len() != texts.len() {
-            return Err(anyhow!("daemon returned {} vectors for {} texts", vectors.len(), texts.len()));
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(SOCKET_BATCH) {
+            let response = socket_request(&self.path, &json!({"op": "embed", "mode": mode.as_str(), "texts": batch}), self.timeout)?;
+            let got: Vec<Vec<f32>> = serde_json::from_value(response["vectors"].clone())?;
+            if got.len() != batch.len() {
+                return Err(anyhow!("daemon returned {} vectors for {} texts", got.len(), batch.len()));
+            }
+            vectors.extend(got);
         }
         Ok(vectors)
     }
@@ -189,5 +187,37 @@ impl Embedder for AutoEmbedder {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_embedder_sends_batches_of_32() {
+        use std::io::{BufReader, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("e.sock");
+        let listener = crate::ipc::bind(&endpoint).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut sizes = Vec::new();
+            for _ in 0..3 {
+                let stream = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                crate::ipc::read_line_capped(&mut reader, &mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let count = request["texts"].as_array().unwrap().len();
+                sizes.push(count);
+                let vectors = vec![vec![0.5f32; 4]; count];
+                reader.get_mut().write_all(format!("{}\n", json!({"ok": true, "vectors": vectors})).as_bytes()).unwrap();
+            }
+            sizes
+        });
+        let texts: Vec<String> = (0..70).map(|i| format!("t{i}")).collect();
+        let vectors = SocketEmbedder { path: endpoint, timeout: Duration::from_secs(5) }.embed(&texts, Mode::Passage).unwrap();
+        assert_eq!(vectors.len(), 70);
+        assert_eq!(server.join().unwrap(), [32, 32, 6]);
     }
 }

@@ -165,8 +165,25 @@ fn frontmatter_project(store: &Store, meta: &BTreeMap<String, String>) -> Option
         .or_else(|| meta.get("project").map(|name| project::project_for_name(store, name)).filter(|slug| slug != GLOBAL && known_project(store, slug)))
 }
 
+pub fn slash_rel(root: &Path, path: &Path) -> String {
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => crate::paths::simplify(path.to_path_buf()),
+    };
+    let mut head = String::new();
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => head.push_str(&prefix.as_os_str().to_string_lossy()),
+            std::path::Component::RootDir => head.push('/'),
+            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
+        }
+    }
+    format!("{head}{}", parts.join("/"))
+}
+
 pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path) -> Result<Option<(String, &'static str)>> {
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    let rel = slash_rel(root, path);
     let key = format!("inkwell:{rel}");
     let modified = mtime(path);
     let raw = std::fs::read_to_string(path)?;
@@ -225,7 +242,7 @@ pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: 
     files.sort();
     let mut present = HashSet::new();
     for (index, path) in files.iter().enumerate() {
-        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+        let rel = slash_rel(root, path);
         let key = format!("inkwell:{rel}");
         present.insert(key.clone());
         report.scanned += 1;
@@ -557,7 +574,7 @@ impl DocsBatch<'_> {
 }
 
 fn canonical_or_raw(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::paths::canonical(path)
 }
 
 pub fn inkwell_event(store: &Store, emb: &dyn Embedder, event: &Value, docs: &Path, bita: &str) -> Result<Value> {
@@ -759,6 +776,7 @@ mod tests {
         assert_eq!(folder_project(&store, &spaces, "dp-personalizationx"), GLOBAL);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bita_events_refresh_projects_when_the_entry_project_is_unknown() {
         use std::os::unix::fs::PermissionsExt;
@@ -783,6 +801,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn inkwell_ingest_refreshes_bita_projects_first() {
         use std::os::unix::fs::PermissionsExt;
@@ -1086,6 +1105,7 @@ mod tests {
         assert!(store.by_source_ref("inkwell:dp/b.md").unwrap().is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn inkwell_events_refresh_projects_once_when_a_folder_is_unknown() {
         use std::os::unix::fs::PermissionsExt;
@@ -1272,6 +1292,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slash_rel_keeps_paths_outside_the_root_single_rooted() {
+        let root = Path::new("/docs");
+        assert_eq!(slash_rel(root, Path::new("/docs/dp/a.md")), "dp/a.md");
+        assert_eq!(slash_rel(root, Path::new("dp/a.md")), "dp/a.md");
+        #[cfg(unix)]
+        assert_eq!(slash_rel(root, Path::new("/tmp/x.md")), "/tmp/x.md");
+        #[cfg(windows)]
+        {
+            let root = Path::new(r"C:\docs");
+            assert_eq!(slash_rel(root, Path::new(r"C:\docs\dp\a.md")), "dp/a.md");
+            assert_eq!(slash_rel(root, Path::new(r"C:\tmp\x.md")), "C:/tmp/x.md");
+            assert_eq!(slash_rel(root, Path::new(r"\\?\D:\tmp\x.md")), "D:/tmp/x.md");
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn inkwell_ingest_recovers_stranded_moving_keys() {
         let store = Store::in_memory().unwrap();

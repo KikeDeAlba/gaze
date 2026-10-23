@@ -1,6 +1,6 @@
 [package]
 name = "gaze"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Per-project brain for coding agents: local knowledge store with hybrid vector search"
@@ -20,6 +20,11 @@ sqlite-vec = "0.1"
 toml = "0.9"
 ulid = "1"
 unicode-normalization = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+interprocess = "2"
+widestring = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

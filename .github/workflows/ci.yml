@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +63,9 @@ jobs:
             echo "Cargo.toml is $cargo_version, package.json is $npm_version, plugin.json is $plugin_version" >&2
             exit 1
           fi
+
+      - name: npm dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
 
       - name: npm tests
         run: npm run test:npm

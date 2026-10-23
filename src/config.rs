@@ -36,7 +36,9 @@ pub struct HookConfig {
 #[serde(default)]
 pub struct HarvestConfig {
     pub enabled: bool,
-    pub model: String,
+    pub agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub max_chars: usize,
     pub min_chars: usize,
     pub max_items: usize,
@@ -65,7 +67,7 @@ impl Default for HookConfig {
 
 impl Default for HarvestConfig {
     fn default() -> Self {
-        Self { enabled: true, model: "haiku".into(), max_chars: 40_000, min_chars: 600, max_items: 8, timeout_seconds: 240 }
+        Self { enabled: true, agent: "claude".into(), model: None, max_chars: 40_000, min_chars: 600, max_items: 8, timeout_seconds: 240 }
     }
 }
 

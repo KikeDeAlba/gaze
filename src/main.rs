@@ -8,7 +8,7 @@ use std::time::Instant;
 use gaze::embed::{AutoEmbedder, Embedder};
 use gaze::envelope::{self, usage};
 use gaze::store::{GLOBAL, NewNode, Scope, SearchOptions, Store};
-use gaze::{daemon, hooks, import, ingest, mcp, paths, project, setup, text};
+use gaze::{agents, daemon, hooks, import, ingest, mcp, paths, project, setup, text};
 
 #[derive(Parser)]
 #[command(name = "gaze", version, about = "El cerebro de cada proyecto: notas, reglas y búsqueda híbrida para agentes")]
@@ -97,9 +97,9 @@ enum Command {
     Stats,
     #[command(about = "Capacidades para kit")]
     Capabilities,
-    #[command(about = "Registra gaze en kit y crea la configuración")]
+    #[command(about = "Registra gaze en kit y crea la configuración; desde npm también integra los agentes (--agents, --remove)")]
     Setup,
-    #[command(about = "Quita el registro de kit (conserva los datos)")]
+    #[command(about = "Quita el registro de kit (conserva los datos); desde npm también quita las integraciones")]
     Uninstall,
     #[command(about = "Servidor MCP por stdio")]
     Mcp,
@@ -107,14 +107,22 @@ enum Command {
     Serve {
         #[arg(long)]
         idle_minutes: Option<u64>,
+        #[arg(long, help = "Escribe el log del daemon en esta ruta (con --detach, por omisión serve.log del directorio de datos)")]
+        log: Option<PathBuf>,
+        #[arg(long, help = "Se relanza en segundo plano sin consola y sale")]
+        detach: bool,
     },
-    #[command(about = "Instala o quita el daemon de launchd")]
+    #[command(about = "Instala o quita el daemon (launchd, systemd --user o schtasks)")]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    #[command(about = "Hooks de Claude Code (session-start, prompt, harvest)")]
-    Hook { event: String },
+    #[command(about = "Hooks de los agentes (session-start, prompt, harvest)")]
+    Hook {
+        event: String,
+        #[arg(long, help = "claude, codex, gemini, antigravity u opencode; si falta, se detecta por el entorno")]
+        harness: Option<String>,
+    },
     #[command(about = "Recibe eventos de bita por stdin")]
     BitaHook,
     #[command(about = "Recibe eventos de inkwell por stdin")]
@@ -516,20 +524,23 @@ fn run(command: Command) -> Result<Output> {
         }
         Command::Setup => {
             let result = setup::setup()?;
+            let next = result["next"]
+                .as_array()
+                .map(|steps| steps.iter().filter_map(Value::as_str).map(|s| format!("  {s}")).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default();
             let human = format!(
-                "Registrado en kit: {}\nConfiguración: {}\nBase: {}\n\nFalta (no lo hago yo):\n  gaze daemon install\n  {}\n  {}\n  gaze import claude-memory --dry-run && gaze import claude-memory\n  gaze ingest",
+                "Registrado en kit: {}\nConfiguración: {}\nBase: {}\n\n{}\n\nFalta (no lo hago yo):\n{next}",
                 result["manifest"].as_str().unwrap_or_default(),
                 result["config"].as_str().unwrap_or_default(),
                 result["database"].as_str().unwrap_or_default(),
-                setup::CLAUDE_STEPS[0],
-                setup::CLAUDE_STEPS[1]
+                setup::INTEGRATIONS_NOTE
             );
             Ok(Output::new(result, human))
         }
         Command::Uninstall => {
             let result = setup::uninstall()?;
             let human = format!(
-                "Registro de kit {}.\nLos datos se quedan en {}.\nPara terminar: gaze daemon uninstall && claude plugin uninstall gaze@gaze",
+                "Registro de kit {}.\nLos datos se quedan en {}.\nPara terminar: gaze daemon uninstall (las integraciones con cada agente las quita el paquete npm)",
                 if result["removed"] == json!(true) { "borrado" } else { "no existía" },
                 result["kept"].as_str().unwrap_or_default()
             );
@@ -538,11 +549,14 @@ fn run(command: Command) -> Result<Output> {
         Command::Daemon { action } => match action {
             DaemonAction::Install => {
                 let result = daemon::install()?;
-                let human = if result["ready"] == json!(true) {
-                    format!("Daemon cargado en launchd con pid {} y respondiendo en {}", result["pid"], result["socket"].as_str().unwrap_or_default())
+                let manager = result["manager"].as_str().unwrap_or_default().to_string();
+                let human = if let Some(warning) = result["warning"].as_str() {
+                    format!("Daemon instalado en {manager}, pero sin arrancar: {warning}")
+                } else if result["ready"] == json!(true) {
+                    format!("Daemon cargado en {manager} con pid {} y respondiendo en {}", result["pid"], result["socket"].as_str().unwrap_or_default())
                 } else {
                     format!(
-                        "Daemon cargado en launchd con pid {}, pero aún no responde en {} (puede estar descargando el modelo); revisa {} y gaze daemon status",
+                        "Daemon cargado en {manager} con pid {}, pero aún no responde en {} (puede estar descargando el modelo); revisa {} y gaze daemon status",
                         result["pid"],
                         result["socket"].as_str().unwrap_or_default(),
                         result["log"].as_str().unwrap_or_default()
@@ -552,17 +566,20 @@ fn run(command: Command) -> Result<Output> {
             }
             DaemonAction::Uninstall => {
                 let result = daemon::uninstall()?;
-                Ok(Output::new(result, "Daemon quitado de launchd."))
+                let human = format!("Daemon quitado de {}.", result["manager"].as_str().unwrap_or_default());
+                Ok(Output::new(result, human))
             }
             DaemonAction::Status => {
                 let status = daemon::status();
+                let manager = status["manager"].as_str().unwrap_or_default();
+                let unit = status["unit"].as_str().unwrap_or_default();
                 let human = match status["state"].as_str().unwrap_or_default() {
                     "running" => format!("Corriendo (pid {})", status["pid"]),
                     "not-loaded" => {
-                        format!("Plist instalado pero no cargado en launchd ({}). Cárgalo con: gaze daemon install", paths::launch_agent().display())
+                        format!("Instalado pero no cargado en {manager} ({unit}). Cárgalo con: gaze daemon install")
                     }
                     "starting" => {
-                        format!("Cargado en launchd pero sin responder en el socket (pid {}); revisa {}", status["launchdPid"], paths::serve_log().display())
+                        format!("Cargado en {manager} pero sin responder en el socket (pid {}); revisa {}", status["managerPid"], paths::serve_log().display())
                     }
                     _ => "Apagado".to_string(),
                 };
@@ -578,20 +595,21 @@ fn run(command: Command) -> Result<Output> {
     }
 }
 
-fn run_hook(event: &str) {
+fn run_hook(event: &str, harness: Option<&str>) {
     if hooks::disabled() {
         return;
     }
+    let agent = agents::detect_from_env(harness);
     let input = hooks::read_input();
     let result = (|| -> Result<Option<Value>> {
         match event {
             "harvest" => {
-                hooks::harvest(&input)?;
+                hooks::harvest(&input, agent)?;
                 Ok(None)
             }
             "session-start" | "prompt" => {
                 let store = Store::open_default()?;
-                if event == "session-start" { hooks::session_start(&store, &input) } else { hooks::prompt(&store, &input) }
+                if event == "session-start" { hooks::session_start(&store, &input, agent) } else { hooks::prompt(&store, &input, agent) }
             }
             _ => Ok(None),
         }
@@ -607,11 +625,11 @@ fn main() {
     let cli = Cli::parse();
     let json_mode = cli.json;
     match cli.command {
-        Command::Hook { event } => return run_hook(&event),
+        Command::Hook { event, harness } => return run_hook(&event, harness.as_deref()),
         Command::Mcp => {
             let result = Store::open_default().and_then(|store| {
                 let emb = embedder();
-                let dir = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from).unwrap_or_else(cwd);
+                let dir = hooks::project_dir(agents::detect_from_env(None)).unwrap_or_else(cwd);
                 mcp::Server { store: &store, embedder: &emb, cwd: dir }.run()
             });
             if let Err(error) = result {
@@ -620,8 +638,19 @@ fn main() {
             }
             return;
         }
-        Command::Serve { idle_minutes } => {
-            if let Err(error) = daemon::serve(idle_minutes) {
+        Command::Serve { idle_minutes, log, detach } => {
+            if detach {
+                let log = log.unwrap_or_else(paths::serve_log);
+                match daemon::spawn_detached(idle_minutes, &log) {
+                    Ok(pid) => println!("gaze serve en segundo plano con pid {pid}; log en {}", log.display()),
+                    Err(error) => {
+                        eprintln!("gaze serve --detach: {error:#}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            if let Err(error) = daemon::serve(idle_minutes, daemon::ServeLog::new(log)) {
                 eprintln!("gaze serve: {error:#}");
                 std::process::exit(1);
             }

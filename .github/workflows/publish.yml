@@ -39,8 +39,14 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -55,17 +61,32 @@ jobs:
         with:
           toolchain: stable
 
-      - run: cargo build --release --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: smoke test the binary
-        run: ./target/release/gaze capabilities --json | jq -e .ok
+        shell: bash
+        run: |
+          bin=gaze
+          if [ "$RUNNER_OS" = "Windows" ]; then bin=gaze.exe; fi
+          "./target/${{ matrix.target }}/release/$bin" capabilities --json | jq -e .ok
 
       - name: package the binary
+        shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          archive="gaze-${version}-${{ matrix.target }}.tar.gz"
-          tar -czf "$archive" -C target/release gaze
-          shasum -a 256 "$archive" > "$archive.sha256"
+          release_dir="target/${{ matrix.target }}/release"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            archive="gaze-${version}-${{ matrix.target }}.zip"
+            pwsh -NoProfile -NonInteractive -Command "\$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath (Join-Path '$release_dir' 'gaze.exe') -DestinationPath '$archive' -CompressionLevel Optimal -Force"
+          else
+            archive="gaze-${version}-${{ matrix.target }}.tar.gz"
+            tar -czf "$archive" -C "$release_dir" gaze
+          fi
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
@@ -75,6 +96,7 @@ jobs:
           if-no-files-found: error
 
       - name: upload the assets to the release
+        shell: bash
         run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
@@ -106,13 +128,15 @@ jobs:
         run: |
           version="$(jq -r .version package.json)"
           assets='{}'
-          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
-            file="gaze-${version}-${target}.tar.gz"
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            ext=tar.gz
+            if [ "$target" = "x86_64-pc-windows-msvc" ]; then ext=zip; fi
+            file="gaze-${version}-${target}.${ext}"
             sum="$(sha256sum "$ARCHIVES/$file" | cut -d ' ' -f 1)"
             assets="$(jq -c --arg target "$target" --arg file "$file" --arg sum "$sum" '.[$target] = {file: $file, sha256: $sum}' <<< "$assets")"
           done
           jq -n --arg version "$version" --argjson assets "$assets" '{version: $version, assets: $assets}' > npm/checksums.json
-          jq -e '.assets | has("aarch64-apple-darwin") and has("x86_64-unknown-linux-gnu")' npm/checksums.json
+          jq -e '.assets | length == 5' npm/checksums.json
 
       - name: install the tarball the way a person would, and run it
         run: |

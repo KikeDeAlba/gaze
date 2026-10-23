@@ -194,6 +194,16 @@ pub fn coverage(terms: &[String], haystack: &str) -> f32 {
     found as f32 / terms.len() as f32
 }
 
+pub fn embed_or_log(emb: &dyn Embedder, chunks: &[String]) -> Option<Vec<Vec<f32>>> {
+    match emb.embed(chunks, Mode::Passage) {
+        Ok(vectors) => Some(vectors),
+        Err(error) => {
+            eprintln!("{} gaze: embedding failed, saving without vectors (gaze reindex fixes it): {error:#}", text::now_iso());
+            None
+        }
+    }
+}
+
 impl Store {
     pub fn open_default() -> Result<Self> {
         Ok(Self { conn: db::open(&crate::paths::db_path())?, cfg: Config::load() })
@@ -263,7 +273,7 @@ impl Store {
                 return Ok(WriteOutcome { id: existing.id, action: "unchanged", title, project, kind: input.kind });
             }
             let chunks = text::chunk(&title, &body);
-            let vectors = emb.embed(&chunks, Mode::Passage).ok();
+            let vectors = embed_or_log(emb, &chunks);
             let id = existing.id.clone();
             self.tx(|| {
                 self.conn.execute(
@@ -277,7 +287,7 @@ impl Store {
         }
 
         let chunks = text::chunk(&title, &body);
-        let vectors = emb.embed(&chunks, Mode::Passage).ok();
+        let vectors = embed_or_log(emb, &chunks);
 
         if dedupe
             && NOTE_KINDS.contains(&input.kind.as_str())
@@ -297,7 +307,7 @@ impl Store {
             let pinned = existing.pinned || input.pinned;
             let until = input.until.clone().or(existing.until.clone());
             let merged_chunks = text::chunk(&merged_title, &body);
-            let merged_vectors = if merged_title == title { vectors.clone() } else { emb.embed(&merged_chunks, Mode::Passage).ok() };
+            let merged_vectors = if merged_title == title { vectors.clone() } else { embed_or_log(emb, &merged_chunks) };
             let merged_hash = content_hash(&[&project, &existing.kind, &merged_title, &body, if pinned { "1" } else { "0" }, until.as_deref().unwrap_or("")]);
             self.tx(|| {
                 self.conn.execute(
@@ -937,6 +947,29 @@ pub fn ensure_found(found: bool, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Broken;
+
+    impl Embedder for Broken {
+        fn embed(&self, _texts: &[String], _mode: Mode) -> Result<Vec<Vec<f32>>> {
+            Err(anyhow::anyhow!("daemon down"))
+        }
+    }
+
+    #[test]
+    fn a_failed_embedding_still_saves_the_note_without_vectors() {
+        assert!(embed_or_log(&Broken, &["x".to_string()]).is_none());
+        let store = Store::in_memory().unwrap();
+        let outcome = store
+            .remember(
+                &Broken,
+                NewNode { project: "den".into(), kind: "fact".into(), body: "Sin vectores pero guardada".into(), source: "user".into(), ..Default::default() },
+                true,
+            )
+            .unwrap();
+        assert_eq!(outcome.action, "created");
+        assert!(store.get(&outcome.id).unwrap().is_some());
+    }
     use crate::embed::FakeEmbedder;
 
     fn note(project: &str, kind: &str, title: &str, body: &str) -> NewNode {

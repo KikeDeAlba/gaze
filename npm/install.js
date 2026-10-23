@@ -11,7 +11,10 @@ export const DEFAULT_BASE = 'https://github.com/KikeDeAlba/gaze/releases/downloa
 
 const TARGETS = {
   'darwin-arm64': 'aarch64-apple-darwin',
+  'darwin-x64': 'x86_64-apple-darwin',
   'linux-x64': 'x86_64-unknown-linux-gnu',
+  'linux-arm64': 'aarch64-unknown-linux-gnu',
+  'win32-x64': 'x86_64-pc-windows-msvc',
 }
 
 const GITHUB_HOSTS = new Set(['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'])
@@ -51,8 +54,16 @@ export function resolveTarget(platform = process.platform, arch = process.arch) 
   return target
 }
 
-export function vendorBinary(root = ROOT) {
-  return path.join(root, 'vendor', 'gaze')
+export function binaryName(platform = process.platform) {
+  return platform === 'win32' ? 'gaze.exe' : 'gaze'
+}
+
+export function archiveName(version, target) {
+  return `gaze-${version}-${target}.${target.endsWith('-windows-msvc') ? 'zip' : 'tar.gz'}`
+}
+
+export function vendorBinary(root = ROOT, platform = process.platform) {
+  return path.join(root, 'vendor', binaryName(platform))
 }
 
 function executable(file) {
@@ -80,8 +91,14 @@ function removeOrphans(vendor, now = Date.now()) {
     return
   }
   for (const entry of entries) {
-    if (!entry.startsWith('.install-')) continue
     const file = path.join(vendor, entry)
+    if (/\.old-[0-9a-f]+$/.test(entry)) {
+      try {
+        rmSync(file, { force: true })
+      } catch {}
+      continue
+    }
+    if (!entry.startsWith('.install-')) continue
     try {
       if (now - statSync(file).mtimeMs > ORPHAN_AGE_MS) rmSync(file, { recursive: true, force: true })
     } catch {}
@@ -94,7 +111,7 @@ function packageVersion(root) {
 
 export function readChecksum(root, version, target) {
   const file = path.join(root, 'npm', 'checksums.json')
-  const asset = `gaze-${version}-${target}.tar.gz`
+  const asset = archiveName(version, target)
   let data
   try {
     data = JSON.parse(readFileSync(file, 'utf8'))
@@ -228,7 +245,9 @@ export async function ensureBinary(options = {}) {
     return env.GAZE_BINARY_PATH
   }
   const root = options.root ?? ROOT
-  const binary = vendorBinary(root)
+  const platform = options.platform ?? process.platform
+  const binary = vendorBinary(root, platform)
+  const name = binaryName(platform)
   const version = packageVersion(root)
   if (executable(binary) && vendorVersion(root) === version) return binary
   if (options.offline) return executable(binary) ? binary : null
@@ -257,21 +276,24 @@ export async function ensureBinary(options = {}) {
     const unpacked = path.join(work, 'unpacked')
     mkdirSync(unpacked)
     try {
-      execFileSync('tar', ['-xzf', file, '--no-same-owner', '--no-same-permissions', '-C', unpacked, 'gaze'], { stdio: ['ignore', 'ignore', 'pipe'] })
+      const flags = asset.endsWith('.zip') ? ['-xf'] : ['-xzf']
+      const guards = asset.endsWith('.zip') ? [] : ['--no-same-owner', '--no-same-permissions']
+      execFileSync(tarCommand(env), [...flags, file, ...guards, '-C', unpacked, name], { cwd: work, stdio: ['ignore', 'ignore', 'pipe'] })
     } catch (error) {
       throw new InstallError(`Cannot extract ${asset}: ${String(error.stderr ?? error.message).trim()}`)
     }
-    const extracted = path.join(unpacked, 'gaze')
+    const extracted = path.join(unpacked, name)
     let stats
     try {
       stats = lstatSync(extracted)
     } catch {
-      throw new InstallError(`${asset} does not contain a gaze binary at its root`)
+      throw new InstallError(`${asset} does not contain ${name} at its root`)
     }
-    if (!stats.isFile()) throw new InstallError(`${asset} has a gaze entry that is not a regular file`)
-    chmodSync(extracted, 0o755)
+    if (!stats.isFile()) throw new InstallError(`${asset} has a ${name} entry that is not a regular file`)
+    if (platform !== 'win32') chmodSync(extracted, 0o755)
     const stamp = path.join(work, '.version')
     writeFileSync(stamp, `${version}\n`)
+    if (platform === 'win32') setAside(binary)
     renameSync(extracted, binary)
     renameSync(stamp, path.join(vendor, '.version'))
   } catch (error) {
@@ -280,6 +302,20 @@ export async function ensureBinary(options = {}) {
     rmSync(work, { recursive: true, force: true })
   }
   return binary
+}
+
+export function tarCommand(env = process.env, platform = process.platform) {
+  if (platform !== 'win32') return 'tar'
+  return path.win32.join(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows', 'System32', 'tar.exe')
+}
+
+function setAside(binary) {
+  if (!existsSync(binary)) return
+  const old = `${binary}.old-${randomBytes(6).toString('hex')}`
+  renameSync(binary, old)
+  try {
+    rmSync(old, { force: true })
+  } catch {}
 }
 
 function invokedDirectly() {
@@ -291,15 +327,16 @@ function invokedDirectly() {
 }
 
 function home(env) {
-  return env.HOME || homedir()
+  return env.HOME || env.USERPROFILE || homedir()
 }
 
-export function launchAgent(env = process.env) {
+export function launchAgent(env = process.env, platform = process.platform) {
+  if (platform === 'win32') return null
   return path.join(home(env), 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist')
 }
 
 export function registryManifest(env = process.env) {
-  const config = env.XDG_CONFIG_HOME || path.join(home(env), '.config')
+  const config = process.platform === 'win32' ? env.APPDATA || path.join(home(env), 'AppData', 'Roaming') : env.XDG_CONFIG_HOME || path.join(home(env), '.config')
   return path.join(env.KIT_REGISTRY_DIR || path.join(config, 'kikedealba', 'tools.d'), 'gaze.json')
 }
 
@@ -337,6 +374,26 @@ function realpathOr(file) {
   }
 }
 
+export function daemonMarker(env = process.env) {
+  return path.join(dataDir(env), 'daemon.json')
+}
+
+export function daemonStatus(binary, env = process.env) {
+  const result = spawnSync(binary, ['daemon', 'status', '--json'], { env, cwd: path.dirname(binary), stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, encoding: 'utf8' })
+  try {
+    const envelope = JSON.parse(String(result.stdout ?? '').trim())
+    if (envelope?.ok === true && typeof envelope.data?.installed === 'boolean') return envelope.data
+  } catch {}
+  return null
+}
+
+function daemonInstalled(binary, env) {
+  const status = daemonStatus(binary, env)
+  if (status) return status.installed
+  const agent = launchAgent(env)
+  return (Boolean(agent) && existsSync(agent)) || existsSync(daemonMarker(env))
+}
+
 export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
   if (env.GAZE_BINARY_PATH) return false
   const registered = readJson(registryManifest(env))
@@ -346,10 +403,20 @@ export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
   if (present && !npmManaged(bin)) return false
   if (!present || olderVersion(registered.version, packageVersion(root))) return true
   if (!binary || realpathOr(bin) !== realpathOr(binary)) return false
-  const plist = launchAgent(env)
-  if (!existsSync(plist)) return false
+  const marker = readJson(daemonMarker(env))
+  if (typeof marker?.bin === 'string' && (!existsSync(marker.bin) || realpathOr(marker.bin) !== realpathOr(bin))) return true
+  return plistMismatch(launchAgent(env), bin)
+}
+
+function xmlEscape(value) {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
+}
+
+function plistMismatch(plist, bin) {
+  if (!plist || !existsSync(plist)) return false
   try {
-    return !readFileSync(plist, 'utf8').includes(`<string>${bin}</string>`)
+    const text = readFileSync(plist, 'utf8')
+    return !text.includes(`<string>${xmlEscape(bin)}</string>`) && !text.includes(`<string>${bin}</string>`)
   } catch {
     return true
   }
@@ -358,6 +425,7 @@ export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
 export function dataDir(env = process.env) {
   if (env.GAZE_DATA_DIR) return env.GAZE_DATA_DIR
   if (env.GAZE_DB_PATH) return path.dirname(env.GAZE_DB_PATH)
+  if (process.platform === 'win32') return path.join(env.LOCALAPPDATA || path.join(home(env), 'AppData', 'Local'), 'gaze')
   return path.join(env.XDG_DATA_HOME || path.join(home(env), '.local', 'share'), 'gaze')
 }
 
@@ -437,24 +505,24 @@ export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
   const lock = repairLock(env)
   if (!acquireLock(lock)) return false
   try {
-    const child = spawn(process.execPath, [path.join(root, 'npm', 'install.js'), '--repair', lock], { env, detached: true, stdio: 'ignore' })
+    const child = spawn(process.execPath, [path.join(root, 'npm', 'install.js'), '--repair', lock], { env, cwd: root, detached: true, stdio: 'ignore', windowsHide: true })
     child.on('error', () => rmSync(lock, { force: true }))
     child.unref()
   } catch {
     rmSync(lock, { force: true })
     return false
   }
-  warn?.(`gaze: the kit registration or the launchd daemon points to an older or missing gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
+  warn?.(`gaze: the kit registration or the daemon points to an older or missing gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
   return true
 }
 
 export function refreshRegistration(binary, { env = process.env, warn = (message) => process.stderr.write(message) } = {}) {
-  const daemon = existsSync(launchAgent(env))
+  const daemon = daemonInstalled(binary, env)
   const steps = []
   if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
   if (daemon) steps.push(['daemon', 'install'])
   for (const args of steps) {
-    const result = spawnSync(binary, args, { env, stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8' })
+    const result = spawnSync(binary, args, { env, cwd: path.dirname(binary), stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
     if (result.status !== 0) {
       const detail = (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
       warn(`gaze: could not refresh the daemon with \`gaze ${args.join(' ')}\` (${detail}); run \`gaze setup && gaze daemon install\` by hand\n`)
@@ -474,7 +542,7 @@ async function repair(lock) {
         rmSync(lock, { force: true })
         return
       }
-      problems.push(`gaze setup and gaze daemon install finished, but ${registryManifest()} or ${launchAgent()} still does not point to ${binary}`)
+      problems.push(`gaze setup and gaze daemon install finished, but ${[registryManifest(), daemonMarker(), launchAgent()].filter(Boolean).join(' or ')} still does not point to ${binary}`)
     }
   } catch (error) {
     problems.push(error.message)

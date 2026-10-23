@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { accessSync, chmodSync, closeSync, constants, existsSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { accessSync, chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -35,6 +35,8 @@ const BUSY_ATTEMPTS = 5
 const BUSY_DELAY_MS = 200
 const RECLAIM_GUARD_MS = 60 * 1000
 const FUTURE_LOCK_MS = 60 * 1000
+const NOFOLLOW = constants.O_NOFOLLOW ?? 0
+const MISSING = new Set(['ENOENT', 'ENOTDIR'])
 const VERSION_ENTRIES = new Set(['gaze.exe', '.verified'])
 const INTEGRATION_FILES = {
   codex: (homes) => [path.join(homes.codex, 'hooks.json'), path.join(homes.codex, 'config.toml')],
@@ -143,7 +145,9 @@ async function pruneOtherVersions(vendor, binary, version, root, env, options) {
     return
   }
   if (entries.length === 0) return
-  const references = (await agentConfigs(binary, root, env, options.install)).flatMap(({ refs }) => refs)
+  const configs = await agentConfigs(binary, root, env, options.install)
+  if (configs === null) return
+  const references = configs.flatMap(({ refs }) => refs)
   const dirs = [...new Set([vendor, realpathOr(vendor)])]
   const keep = entries.filter((entry) => references.some((ref) => dirs.some((dir) => ref === path.join(dir, entry) || ref.startsWith(path.join(dir, entry) + path.sep))))
   removeOtherVersions(vendor, version, keep)
@@ -778,14 +782,15 @@ function configFiles(homes) {
   return Object.entries(INTEGRATION_FILES).flatMap(([agent, files]) => files(homes).map((file) => ({ agent, file })))
 }
 
-export function staleConfigs(binary, homes, root = ROOT) {
+export function staleConfigs(binary, homes, root = ROOT, { strict = false } = {}) {
   const prefixes = [...new Set([root, realpathOr(root)])].map((dir) => path.join(dir, 'vendor') + path.sep)
   const current = [...new Set([binary, realpathOr(binary)])]
   return configFiles(homes).flatMap(({ agent, file }) => {
     let text
     try {
       text = readFileSync(file, 'utf8')
-    } catch {
+    } catch (error) {
+      if (strict && !MISSING.has(error.code)) throw error
       return []
     }
     const refs = otherReferences(text, prefixes, current)
@@ -811,46 +816,110 @@ async function loadKit(env, install = {}) {
 async function agentConfigs(binary, root, env, install) {
   try {
     const kit = await loadKit(env, install)
-    return kit ? staleConfigs(binary, kit.homes, root) : []
+    return kit ? staleConfigs(binary, kit.homes, root, { strict: true }) : []
   } catch {
-    return []
+    return null
   }
 }
 
-function snapshotConfigs(files) {
+function identity(stats) {
+  return { ino: stats.ino, dev: stats.dev, uid: stats.uid }
+}
+
+function sameInode(a, b) {
+  return a.ino === b.ino && a.dev === b.dev
+}
+
+function openNoFollow(file, flags, expected) {
+  const before = lstatSync(file)
+  if (!before.isFile() || (expected && !sameInode(before, expected))) return null
+  const fd = openSync(file, flags | NOFOLLOW)
+  if (sameInode(fstatSync(fd), before)) return fd
+  closeSync(fd)
+  return null
+}
+
+function chmodNoFollow(file, mode, expected) {
+  const fd = openNoFollow(file, constants.O_RDONLY, expected)
+  if (fd === null) return false
+  try {
+    fchmodSync(fd, mode)
+  } finally {
+    closeSync(fd)
+  }
+  return true
+}
+
+export function snapshotConfigs(files) {
   return files.flatMap((file) => {
     try {
       const stats = lstatSync(file)
-      if (stats.isSymbolicLink()) return [{ file, link: readlinkSync(file), target: realpathSync(file), mode: statSync(file).mode & 0o777 }]
-      return stats.isFile() ? [{ file, mode: stats.mode & 0o777 }] : []
+      if (stats.isSymbolicLink()) {
+        const target = realpathSync(file)
+        const real = statSync(target)
+        return real.isFile() ? [{ file, link: readlinkSync(file), target, mode: real.mode & 0o777, ...identity(real) }] : []
+      }
+      return stats.isFile() ? [{ file, mode: stats.mode & 0o777, ...identity(stats) }] : []
     } catch {
       return []
     }
   })
 }
 
-function restoreConfigs(snapshots) {
-  for (const { file, link, target, mode } of snapshots) {
+function restoreLink({ file, link, target, mode, ino, dev }) {
+  const now = lstatSync(file)
+  if (now.isSymbolicLink()) return realpathSync(file) === target && chmodNoFollow(target, mode, { ino, dev })
+  if (realpathSync(path.resolve(path.dirname(file), link)) !== target) return false
+  const source = openNoFollow(file, constants.O_RDONLY)
+  if (source === null) return false
+  let content
+  try {
+    content = readFileSync(source)
+  } finally {
+    closeSync(source)
+  }
+  const fd = openNoFollow(target, constants.O_WRONLY, { ino, dev })
+  if (fd === null) return false
+  try {
+    ftruncateSync(fd, 0)
+    writeSync(fd, content)
+    fchmodSync(fd, mode)
+  } finally {
+    closeSync(fd)
+  }
+  rmSync(file, { force: true })
+  try {
+    symlinkSync(link, file)
+  } catch {
+    writeFileSync(file, content, { flag: 'wx', mode })
+  }
+  return true
+}
+
+export function restoreConfigs(snapshots, { euid = process.geteuid?.(), warn = (message) => process.stderr.write(message) } = {}) {
+  for (const snapshot of snapshots) {
+    const { file, link, mode, uid } = snapshot
+    if (euid === 0 && uid !== 0) {
+      warn(`gaze: running as root, so the mode${link === undefined ? '' : ' and symlink'} of ${file} were not restored; run \`gaze setup\` as its owner\n`)
+      continue
+    }
+    let restored
     try {
-      if (link !== undefined && !lstatSync(file).isSymbolicLink()) {
-        const content = readFileSync(file)
-        writeFileSync(target, content)
-        rmSync(file, { force: true })
-        try {
-          symlinkSync(link, file)
-        } catch {
-          writeFileSync(file, content, { mode })
-        }
-      }
-      chmodSync(target ?? file, mode)
-    } catch {}
+      restored = link === undefined ? chmodNoFollow(file, mode) : restoreLink(snapshot)
+    } catch {
+      restored = false
+    }
+    if (!restored) {
+      warn(`gaze: ${link === undefined ? file : `${file} -> ${snapshot.target}`} changed while gaze setup rewrote it, so its mode${link === undefined ? '' : ' and symlink'} were not restored; check it and run \`gaze setup\`\n`)
+      continue
+    }
     try {
-      if (lstatSync(`${file}.backup`).isFile()) chmodSync(`${file}.backup`, mode)
+      chmodNoFollow(`${file}.backup`, mode)
     } catch {}
   }
 }
 
-export async function refreshIntegrations(binary, { root = ROOT, env = process.env, install = {}, warn = (message) => process.stderr.write(message) } = {}) {
+export async function refreshIntegrations(binary, { root = ROOT, env = process.env, install = {}, euid, warn = (message) => process.stderr.write(message) } = {}) {
   let kit
   let setup
   try {
@@ -878,7 +947,7 @@ export async function refreshIntegrations(binary, { root = ROOT, env = process.e
     warn(`gaze: could not point ${stale.join(', ')} at ${binary} (${error.message}); run \`gaze setup\` by hand\n`)
     ok = false
   } finally {
-    restoreConfigs(snapshots)
+    restoreConfigs(snapshots, { ...(euid === undefined ? {} : { euid }), warn })
   }
   for (const { file, refs } of staleConfigs(binary, kit.homes, root)) {
     warn(`gaze: ${file} still points to ${refs.join(', ')}; run \`gaze setup\`\n`)
@@ -887,7 +956,7 @@ export async function refreshIntegrations(binary, { root = ROOT, env = process.e
   return ok
 }
 
-export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, warn = (message) => process.stderr.write(message) } = {}) {
+export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, euid, warn = (message) => process.stderr.write(message) } = {}) {
   const daemon = daemonInstalled(binary, env)
   const steps = []
   if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
@@ -903,7 +972,7 @@ export async function refreshRegistration(binary, { env = process.env, root = RO
     }
   }
   if (env.GAZE_BINARY_PATH) return refreshed
-  return (await refreshIntegrations(binary, { root, env, install, warn })) && refreshed
+  return (await refreshIntegrations(binary, { root, env, install, euid, warn })) && refreshed
 }
 
 function writeLock(lock, text) {

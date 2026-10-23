@@ -10,7 +10,7 @@ import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { platformContext } from '@kikedealba/kit/platform'
-import { acquireLock, archiveName, daemonMarker, ensureBinary, hopAllowed, needsRepair, olderVersion, redactUrl, refreshRegistration, registryManifest, repairLock, resolveTarget, runInstall, staleIntegrations, startRepair } from './install.js'
+import { acquireLock, archiveName, daemonMarker, ensureBinary, hopAllowed, needsRepair, olderVersion, redactUrl, refreshRegistration, registryManifest, repairLock, resolveTarget, restoreConfigs, runInstall, snapshotConfigs, staleIntegrations, startRepair } from './install.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
@@ -1483,6 +1483,103 @@ describe('agent integrations after a windows upgrade', () => {
     assert.equal(await install(root, { platform: 'win32', arch: 'x64', install: options }), binary)
     assert.ok(existsSync(old), 'the version a config still uses is not removed')
     assert.deepEqual(vendorEntries(root), ['9.9.8', '9.9.9'])
+  })
+
+  function linkedConfig() {
+    const dir = realpathSync(mkdtempSync(path.join(scratch, 'restore-')))
+    const real = path.join(dir, 'real.json')
+    const file = path.join(dir, 'config.json')
+    writeFileSync(real, '{"old":true}\n', { mode: 0o600 })
+    chmodSync(real, 0o600)
+    symlinkSync(real, file)
+    return { dir, real, file }
+  }
+
+  function kitRewrite(file, content) {
+    writeFileSync(`${file}.tmp`, content, { mode: 0o644 })
+    fs.renameSync(`${file}.tmp`, file)
+  }
+
+  test('restores the symlink and the mode of a config that kit replaced', { skip: process.platform === 'win32' }, () => {
+    const { real, file } = linkedConfig()
+    const snapshots = snapshotConfigs([file])
+    kitRewrite(file, '{"new":true}\n')
+    writeFileSync(`${file}.backup`, '{"old":true}\n', { mode: 0o644 })
+    const warnings = []
+    restoreConfigs(snapshots, { euid: 501, warn: (message) => warnings.push(message) })
+    assert.deepEqual(warnings, [])
+    assert.ok(fs.lstatSync(file).isSymbolicLink())
+    assert.equal(readFileSync(real, 'utf8'), '{"new":true}\n')
+    assert.equal(statSync(real).mode & 0o777, 0o600)
+    assert.equal(statSync(`${file}.backup`).mode & 0o777, 0o600)
+  })
+
+  test('as root, never restores a config owned by another user', { skip: process.platform === 'win32' }, () => {
+    const { real, file } = linkedConfig()
+    const snapshots = snapshotConfigs([file]).map((snapshot) => ({ ...snapshot, uid: 501 }))
+    kitRewrite(file, '{"new":true}\n')
+    const warnings = []
+    restoreConfigs(snapshots, { euid: 0, warn: (message) => warnings.push(message) })
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /running as root, so the mode and symlink of .*config\.json were not restored/)
+    assert.equal(fs.lstatSync(file).isSymbolicLink(), false)
+    assert.equal(readFileSync(real, 'utf8'), '{"old":true}\n')
+  })
+
+  test('skips the restore when the symlink target changed inode after the snapshot', { skip: process.platform === 'win32' }, () => {
+    const { dir, real, file } = linkedConfig()
+    const snapshots = snapshotConfigs([file])
+    kitRewrite(file, '{"new":true}\n')
+    const swapped = path.join(dir, 'swapped')
+    writeFileSync(swapped, 'someone else', { mode: 0o644 })
+    fs.renameSync(swapped, real)
+    const warnings = []
+    restoreConfigs(snapshots, { euid: 501, warn: (message) => warnings.push(message) })
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /changed while gaze setup rewrote it/)
+    assert.equal(readFileSync(real, 'utf8'), 'someone else')
+    assert.equal(statSync(real).mode & 0o777, 0o644)
+    assert.equal(readFileSync(file, 'utf8'), '{"new":true}\n')
+  })
+
+  test('skips the restore when the symlink points somewhere else afterwards', { skip: process.platform === 'win32' }, () => {
+    const { dir, file } = linkedConfig()
+    const snapshots = snapshotConfigs([file])
+    const other = path.join(dir, 'other')
+    writeFileSync(other, 'other', { mode: 0o644 })
+    rmSync(file)
+    symlinkSync(other, file)
+    const warnings = []
+    restoreConfigs(snapshots, { euid: 501, warn: (message) => warnings.push(message) })
+    assert.equal(warnings.length, 1)
+    assert.equal(statSync(other).mode & 0o777, 0o644)
+  })
+
+  test('does not remove old versions when the agent configs cannot be read', async () => {
+    const root = windowsPackage('9.9.8')
+    const { install: options } = agentMachine()
+    const old = await install(root, { platform: 'win32', arch: 'x64', install: options })
+    upgrade(root, '9.9.9')
+    const broken = { ...options, homes: new Proxy({}, { get: () => { throw new Error('kit exploded') } }) }
+    const binary = await install(root, { platform: 'win32', arch: 'x64', install: broken })
+    assert.ok(existsSync(old))
+    assert.deepEqual(vendorEntries(root), ['9.9.8', '9.9.9'])
+    assert.equal(await install(root, { platform: 'win32', arch: 'x64', install: options }), binary)
+    assert.deepEqual(vendorEntries(root), ['9.9.9'])
+  })
+
+  test('does not remove old versions when an agent config is unreadable', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, async () => {
+    const root = windowsPackage('9.9.8')
+    const { agentHome, install: options } = agentMachine()
+    const old = await install(root, { platform: 'win32', arch: 'x64', install: options })
+    const hooks = path.join(agentHome, '.codex', 'hooks.json')
+    mkdirSync(path.dirname(hooks), { recursive: true })
+    writeFileSync(hooks, '{}')
+    chmodSync(hooks, 0o000)
+    upgrade(root, '9.9.9')
+    await install(root, { platform: 'win32', arch: 'x64', install: options })
+    assert.ok(existsSync(old))
+    chmodSync(hooks, 0o600)
   })
 
   test('leaves the agent configs alone with GAZE_BINARY_PATH', async () => {

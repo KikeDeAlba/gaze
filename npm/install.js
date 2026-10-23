@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, closeSync, constants, existsSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -34,6 +34,7 @@ const BUSY = new Set(['EBUSY', 'EPERM', 'EACCES'])
 const BUSY_ATTEMPTS = 5
 const BUSY_DELAY_MS = 200
 const RECLAIM_GUARD_MS = 60 * 1000
+const FUTURE_LOCK_MS = 60 * 1000
 const VERSION_ENTRIES = new Set(['gaze.exe', '.verified'])
 const INTEGRATION_FILES = {
   codex: (homes) => [path.join(homes.codex, 'hooks.json'), path.join(homes.codex, 'config.toml')],
@@ -47,6 +48,13 @@ export class InstallError extends Error {
   constructor(message) {
     super(message)
     this.name = 'InstallError'
+  }
+}
+
+export class BusyError extends InstallError {
+  constructor(message) {
+    super(message)
+    this.name = 'BusyError'
   }
 }
 
@@ -112,7 +120,7 @@ function removeOrphans(vendor, now = Date.now()) {
   }
 }
 
-function removeOtherVersions(vendor, version) {
+function removeOtherVersions(vendor, version, keep = []) {
   let entries
   try {
     entries = readdirSync(vendor)
@@ -120,11 +128,25 @@ function removeOtherVersions(vendor, version) {
     return
   }
   for (const entry of entries) {
-    if (entry === version) continue
+    if (entry === version || keep.includes(entry)) continue
     try {
       rmSync(path.join(vendor, entry), { recursive: true, force: true })
     } catch {}
   }
+}
+
+async function pruneOtherVersions(vendor, binary, version, root, env, options) {
+  let entries
+  try {
+    entries = readdirSync(vendor).filter((entry) => entry !== version)
+  } catch {
+    return
+  }
+  if (entries.length === 0) return
+  const references = (await agentConfigs(binary, root, env, options.install)).flatMap(({ refs }) => refs)
+  const dirs = [...new Set([vendor, realpathOr(vendor)])]
+  const keep = entries.filter((entry) => references.some((ref) => dirs.some((dir) => ref === path.join(dir, entry) || ref.startsWith(path.join(dir, entry) + path.sep))))
+  removeOtherVersions(vendor, version, keep)
 }
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -135,7 +157,7 @@ async function readBinary(file) {
       return readFileSync(file)
     } catch (error) {
       if (!BUSY.has(error.code)) return null
-      if (attempt >= BUSY_ATTEMPTS) throw new InstallError(`Cannot read ${file}: ${error.code}. Another process, usually an antivirus scan, keeps it open; run gaze again in a moment`)
+      if (attempt >= BUSY_ATTEMPTS) throw new BusyError(`Cannot read ${file}: ${error.code}. Another process, usually an antivirus scan, keeps it open; run gaze again in a moment`)
     }
     await pause(BUSY_DELAY_MS)
   }
@@ -216,8 +238,12 @@ async function writeOnce(binary, data, sha256) {
       if (error.code !== 'EEXIST') throw error
       const verified = await settled(binary, sha256)
       if (!verified) {
-        rmSync(verifiedMarker(binary), { recursive: true, force: true })
-        rmSync(binary, { force: true })
+        try {
+          rmSync(verifiedMarker(binary), { recursive: true, force: true })
+          rmSync(binary, { force: true })
+        } catch (failure) {
+          throw new BusyError(`Cannot replace ${binary}, whose sha256 does not match: ${failure.code ?? failure.message}. Another process, usually an antivirus scan or a running gaze, keeps it open; close it and run gaze again`)
+        }
         continue
       }
       tryMarkVerified(binary, sha256, verified)
@@ -244,7 +270,7 @@ function pruneVersionDir(dir) {
     try {
       rmSync(file, { recursive: true, force: true })
     } catch (error) {
-      throw new InstallError(`Cannot remove ${file}, which does not belong in ${dir}: ${error.code ?? error.message}. Delete it and run gaze again`)
+      throw new BusyError(`Cannot remove ${file}, which does not belong in ${dir}: ${error.code ?? error.message}. Delete it and run gaze again`)
     }
   }
 }
@@ -271,6 +297,19 @@ export function readChecksum(root, version, target) {
   return { asset, sha256: entry.sha256.toLowerCase() }
 }
 
+export function redactUrl(url) {
+  try {
+    const parsed = typeof url === 'string' ? new URL(url) : url
+    return `${parsed.origin}${parsed.pathname === '/' ? '' : parsed.pathname}`
+  } catch {
+    return '<invalid URL>'
+  }
+}
+
+function redactText(text) {
+  return String(text).replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, (match) => redactUrl(match))
+}
+
 export function downloadBase(env, warn) {
   const custom = env.GAZE_DOWNLOAD_BASE
   if (!custom) return { base: DEFAULT_BASE, custom: false }
@@ -278,10 +317,10 @@ export function downloadBase(env, warn) {
   try {
     url = new URL(custom)
   } catch {
-    throw new InstallError(`GAZE_DOWNLOAD_BASE is not a valid URL: ${custom}`)
+    throw new InstallError('GAZE_DOWNLOAD_BASE is not a valid URL')
   }
-  if (!hopAllowed(url, true)) throw new InstallError(`GAZE_DOWNLOAD_BASE must use https (plain http is only allowed for 127.0.0.1 and localhost): ${custom}`)
-  warn(`gaze: downloading from GAZE_DOWNLOAD_BASE=${custom} instead of the GitHub releases\n`)
+  if (!hopAllowed(url, true)) throw new InstallError(`GAZE_DOWNLOAD_BASE must use https (plain http is only allowed for 127.0.0.1 and localhost): ${redactUrl(url)}`)
+  warn(`gaze: downloading from GAZE_DOWNLOAD_BASE=${redactUrl(url)} instead of the GitHub releases\n`)
   return { base: custom.replace(/\/+$/, ''), custom: true }
 }
 
@@ -297,12 +336,12 @@ function retryable(status) {
 
 async function readCapped(response, url) {
   const declared = Number(response.headers.get('content-length'))
-  if (declared > MAX_BYTES) throw new InstallError(`${url} is ${declared} bytes, over the ${MAX_BYTES} byte limit`)
+  if (declared > MAX_BYTES) throw new InstallError(`${redactUrl(url)} is ${declared} bytes, over the ${MAX_BYTES} byte limit`)
   const chunks = []
   let size = 0
   for await (const chunk of response.body) {
     size += chunk.length
-    if (size > MAX_BYTES) throw new InstallError(`${url} is over the ${MAX_BYTES} byte limit`)
+    if (size > MAX_BYTES) throw new InstallError(`${redactUrl(url)} is over the ${MAX_BYTES} byte limit`)
     chunks.push(chunk)
   }
   return Buffer.concat(chunks)
@@ -311,24 +350,24 @@ async function readCapped(response, url) {
 async function fetchOnce(url, custom) {
   let current = url
   for (let hop = 0; ; hop++) {
-    if (!hopAllowed(current, custom)) throw new InstallError(`Refusing to download from ${current}: ${custom ? 'only https, or http on 127.0.0.1 and localhost, is allowed' : `only https on ${[...GITHUB_HOSTS].join(', ')} is allowed`}`)
+    if (!hopAllowed(current, custom)) throw new InstallError(`Refusing to download from ${redactUrl(current)}: ${custom ? 'only https, or http on 127.0.0.1 and localhost, is allowed' : `only https on ${[...GITHUB_HOSTS].join(', ')} is allowed`}`)
     let response
     try {
       response = await fetch(current, { redirect: 'manual', signal: AbortSignal.timeout(TIMEOUT_MS), headers: { 'User-Agent': 'gaze-npm-installer' } })
     } catch (error) {
-      throw new NetworkError(`Cannot download ${current}: ${error.cause?.message ?? error.message}`)
+      throw new NetworkError(`Cannot download ${redactUrl(current)}: ${redactText(error.cause?.message ?? error.message)}`)
     }
     if (REDIRECT_STATUSES.has(response.status)) {
       await response.body?.cancel()
       const location = response.headers.get('location')
-      if (!location) throw new NetworkError(`Cannot download ${current}: HTTP ${response.status} without a Location header`)
-      if (hop >= MAX_REDIRECTS) throw new InstallError(`Cannot download ${url}: more than ${MAX_REDIRECTS} redirects`)
+      if (!location) throw new NetworkError(`Cannot download ${redactUrl(current)}: HTTP ${response.status} without a Location header`)
+      if (hop >= MAX_REDIRECTS) throw new InstallError(`Cannot download ${redactUrl(url)}: more than ${MAX_REDIRECTS} redirects`)
       current = new URL(location, current).href
       continue
     }
     if (!response.ok) {
       await response.body?.cancel()
-      const error = new NetworkError(`Cannot download ${current}: HTTP ${response.status}`)
+      const error = new NetworkError(`Cannot download ${redactUrl(current)}: HTTP ${response.status}`)
       error.retryable = retryable(response.status)
       throw error
     }
@@ -336,7 +375,7 @@ async function fetchOnce(url, custom) {
       return await readCapped(response, current)
     } catch (error) {
       if (error instanceof InstallError) throw error
-      throw new NetworkError(`Cannot download ${current}: ${error.cause?.message ?? error.message}`)
+      throw new NetworkError(`Cannot download ${redactUrl(current)}: ${redactText(error.cause?.message ?? error.message)}`)
     }
   }
 }
@@ -452,13 +491,13 @@ async function ensureVersionedBinary(binary, version, root, env, warn, options) 
   const { asset, sha256 } = readChecksum(root, version, target)
   pruneVersionDir(path.dirname(binary))
   if (marked(binary, sha256)) {
-    removeOtherVersions(vendor, version)
+    await pruneOtherVersions(vendor, binary, version, root, env, options)
     return binary
   }
   const before = regularFile(binary)
   if (before && (await matches(binary, sha256))) {
     tryMarkVerified(binary, sha256, before)
-    removeOtherVersions(vendor, version)
+    await pruneOtherVersions(vendor, binary, version, root, env, options)
     return binary
   }
   if (options.offline) return null
@@ -471,7 +510,7 @@ async function ensureVersionedBinary(binary, version, root, env, warn, options) 
 
   try {
     mkdirSync(path.dirname(binary), { recursive: true })
-    removeOtherVersions(vendor, version)
+    await pruneOtherVersions(vendor, binary, version, root, env, options)
     pruneVersionDir(path.dirname(binary))
     await writeOnce(binary, data, sha256)
   } catch (error) {
@@ -627,7 +666,7 @@ function lockOwner(file) {
 
 function staleLock(file, stats, now) {
   const age = now - stats.mtimeMs
-  return age >= ABANDONED_LOCK_MS || (age >= REPAIR_RETRY_MS && !alive(lockOwner(file)))
+  return age < -FUTURE_LOCK_MS || age >= ABANDONED_LOCK_MS || (age >= REPAIR_RETRY_MS && !alive(lockOwner(file)))
 }
 
 function reclaimUnderGuard(file, before, now) {
@@ -637,7 +676,9 @@ function reclaimUnderGuard(file, before, now) {
   } catch (error) {
     if (error.code !== 'EEXIST') return false
     try {
-      if (now - statSync(guard).mtimeMs > RECLAIM_GUARD_MS) rmdirSync(guard)
+      const stats = lstatSync(guard)
+      if (!stats.isDirectory() || readdirSync(guard).length > 0) rmSync(guard, { recursive: true, force: true })
+      else if (now - stats.mtimeMs > RECLAIM_GUARD_MS) rmdirSync(guard)
     } catch {}
     return false
   }
@@ -710,51 +751,140 @@ function escapedForms(value) {
   return [...new Set([value, JSON.stringify(value).slice(1, -1)])]
 }
 
-function referencesOtherBinary(text, prefixes, current) {
+function unescaped(value) {
+  if (!value.includes('\\\\')) return value
+  try {
+    return JSON.parse(`"${value}"`)
+  } catch {
+    return value
+  }
+}
+
+function otherReferences(text, prefixes, current) {
   let rest = text
   for (const form of current.flatMap(escapedForms)) rest = rest.replaceAll(form, '')
-  return prefixes.flatMap(escapedForms).some((prefix) => rest.includes(prefix))
+  const found = new Set()
+  for (const prefix of prefixes.flatMap(escapedForms)) {
+    for (let at = rest.indexOf(prefix); at !== -1; at = rest.indexOf(prefix, at + 1)) {
+      const tail = rest.slice(at + prefix.length)
+      const match = /^[^"'\n]*?gaze(?:\.exe)?(?![\w.-])/.exec(tail) ?? /^[^"'\s]*/.exec(tail)
+      found.add(unescaped(prefix + match[0]))
+    }
+  }
+  return [...found]
+}
+
+function configFiles(homes) {
+  return Object.entries(INTEGRATION_FILES).flatMap(([agent, files]) => files(homes).map((file) => ({ agent, file })))
+}
+
+export function staleConfigs(binary, homes, root = ROOT) {
+  const prefixes = [...new Set([root, realpathOr(root)])].map((dir) => path.join(dir, 'vendor') + path.sep)
+  const current = [...new Set([binary, realpathOr(binary)])]
+  return configFiles(homes).flatMap(({ agent, file }) => {
+    let text
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch {
+      return []
+    }
+    const refs = otherReferences(text, prefixes, current)
+    return refs.length > 0 ? [{ agent, file, refs }] : []
+  })
 }
 
 export function staleIntegrations(binary, homes, root = ROOT) {
-  const prefixes = [...new Set([root, realpathOr(root)])].map((dir) => path.join(dir, 'vendor') + path.sep)
-  const current = [...new Set([binary, realpathOr(binary)])]
-  const stale = (file) => {
-    try {
-      return referencesOtherBinary(readFileSync(file, 'utf8'), prefixes, current)
-    } catch {
-      return false
-    }
-  }
-  return Object.entries(INTEGRATION_FILES)
-    .filter(([, files]) => files(homes).some(stale))
-    .map(([agent]) => agent)
+  return [...new Set(staleConfigs(binary, homes, root).map(({ agent }) => agent))]
 }
 
-export async function refreshIntegrations(binary, { root = ROOT, install = {}, warn = (message) => process.stderr.write(message) } = {}) {
-  let setup
-  let agents
-  let ctx
+async function loadKit(env, install = {}) {
   try {
-    agents = await import('@kikedealba/kit/agents')
-    ctx = install.ctx ?? (await import('@kikedealba/kit/platform')).platformContext()
+    const agents = await import('@kikedealba/kit/agents')
+    const ctx = install.ctx ?? (await import('@kikedealba/kit/platform')).platformContext({ env, home: home(env) })
+    return { agents, ctx, homes: agents.agentHomes(ctx, install.homes) }
+  } catch (error) {
+    if (error.code === 'ERR_MODULE_NOT_FOUND') return null
+    throw error
+  }
+}
+
+async function agentConfigs(binary, root, env, install) {
+  try {
+    const kit = await loadKit(env, install)
+    return kit ? staleConfigs(binary, kit.homes, root) : []
+  } catch {
+    return []
+  }
+}
+
+function snapshotConfigs(files) {
+  return files.flatMap((file) => {
+    try {
+      const stats = lstatSync(file)
+      if (stats.isSymbolicLink()) return [{ file, link: readlinkSync(file), target: realpathSync(file), mode: statSync(file).mode & 0o777 }]
+      return stats.isFile() ? [{ file, mode: stats.mode & 0o777 }] : []
+    } catch {
+      return []
+    }
+  })
+}
+
+function restoreConfigs(snapshots) {
+  for (const { file, link, target, mode } of snapshots) {
+    try {
+      if (link !== undefined && !lstatSync(file).isSymbolicLink()) {
+        const content = readFileSync(file)
+        writeFileSync(target, content)
+        rmSync(file, { force: true })
+        try {
+          symlinkSync(link, file)
+        } catch {
+          writeFileSync(file, content, { mode })
+        }
+      }
+      chmodSync(target ?? file, mode)
+    } catch {}
+    try {
+      if (lstatSync(`${file}.backup`).isFile()) chmodSync(`${file}.backup`, mode)
+    } catch {}
+  }
+}
+
+export async function refreshIntegrations(binary, { root = ROOT, env = process.env, install = {}, warn = (message) => process.stderr.write(message) } = {}) {
+  let kit
+  let setup
+  try {
+    kit = await loadKit(env, install)
+    if (!kit) return true
     setup = await import(pathToFileURL(path.join(root, 'npm', 'setup.js')).href)
   } catch (error) {
     if (error.code === 'ERR_MODULE_NOT_FOUND') return true
     warn(`gaze: could not load the agent integrations (${error.message}); run \`gaze setup\` by hand\n`)
     return false
   }
-  const stale = staleIntegrations(binary, agents.agentHomes(ctx, install.homes), root)
-  if (stale.length === 0) return true
+  const before = staleConfigs(binary, kit.homes, root)
+  if (before.length === 0) return true
+  const stale = [...new Set(before.map(({ agent }) => agent))]
+  const snapshots = snapshotConfigs(configFiles(kit.homes).filter(({ agent }) => stale.includes(agent)).map(({ file }) => file))
+  let ok = true
   try {
-    const { steps } = await setup.installAgents(stale, { binary: realpathOr(binary) }, { ...install, ctx })
+    const { steps } = await setup.installAgents(stale, { binary: realpathOr(binary) }, { ...install, ctx: kit.ctx })
     const failed = steps.filter((step) => step.state === 'failed')
-    if (failed.length === 0) return true
-    warn(`gaze: could not point ${failed.map((step) => `${step.agent} ${step.item}`).join(', ')} at ${binary} (${failed[0].detail}); run \`gaze setup\` by hand\n`)
+    if (failed.length > 0) {
+      warn(`gaze: could not point ${failed.map((step) => `${step.agent} ${step.item}`).join(', ')} at ${binary} (${failed[0].detail}); run \`gaze setup\` by hand\n`)
+      ok = false
+    }
   } catch (error) {
     warn(`gaze: could not point ${stale.join(', ')} at ${binary} (${error.message}); run \`gaze setup\` by hand\n`)
+    ok = false
+  } finally {
+    restoreConfigs(snapshots)
   }
-  return false
+  for (const { file, refs } of staleConfigs(binary, kit.homes, root)) {
+    warn(`gaze: ${file} still points to ${refs.join(', ')}; run \`gaze setup\`\n`)
+    ok = false
+  }
+  return ok
 }
 
 export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, warn = (message) => process.stderr.write(message) } = {}) {
@@ -772,13 +902,33 @@ export async function refreshRegistration(binary, { env = process.env, root = RO
       break
     }
   }
-  return (await refreshIntegrations(binary, { root, install, warn })) && refreshed
+  if (env.GAZE_BINARY_PATH) return refreshed
+  return (await refreshIntegrations(binary, { root, env, install, warn })) && refreshed
+}
+
+function writeLock(lock, text) {
+  try {
+    if (!lstatSync(lock).isFile()) return false
+    const fd = openSync(lock, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+    try {
+      ftruncateSync(fd, 0)
+      writeSync(fd, text)
+    } finally {
+      closeSync(fd)
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function repair(lock) {
   const problems = []
+  if (!writeLock(lock, `${process.pid}\n`)) {
+    process.exitCode = 1
+    return
+  }
   try {
-    writeFileSync(lock, `${process.pid}\n`)
     const binary = await ensureBinary({ warn: (message) => problems.push(message.trim()) })
     if (await refreshRegistration(binary, { warn: (message) => problems.push(message.trim()) })) {
       if (!needsRepair(binary)) {
@@ -790,23 +940,32 @@ async function repair(lock) {
   } catch (error) {
     problems.push(error.message)
   }
-  writeFileSync(lock, `${process.pid}\n${new Date().toISOString()} ${problems.join('\n')}\n`)
+  writeLock(lock, `${process.pid}\n${new Date().toISOString()} ${problems.join('\n')}\n`)
   process.exitCode = 1
+}
+
+export async function runInstall(mode, argument, options = {}) {
+  const write = options.write ?? ((text) => process.stderr.write(text))
+  try {
+    const binary = await ensureBinary(mode === '--proxy-child' ? { ...options, root: argument } : options)
+    if (mode === '--postinstall') await refreshRegistration(binary, { env: options.env, root: options.root, install: options.install, warn: write })
+  } catch (error) {
+    if (mode === '--postinstall' && error instanceof NetworkError) {
+      write(`gaze: could not download the binary during install (${error.message}); it will be downloaded the first time gaze runs\n`)
+    } else if (mode === '--postinstall' && error instanceof BusyError) {
+      write(`gaze: could not finish installing the binary (${error.message}); it will be completed the first time gaze runs\n`)
+    } else {
+      write(`gaze: ${error.message}\n`)
+      return mode === '--proxy-child' && error instanceof NetworkError ? NETWORK_EXIT : 1
+    }
+  }
+  return 0
 }
 
 async function main(mode, argument) {
   if (mode === '--repair') return repair(argument)
-  try {
-    const binary = await ensureBinary(mode === '--proxy-child' ? { root: argument } : {})
-    if (mode === '--postinstall') await refreshRegistration(binary)
-  } catch (error) {
-    if (mode === '--postinstall' && error instanceof NetworkError) {
-      process.stderr.write(`gaze: could not download the binary during install (${error.message}); it will be downloaded the first time gaze runs\n`)
-    } else {
-      process.stderr.write(`gaze: ${error.message}\n`)
-      process.exitCode = mode === '--proxy-child' && error instanceof NetworkError ? NETWORK_EXIT : 1
-    }
-  }
+  const code = await runInstall(mode, argument)
+  if (code !== 0) process.exitCode = code
 }
 
 if (invokedDirectly()) await main(...process.argv.slice(2))

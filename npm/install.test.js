@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import childProcess, { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, copyFileSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, copyFileSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { archiveName, daemonMarker, ensureBinary, hopAllowed, needsRepair, olderVersion, registryManifest, repairLock, resolveTarget, startRepair, tarCommand } from './install.js'
+import { archiveName, daemonMarker, ensureBinary, hopAllowed, needsRepair, olderVersion, registryManifest, repairLock, resolveTarget, startRepair } from './install.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
@@ -32,20 +33,14 @@ esac
 `
 const NO_PROXY_ENV = { HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '', NO_PROXY: '', no_proxy: '', NODE_USE_ENV_PROXY: '', KIT_REGISTRY_DIR: '', XDG_CONFIG_HOME: '', XDG_DATA_HOME: '', GAZE_DATA_DIR: '', GAZE_DB_PATH: '' }
 const quiet = () => {}
-const BSDTAR = (() => {
-  try {
-    return execFileSync('tar', ['--version'], { encoding: 'utf8' }).includes('bsdtar')
-  } catch {
-    return false
-  }
-})()
+const WINDOWS = 'x86_64-pc-windows-msvc'
+const EXE = Buffer.from('MZ fake gaze.exe for the npm installer tests\n')
 
 const scratch = mkdtempSync(path.join(tmpdir(), 'gaze-npm-test-'))
 let goodArchive
 let registeringArchive
 let symlinkArchive
 let archive
-let zipArchive
 let requests = []
 let server
 let base
@@ -102,22 +97,40 @@ function run(root, args, env, input) {
   return node(path.join(root, 'npm', 'gaze.js'), args, env, input)
 }
 
-function vendorEntries(root) {
-  const vendor = path.join(root, 'vendor')
+function vendorEntries(root, ...nested) {
+  const vendor = path.join(root, 'vendor', ...nested)
   return existsSync(vendor) ? readdirSync(vendor).sort() : []
+}
+
+async function watchingFs(calls, action, fail = {}) {
+  const originals = { renameSync: fs.renameSync, rmSync: fs.rmSync, execFileSync: childProcess.execFileSync }
+  fs.renameSync = (...args) => {
+    calls.push(['renameSync', ...args])
+    return originals.renameSync(...args)
+  }
+  fs.rmSync = (...args) => {
+    calls.push(['rmSync', ...args])
+    if (fail.rmSync?.(args[0])) throw Object.assign(new Error(`EBUSY: resource busy or locked, rm '${args[0]}'`), { code: 'EBUSY' })
+    return originals.rmSync(...args)
+  }
+  childProcess.execFileSync = (...args) => {
+    calls.push(['execFileSync', ...args])
+    return originals.execFileSync(...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    return await action()
+  } finally {
+    Object.assign(fs, { renameSync: originals.renameSync, rmSync: originals.rmSync })
+    childProcess.execFileSync = originals.execFileSync
+    syncBuiltinESMExports()
+  }
 }
 
 before(async () => {
   goodArchive = tarball('good', (file) => writeFileSync(file, SCRIPT, { mode: 0o644 }))
   registeringArchive = tarball('registering', (file) => writeFileSync(file, REGISTERING_SCRIPT, { mode: 0o644 }))
   symlinkArchive = tarball('symlink', (file) => symlinkSync('/bin/sh', file))
-  const zipSource = mkdtempSync(path.join(scratch, 'zip-'))
-  writeFileSync(path.join(zipSource, 'gaze.exe'), SCRIPT)
-  const zipFile = path.join(scratch, 'good.zip')
-  try {
-    execFileSync('zip', ['-q', '-j', zipFile, path.join(zipSource, 'gaze.exe')])
-    zipArchive = readFileSync(zipFile)
-  } catch {}
   server = createServer((request, response) => {
     requests.push(request.url)
     const pathname = new URL(request.url, base).pathname
@@ -126,10 +139,10 @@ before(async () => {
       response.writeHead(302, { Location: `http://downloads.example.com/${name}` }).end()
     } else if (pathname.startsWith('/loop/')) {
       response.writeHead(302, { Location: pathname }).end()
-    } else if (/^\/v\d+\.\d+\.\d+\//.test(pathname) && /\.(tar\.gz|zip)$/.test(name)) {
+    } else if (/^\/v\d+\.\d+\.\d+\//.test(pathname) && /\.(tar\.gz|exe)$/.test(name)) {
       response.writeHead(302, { Location: `/files/${name}` }).end()
-    } else if (pathname.startsWith('/files/') && name.endsWith('.zip')) {
-      response.writeHead(200, { 'Content-Type': 'application/zip' }).end(zipArchive)
+    } else if (pathname.startsWith('/files/') && name.endsWith('.exe')) {
+      response.writeHead(200, { 'Content-Type': 'application/octet-stream' }).end(EXE)
     } else if (pathname.startsWith('/files/') && name.endsWith('.tar.gz')) {
       response.writeHead(200, { 'Content-Type': 'application/gzip' }).end(archive)
     } else {
@@ -207,32 +220,6 @@ describe('ensureBinary', () => {
     assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
     assert.deepEqual(vendorEntries(root), ['.version', 'gaze'])
     assert.deepEqual(requests, [`/v${VERSION}/${asset('x86_64-unknown-linux-gnu')}`, `/files/${asset('x86_64-unknown-linux-gnu')}`])
-  })
-
-  test('extracts gaze.exe from the zip for win32-x64 without chmod', { skip: (zipArchive === undefined || !BSDTAR) && 'needs zip and a tar that reads zip (bsdtar)' }, async () => {
-    const root = packageRoot({ targets: ['x86_64-pc-windows-msvc'], hash: sha256(zipArchive) })
-    const binary = await install(root, { platform: 'win32', arch: 'x64' })
-    assert.equal(binary, path.join(root, 'vendor', 'gaze.exe'))
-    assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
-    assert.deepEqual(vendorEntries(root), ['.version', 'gaze.exe'])
-    assert.deepEqual(requests, [`/v${VERSION}/gaze-${VERSION}-x86_64-pc-windows-msvc.zip`, `/files/gaze-${VERSION}-x86_64-pc-windows-msvc.zip`])
-  })
-
-  test('replaces an existing gaze.exe by setting the old one aside first', { skip: (zipArchive === undefined || !BSDTAR) && 'needs zip and a tar that reads zip (bsdtar)' }, async () => {
-    const root = packageRoot({ targets: ['x86_64-pc-windows-msvc'], hash: sha256(zipArchive) })
-    mkdirSync(path.join(root, 'vendor'))
-    writeFileSync(path.join(root, 'vendor', 'gaze.exe'), 'old')
-    writeFileSync(path.join(root, 'vendor', 'gaze.exe.old-abcdef'), 'stale')
-    writeFileSync(path.join(root, 'vendor', '.version'), '9.9.8\n')
-    const binary = await install(root, { platform: 'win32', arch: 'x64' })
-    assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
-    assert.deepEqual(vendorEntries(root), ['.version', 'gaze.exe'])
-  })
-
-  test('uses the System32 tar on windows and the PATH tar elsewhere', () => {
-    assert.equal(tarCommand({ SystemRoot: 'D:\\Win' }, 'win32'), 'D:\\Win\\System32\\tar.exe')
-    assert.equal(tarCommand({}, 'win32'), 'C:\\Windows\\System32\\tar.exe')
-    assert.equal(tarCommand({ SystemRoot: 'D:\\Win' }, 'linux'), 'tar')
   })
 
   test('writes vendor/.version and reinstalls when it belongs to another version', async () => {
@@ -351,6 +338,117 @@ describe('ensureBinary', () => {
     assert.deepEqual(warnings, [`gaze: using GAZE_BINARY_PATH=${custom} instead of the bundled binary\n`])
     assert.equal(requests.length, 0)
     assert.equal(existsSync(path.join(root, 'vendor')), false)
+  })
+})
+
+describe('ensureBinary on win32', () => {
+  const exeAsset = `gaze-${VERSION}-${WINDOWS}.exe`
+
+  function windowsRoot(options = {}) {
+    return packageRoot({ targets: [WINDOWS], hash: sha256(EXE), ...options })
+  }
+
+  function installWindows(root, options = {}) {
+    return install(root, { platform: 'win32', arch: 'x64', ...options })
+  }
+
+  test('names the windows asset as a raw .exe', () => {
+    assert.equal(archiveName(VERSION, WINDOWS), exeAsset)
+    assert.equal(archiveName(VERSION, 'x86_64-unknown-linux-gnu'), `gaze-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`)
+  })
+
+  test('writes the verified .exe once into vendor/<version>/ without tar, renames or temp dirs', async () => {
+    const root = windowsRoot()
+    const calls = []
+    const binary = await watchingFs(calls, () => installWindows(root))
+    assert.equal(binary, path.join(root, 'vendor', VERSION, 'gaze.exe'))
+    assert.deepEqual(readFileSync(binary), EXE)
+    assert.deepEqual(vendorEntries(root), [VERSION])
+    assert.deepEqual(vendorEntries(root, VERSION), ['gaze.exe'])
+    assert.deepEqual(requests, [`/v${VERSION}/${exeAsset}`, `/files/${exeAsset}`])
+    assert.deepEqual(calls.filter(([name]) => name !== 'rmSync'), [])
+    assert.deepEqual(calls.filter(([, target]) => /\.(install|old)-/.test(String(target))), [])
+
+    requests = []
+    assert.equal(await installWindows(root), binary)
+    assert.equal(requests.length, 0)
+  })
+
+  test('removes older versions and the old layout, leaving no .old-* or .install-* entries', async () => {
+    const root = windowsRoot()
+    const vendor = path.join(root, 'vendor')
+    mkdirSync(path.join(vendor, '9.9.8'), { recursive: true })
+    writeFileSync(path.join(vendor, '9.9.8', 'gaze.exe'), 'old')
+    writeFileSync(path.join(vendor, 'gaze.exe'), 'legacy')
+    writeFileSync(path.join(vendor, 'gaze.exe.old-abcdef'), 'stale')
+    writeFileSync(path.join(vendor, '.version'), '9.9.8\n')
+    mkdirSync(path.join(vendor, '.install-old'))
+    const binary = await installWindows(root)
+    assert.deepEqual(readFileSync(binary), EXE)
+    assert.deepEqual(vendorEntries(root), [VERSION])
+    assert.deepEqual(vendorEntries(root, VERSION), ['gaze.exe'])
+  })
+
+  test('ignores EBUSY while removing an older version that is still running', async () => {
+    const root = windowsRoot()
+    const old = path.join(root, 'vendor', '9.9.8')
+    mkdirSync(old, { recursive: true })
+    writeFileSync(path.join(old, 'gaze.exe'), 'running')
+    const calls = []
+    const binary = await watchingFs(calls, () => installWindows(root), { rmSync: (target) => target === old })
+    assert.deepEqual(readFileSync(binary), EXE)
+    assert.deepEqual(vendorEntries(root), ['9.9.8', VERSION])
+    assert.ok(calls.some(([name, target]) => name === 'rmSync' && target === old))
+
+    await installWindows(root)
+    assert.deepEqual(vendorEntries(root), [VERSION])
+  })
+
+  test('rewrites a gaze.exe whose sha256 does not match', async () => {
+    const root = windowsRoot()
+    const binary = path.join(root, 'vendor', VERSION, 'gaze.exe')
+    mkdirSync(path.dirname(binary), { recursive: true })
+    writeFileSync(binary, EXE.subarray(0, 10))
+    const stale = new Date(Date.now() - 60 * 1000)
+    utimesSync(binary, stale, stale)
+    assert.equal(await installWindows(root, { offline: true }), null)
+    assert.equal(await installWindows(root), binary)
+    assert.deepEqual(readFileSync(binary), EXE)
+    assert.deepEqual(requests, [`/v${VERSION}/${exeAsset}`, `/files/${exeAsset}`])
+  })
+
+  test('waits for a concurrent install that is still writing gaze.exe', async () => {
+    const root = windowsRoot()
+    const binary = path.join(root, 'vendor', VERSION, 'gaze.exe')
+    mkdirSync(path.dirname(binary), { recursive: true })
+    writeFileSync(binary, EXE.subarray(0, 10))
+    const finish = new Promise((resolve) => setTimeout(() => resolve(writeFileSync(binary, EXE)), 300))
+    assert.equal(await installWindows(root), binary)
+    await finish
+    assert.deepEqual(readFileSync(binary), EXE)
+  })
+
+  test('offline mode uses a verified gaze.exe and never downloads', async () => {
+    const root = windowsRoot()
+    assert.equal(await installWindows(root, { offline: true }), null)
+    const binary = path.join(root, 'vendor', VERSION, 'gaze.exe')
+    mkdirSync(path.dirname(binary), { recursive: true })
+    writeFileSync(binary, EXE)
+    assert.equal(await installWindows(root, { offline: true }), binary)
+    assert.equal(requests.length, 0)
+  })
+
+  test('fails on a checksum mismatch and writes nothing', async () => {
+    const root = windowsRoot({ hash: '0'.repeat(64) })
+    await assert.rejects(installWindows(root), /Checksum mismatch for gaze-9\.9\.9-x86_64-pc-windows-msvc\.exe: expected 0{64}/)
+    assert.deepEqual(vendorEntries(root), [])
+  })
+
+  test('refuses a checksums.json that still lists the windows zip', async () => {
+    const root = windowsRoot()
+    writeFileSync(path.join(root, 'npm', 'checksums.json'), JSON.stringify({ version: VERSION, assets: { [WINDOWS]: { file: `gaze-${VERSION}-${WINDOWS}.zip`, sha256: sha256(EXE) } } }))
+    await assert.rejects(installWindows(root), /lists gaze-9\.9\.9-x86_64-pc-windows-msvc\.zip for x86_64-pc-windows-msvc, expected gaze-9\.9\.9-x86_64-pc-windows-msvc\.exe/)
+    assert.equal(requests.length, 0)
   })
 })
 
@@ -793,6 +891,50 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     assert.equal(startRepair({ root, env: { ...process.env, ...NO_PROXY_ENV, ...env } }), false)
     assert.equal(readFileSync(lock, 'utf8'), `${process.pid}\n`)
     rmSync(lock)
+  })
+
+  test('a stale lock is removed and recreated without renaming it', async () => {
+    const env = machine()
+    await installVersion('9.9.7', env)
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const lock = repairLock(env)
+    mkdirSync(path.dirname(lock), { recursive: true })
+    writeFileSync(lock, '999999999\n')
+    const stale = new Date(Date.now() - 20 * 60 * 1000)
+    utimesSync(lock, stale, stale)
+    const calls = []
+    const full = { ...process.env, ...NO_PROXY_ENV, ...env, GAZE_DOWNLOAD_BASE: base }
+    assert.equal(await watchingFs(calls, () => startRepair({ root, env: full })), true)
+    assert.deepEqual(calls.filter(([name]) => name === 'renameSync'), [])
+    assert.ok(calls.some(([name, target]) => name === 'rmSync' && target === lock))
+    assert.deepEqual(readdirSync(path.dirname(lock)).filter((entry) => entry.startsWith('repair.lock.')), [])
+    await settled(env)
+    assert.equal(registered(env).version, '9.9.8')
+  })
+
+  test('needsRepair treats vendor/<version>/gaze.exe as npm managed', () => {
+    const env = { ...machine(), GAZE_DATA_DIR: mkdtempSync(path.join(scratch, 'data-')) }
+    const root = packageRoot({ version: '9.9.8' }, '9.9.8')
+    const old = path.join(root, 'vendor', '9.9.7', 'gaze.exe')
+    const current = path.join(root, 'vendor', '9.9.8', 'gaze.exe')
+    for (const file of [old, current]) {
+      mkdirSync(path.dirname(file), { recursive: true })
+      writeFileSync(file, EXE)
+    }
+    rmSync(path.join(env.HOME, 'Library'), { recursive: true, force: true })
+    mkdirSync(env.KIT_REGISTRY_DIR, { recursive: true })
+    writeFileSync(registryManifest(env), JSON.stringify({ version: '9.9.7', bin: [old] }))
+    assert.equal(needsRepair(current, { root, env }), true)
+    writeFileSync(registryManifest(env), JSON.stringify({ version: '9.9.8', bin: [current] }))
+    writeFileSync(daemonMarker(env), JSON.stringify({ manager: 'schtasks', bin: old }))
+    assert.equal(needsRepair(current, { root, env }), true)
+    writeFileSync(daemonMarker(env), JSON.stringify({ manager: 'schtasks', bin: current }))
+    assert.equal(needsRepair(current, { root, env }), false)
+    const foreign = path.join(env.HOME, 'tools', '9.9.7', 'gaze.exe')
+    mkdirSync(path.dirname(foreign), { recursive: true })
+    writeFileSync(foreign, EXE)
+    writeFileSync(registryManifest(env), JSON.stringify({ version: '0.0.1', bin: [foreign] }))
+    assert.equal(needsRepair(current, { root, env }), false)
   })
 
   test('a lock older than an hour is taken over even if its pid is alive again', async () => {

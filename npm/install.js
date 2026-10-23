@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { createHash, randomBytes } from 'node:crypto'
-import { accessSync, chmodSync, constants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -29,6 +29,7 @@ const ORPHAN_AGE_MS = 10 * 60 * 1000
 const REFRESH_TIMEOUT_MS = 180_000
 const REPAIR_RETRY_MS = 10 * 60 * 1000
 const ABANDONED_LOCK_MS = 60 * 60 * 1000
+const SETTLE_MS = 2000
 
 export class InstallError extends Error {
   constructor(message) {
@@ -58,10 +59,11 @@ export function binaryName(platform = process.platform) {
 }
 
 export function archiveName(version, target) {
-  return `gaze-${version}-${target}.${target.endsWith('-windows-msvc') ? 'zip' : 'tar.gz'}`
+  return `gaze-${version}-${target}.${target.endsWith('-windows-msvc') ? 'exe' : 'tar.gz'}`
 }
 
-export function vendorBinary(root = ROOT, platform = process.platform) {
+export function vendorBinary(root = ROOT, platform = process.platform, version = packageVersion(root)) {
+  if (platform === 'win32') return path.join(root, 'vendor', version, binaryName(platform))
   return path.join(root, 'vendor', binaryName(platform))
 }
 
@@ -91,17 +93,62 @@ function removeOrphans(vendor, now = Date.now()) {
   }
   for (const entry of entries) {
     const file = path.join(vendor, entry)
-    if (/\.old-[0-9a-f]+$/.test(entry)) {
-      try {
-        rmSync(file, { force: true })
-      } catch {}
-      continue
-    }
     if (!entry.startsWith('.install-')) continue
     try {
       if (now - statSync(file).mtimeMs > ORPHAN_AGE_MS) rmSync(file, { recursive: true, force: true })
     } catch {}
   }
+}
+
+function removeOtherVersions(vendor, version) {
+  let entries
+  try {
+    entries = readdirSync(vendor)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (entry === version) continue
+    try {
+      rmSync(path.join(vendor, entry), { recursive: true, force: true })
+    } catch {}
+  }
+}
+
+function matches(file, sha256) {
+  try {
+    return createHash('sha256').update(readFileSync(file)).digest('hex') === sha256
+  } catch {
+    return false
+  }
+}
+
+async function settled(file, sha256) {
+  for (;;) {
+    if (matches(file, sha256)) return true
+    let stats
+    try {
+      stats = statSync(file)
+    } catch {
+      return false
+    }
+    if (Date.now() - stats.mtimeMs > SETTLE_MS) return false
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
+async function writeOnce(binary, data, sha256) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(binary, data, { flag: 'wx' })
+      return
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
+    if (await settled(binary, sha256)) return
+    rmSync(binary, { force: true })
+  }
+  throw new InstallError(`Cannot write ${binary}: another install keeps replacing it`)
 }
 
 function packageVersion(root) {
@@ -245,9 +292,10 @@ export async function ensureBinary(options = {}) {
   }
   const root = options.root ?? ROOT
   const platform = options.platform ?? process.platform
-  const binary = vendorBinary(root, platform)
-  const name = binaryName(platform)
   const version = packageVersion(root)
+  const binary = vendorBinary(root, platform, version)
+  if (platform === 'win32') return ensureVersionedBinary(binary, version, root, env, warn, options)
+  const name = binaryName(platform)
   if (executable(binary) && vendorVersion(root) === version) return binary
   if (options.offline) return executable(binary) ? binary : null
 
@@ -275,9 +323,7 @@ export async function ensureBinary(options = {}) {
     const unpacked = path.join(work, 'unpacked')
     mkdirSync(unpacked)
     try {
-      const flags = asset.endsWith('.zip') ? ['-xf'] : ['-xzf']
-      const guards = asset.endsWith('.zip') ? [] : ['--no-same-owner', '--no-same-permissions']
-      execFileSync(tarCommand(env), [...flags, file, ...guards, '-C', unpacked, name], { cwd: work, stdio: ['ignore', 'ignore', 'pipe'] })
+      execFileSync('tar', ['-xzf', file, '--no-same-owner', '--no-same-permissions', '-C', unpacked, name], { cwd: work, stdio: ['ignore', 'ignore', 'pipe'] })
     } catch (error) {
       throw new InstallError(`Cannot extract ${asset}: ${String(error.stderr ?? error.message).trim()}`)
     }
@@ -289,10 +335,9 @@ export async function ensureBinary(options = {}) {
       throw new InstallError(`${asset} does not contain ${name} at its root`)
     }
     if (!stats.isFile()) throw new InstallError(`${asset} has a ${name} entry that is not a regular file`)
-    if (platform !== 'win32') chmodSync(extracted, 0o755)
+    chmodSync(extracted, 0o755)
     const stamp = path.join(work, '.version')
     writeFileSync(stamp, `${version}\n`)
-    if (platform === 'win32') setAside(binary)
     renameSync(extracted, binary)
     renameSync(stamp, path.join(vendor, '.version'))
   } catch (error) {
@@ -303,18 +348,30 @@ export async function ensureBinary(options = {}) {
   return binary
 }
 
-export function tarCommand(env = process.env, platform = process.platform) {
-  if (platform !== 'win32') return 'tar'
-  return path.win32.join(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows', 'System32', 'tar.exe')
-}
+async function ensureVersionedBinary(binary, version, root, env, warn, options) {
+  const vendor = path.dirname(path.dirname(binary))
+  const target = resolveTarget(options.platform, options.arch)
+  const { asset, sha256 } = readChecksum(root, version, target)
+  if (matches(binary, sha256)) {
+    removeOtherVersions(vendor, version)
+    return binary
+  }
+  if (options.offline) return null
+  if (proxied(env)) return downloadThroughProxy(root, env)
+  const { base, custom } = downloadBase(env, warn)
 
-function setAside(binary) {
-  if (!existsSync(binary)) return
-  const old = `${binary}.old-${randomBytes(6).toString('hex')}`
-  renameSync(binary, old)
+  const data = await download(`${base}/v${version}/${asset}`, custom)
+  const actual = createHash('sha256').update(data).digest('hex')
+  if (actual !== sha256) throw new InstallError(`Checksum mismatch for ${asset}: expected ${sha256}, got ${actual}`)
+
   try {
-    rmSync(old, { force: true })
-  } catch {}
+    mkdirSync(path.dirname(binary), { recursive: true })
+    removeOtherVersions(vendor, version)
+    await writeOnce(binary, data, sha256)
+  } catch (error) {
+    throw unwritable(error, vendor)
+  }
+  return binary
 }
 
 function invokedDirectly() {
@@ -347,9 +404,17 @@ function readJson(file) {
   }
 }
 
+function vendorRoot(bin) {
+  const dir = path.dirname(bin)
+  if (path.basename(dir) === 'vendor') return path.dirname(dir)
+  const vendor = path.dirname(dir)
+  if (path.basename(vendor) === 'vendor' && versionParts(path.basename(dir))) return path.dirname(vendor)
+  return null
+}
+
 function npmManaged(bin) {
-  const vendor = path.dirname(bin)
-  return path.basename(vendor) === 'vendor' && readJson(path.join(path.dirname(vendor), 'package.json'))?.name === '@kikedealba/gaze'
+  const root = vendorRoot(bin)
+  return root !== null && readJson(path.join(root, 'package.json'))?.name === '@kikedealba/gaze'
 }
 
 function versionParts(version) {
@@ -451,34 +516,19 @@ function lockOwner(file) {
 }
 
 function reclaim(file, now) {
-  let before
+  let stats
   try {
-    before = statSync(file)
+    stats = statSync(file)
   } catch {
     return true
   }
-  const age = now - before.mtimeMs
+  const age = now - stats.mtimeMs
   if (age < REPAIR_RETRY_MS || (age < ABANDONED_LOCK_MS && alive(lockOwner(file)))) return false
-  const moved = `${file}.${process.pid}.${randomBytes(6).toString('hex')}`
   try {
-    renameSync(file, moved)
+    rmSync(file, { force: true })
   } catch {
     return false
   }
-  let after
-  try {
-    after = statSync(moved)
-  } catch {
-    return false
-  }
-  if (after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) {
-    try {
-      linkSync(moved, file)
-    } catch {}
-    rmSync(moved, { force: true })
-    return false
-  }
-  rmSync(moved, { force: true })
   return true
 }
 

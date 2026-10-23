@@ -93,7 +93,9 @@ function removeOrphans(vendor, now = Date.now()) {
   for (const entry of entries) {
     const file = path.join(vendor, entry)
     if (/\.old-[0-9a-f]+$/.test(entry)) {
-      rmSync(file, { force: true })
+      try {
+        rmSync(file, { force: true })
+      } catch {}
       continue
     }
     if (!entry.startsWith('.install-')) continue
@@ -402,11 +404,19 @@ export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
   if (!present || olderVersion(registered.version, packageVersion(root))) return true
   if (!binary || realpathOr(bin) !== realpathOr(binary)) return false
   const marker = readJson(daemonMarker(env))
-  if (typeof marker?.bin === 'string') return !existsSync(marker.bin) || realpathOr(marker.bin) !== realpathOr(bin)
-  const plist = launchAgent(env)
+  if (typeof marker?.bin === 'string' && (!existsSync(marker.bin) || realpathOr(marker.bin) !== realpathOr(bin))) return true
+  return plistMismatch(launchAgent(env), bin)
+}
+
+function xmlEscape(value) {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;')
+}
+
+function plistMismatch(plist, bin) {
   if (!plist || !existsSync(plist)) return false
   try {
-    return !readFileSync(plist, 'utf8').includes(`<string>${bin}</string>`)
+    const text = readFileSync(plist, 'utf8')
+    return !text.includes(`<string>${xmlEscape(bin)}</string>`) && !text.includes(`<string>${bin}</string>`)
   } catch {
     return true
   }

@@ -599,6 +599,16 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     assert.equal(needsRepair(binary, { root, env }), false)
   })
 
+  test('needsRepair checks the plist even when the daemon marker matches', async () => {
+    const env = { ...machine(), GAZE_DATA_DIR: mkdtempSync(path.join(scratch, 'data-')) }
+    const root = await installVersion(VERSION, env)
+    const binary = path.join(root, 'vendor', 'gaze')
+    writeFileSync(daemonMarker(env), JSON.stringify({ manager: 'launchd', bin: realpathSync(binary) }))
+    assert.equal(needsRepair(binary, { root, env }), false)
+    writeFileSync(path.join(env.HOME, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'), '<plist><string>/old/vendor/gaze</string></plist>')
+    assert.equal(needsRepair(binary, { root, env }), true)
+  })
+
   test('needsRepair notices a plist that points elsewhere', async () => {
     const env = machine()
     const root = await installVersion(VERSION, env)

@@ -15,6 +15,7 @@ fn gaze(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
         .env("GAZE_PROJECT", "den")
         .env("GAZE_BITA_BIN", "/nonexistent/bita")
         .env_remove("GAZE_HARVEST")
+        .env_remove("KIT_HEADLESS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -73,8 +74,14 @@ fn cli_contracts() {
     let context = start["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     assert!(context.contains("Nunca uses npm"));
     assert_eq!(start["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let gemini: Value =
+        serde_json::from_str(gaze(d, &["hook", "session-start", "--harness", "gemini"], Some("{\"session_id\":\"g\",\"cwd\":\"/\"}")).trim()).unwrap();
+    assert!(gemini["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Nunca uses npm"));
 
     let setup = envelope(&gaze(d, &["setup", "--json"], None));
+    let next = setup["data"]["next"].to_string();
+    assert!(!next.contains("claude plugin"), "{next}");
+    assert!(next.contains("gaze daemon install"));
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(setup["data"]["manifest"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(manifest["subscribes"][0]["tool"], "bita");
     assert_eq!(manifest["subscribes"][1]["tool"], "inkwell");
@@ -82,7 +89,7 @@ fn cli_contracts() {
     assert_eq!(manifest["subscribes"][1]["command"][1], "inkwell-hook");
     assert_eq!(manifest["manifestVersion"], 1);
     assert_eq!(manifest["install"], "npm install -g @kikedealba/gaze && gaze setup");
-    let native = std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap();
+    let native = gaze::paths::simplify(std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap());
     assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
     assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
 }
@@ -118,6 +125,22 @@ fn hooks_are_silent_during_harvest() {
         .output()
         .unwrap();
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn hooks_are_silent_inside_a_kit_headless_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+        .args(["hook", "prompt", "--harness", "codex"])
+        .env("GAZE_DATA_DIR", dir.path())
+        .env("GAZE_EMBEDDER", "fake")
+        .env_remove("GAZE_HARVEST")
+        .env("KIT_HEADLESS", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty());
+    assert!(!dir.path().join("gaze.db").exists());
 }
 
 #[test]
@@ -178,4 +201,33 @@ fn inkwell_hook_exits_non_zero_when_a_change_fails() {
     assert_eq!(summary["failed"], 1);
     assert_eq!(summary["changes"][1]["result"], "created");
     assert!(run(&["dp/ok.md"]).status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_detach_logs_to_the_file_and_stops_on_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let log = dir.path().join("logs/serve.log");
+    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+        .args(["serve", "--detach", "--log"])
+        .arg(&log)
+        .env("GAZE_DATA_DIR", dir.path())
+        .env("GAZE_SOCKET", &socket)
+        .env("GAZE_EMBEDDER", "fake")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let started = std::time::Instant::now();
+    while gaze::daemon::ping(&socket).is_none() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "daemon never answered");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(gaze::daemon::shutdown(&socket));
+    let started = std::time::Instant::now();
+    while gaze::daemon::ping(&socket).is_some() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "daemon kept running");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(std::fs::read_to_string(&log).unwrap().contains("gaze serve listening on"));
 }

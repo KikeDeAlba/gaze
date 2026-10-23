@@ -41,10 +41,11 @@ pub fn manifest(bin: &str) -> Value {
     })
 }
 
-pub const CLAUDE_STEPS: [&str; 2] = ["claude plugin marketplace add KikeDeAlba/gaze", "claude plugin install gaze@gaze"];
+pub const INTEGRATIONS_NOTE: &str =
+    "Las integraciones con cada agente (plugin, skill, MCP y hooks) las instala el paquete npm con kit; este binario solo registra gaze y prepara sus datos.";
 
 pub fn setup() -> Result<Value> {
-    let bin = std::env::current_exe()?.canonicalize()?.to_string_lossy().to_string();
+    let bin = crate::paths::simplify(std::env::current_exe()?.canonicalize()?).to_string_lossy().to_string();
     let registry = paths::registry_dir();
     std::fs::create_dir_all(&registry)?;
     let target = registry.join("gaze.json");
@@ -68,7 +69,8 @@ pub fn setup() -> Result<Value> {
         "config": config,
         "configCreated": wrote_config,
         "database": paths::db_path(),
-        "next": ["gaze daemon install", CLAUDE_STEPS[0], CLAUDE_STEPS[1], "gaze import claude-memory --dry-run", "gaze ingest"],
+        "integrations": INTEGRATIONS_NOTE,
+        "next": ["gaze daemon install", "gaze import claude-memory --dry-run && gaze import claude-memory", "gaze ingest"],
     }))
 }
 
@@ -81,7 +83,7 @@ pub fn uninstall() -> Result<Value> {
     Ok(json!({
         "manifest": target,
         "removed": existed,
-        "next": ["gaze daemon uninstall", "claude plugin uninstall gaze@gaze"],
+        "next": ["gaze daemon uninstall"],
         "kept": paths::db_path(),
     }))
 }

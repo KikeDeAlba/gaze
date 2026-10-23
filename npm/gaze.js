@@ -22,6 +22,10 @@ if (!binary) {
   process.stderr.write('gaze: the gaze binary is not installed yet; run `gaze setup` once to download it\n')
   process.exit(QUICK_EXIT[args[0]])
 }
+if (args[0] === 'setup' || args[0] === 'uninstall') {
+  const { runSetup } = await import('./setup.js')
+  process.exit(await runSetup(args, binary))
+}
 
 const child = spawn(binary, args, { stdio: 'inherit' })
 const relays = FORWARDED.map((signal) => {

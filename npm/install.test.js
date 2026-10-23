@@ -76,7 +76,7 @@ function writeChecksums(root, { version = VERSION, targets = TARGETS, hash = sha
 function packageRoot(checksums = {}, version = VERSION) {
   const root = mkdtempSync(path.join(scratch, 'pkg-'))
   mkdirSync(path.join(root, 'npm'))
-  for (const file of ['install.js', 'gaze.js']) copyFileSync(path.join(HERE, file), path.join(root, 'npm', file))
+  for (const file of ['install.js', 'gaze.js', 'setup.js']) copyFileSync(path.join(HERE, file), path.join(root, 'npm', file))
   writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: '@kikedealba/gaze', version, type: 'module' }))
   if (checksums) writeChecksums(root, checksums)
   return root
@@ -564,7 +564,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
 
   async function installVersion(version, env) {
     const root = packageRoot({ version }, version)
-    const setup = await run(root, ['setup'], env)
+    const setup = await run(root, ['setup', '--agents', 'none'], env)
     assert.equal(setup.code, 0, setup.stderr)
     const daemon = await run(root, ['daemon', 'install'], env)
     assert.equal(daemon.code, 0, daemon.stderr)
@@ -661,7 +661,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     const env = machine()
     await installVersion('9.9.7', env)
     const root = packageRoot({ version: '9.9.8' }, '9.9.8')
-    const result = await run(root, ['setup'], env)
+    const result = await run(root, ['setup', '--agents', 'none'], env)
     assert.equal(result.code, 0, result.stderr)
     assert.doesNotMatch(result.stderr, /refreshing/)
     assert.equal(existsSync(repairLock(env)), false)

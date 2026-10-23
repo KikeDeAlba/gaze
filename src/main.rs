@@ -97,9 +97,9 @@ enum Command {
     Stats,
     #[command(about = "Capacidades para kit")]
     Capabilities,
-    #[command(about = "Registra gaze en kit y crea la configuración")]
+    #[command(about = "Registra gaze en kit y crea la configuración; desde npm también integra los agentes (--agents, --remove)")]
     Setup,
-    #[command(about = "Quita el registro de kit (conserva los datos)")]
+    #[command(about = "Quita el registro de kit (conserva los datos); desde npm también quita las integraciones")]
     Uninstall,
     #[command(about = "Servidor MCP por stdio")]
     Mcp,

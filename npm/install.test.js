@@ -8,15 +8,21 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { archiveName, ensureBinary, hopAllowed, needsRepair, olderVersion, registryManifest, repairLock, resolveTarget, startRepair } from './install.js'
+import { archiveName, daemonMarker, ensureBinary, hopAllowed, needsRepair, olderVersion, registryManifest, repairLock, resolveTarget, startRepair, tarCommand } from './install.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
 const TARGETS = ['aarch64-apple-darwin', 'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc']
 const SUPPORTED = { 'darwin-arm64': 'aarch64-apple-darwin', 'linux-x64': 'x86_64-unknown-linux-gnu' }[`${process.platform}-${process.arch}`]
-const SCRIPT = '#!/bin/sh\nif [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi\nif [ "$1" = "die" ]; then kill -TERM $$; fi\nif [ "$1" = "cat" ]; then exec cat; fi\necho "fake gaze $*"\nexit "${GAZE_FAKE_EXIT:-0}"\n'
+const SCRIPT = '#!/bin/sh\nif [ "$1 $2" = "daemon status" ]; then if [ -n "$GAZE_FAKE_INSTALLED" ]; then echo \'{"ok":true,"data":{"installed":true}}\'; fi; exit 0; fi\nif [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi\nif [ "$1" = "die" ]; then kill -TERM $$; fi\nif [ "$1" = "cat" ]; then exec cat; fi\necho "fake gaze $*"\nexit "${GAZE_FAKE_EXIT:-0}"\n'
 const REGISTERING_SCRIPT = `#!/bin/sh
 self="$(cd "$(dirname "$0")" && pwd -P)/gaze"
+if [ "$1 $2" = "daemon status" ]; then
+  installed=false
+  if [ -f "$HOME/Library/LaunchAgents/com.kikedealba.gaze.plist" ] || [ -n "$GAZE_FAKE_INSTALLED" ]; then installed=true; fi
+  printf '{"ok":true,"data":{"installed":%s}}\\n' "$installed"
+  exit 0
+fi
 if [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi
 case "$1" in
   setup) mkdir -p "$KIT_REGISTRY_DIR" && printf '{"version":"%s","bin":["%s"]}\\n' "\${GAZE_FAKE_VERSION:-$(cat "$(dirname "$self")/.version")}" "$self" > "$KIT_REGISTRY_DIR/gaze.json" ;;
@@ -210,6 +216,23 @@ describe('ensureBinary', () => {
     assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
     assert.deepEqual(vendorEntries(root), ['.version', 'gaze.exe'])
     assert.deepEqual(requests, [`/v${VERSION}/gaze-${VERSION}-x86_64-pc-windows-msvc.zip`, `/files/gaze-${VERSION}-x86_64-pc-windows-msvc.zip`])
+  })
+
+  test('replaces an existing gaze.exe by setting the old one aside first', { skip: (zipArchive === undefined || !BSDTAR) && 'needs zip and a tar that reads zip (bsdtar)' }, async () => {
+    const root = packageRoot({ targets: ['x86_64-pc-windows-msvc'], hash: sha256(zipArchive) })
+    mkdirSync(path.join(root, 'vendor'))
+    writeFileSync(path.join(root, 'vendor', 'gaze.exe'), 'old')
+    writeFileSync(path.join(root, 'vendor', 'gaze.exe.old-abcdef'), 'stale')
+    writeFileSync(path.join(root, 'vendor', '.version'), '9.9.8\n')
+    const binary = await install(root, { platform: 'win32', arch: 'x64' })
+    assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
+    assert.deepEqual(vendorEntries(root), ['.version', 'gaze.exe'])
+  })
+
+  test('uses the System32 tar on windows and the PATH tar elsewhere', () => {
+    assert.equal(tarCommand({ SystemRoot: 'D:\\Win' }, 'win32'), 'D:\\Win\\System32\\tar.exe')
+    assert.equal(tarCommand({}, 'win32'), 'C:\\Windows\\System32\\tar.exe')
+    assert.equal(tarCommand({ SystemRoot: 'D:\\Win' }, 'linux'), 'tar')
   })
 
   test('writes vendor/.version and reinstalls when it belongs to another version', async () => {
@@ -491,6 +514,14 @@ describe('install.js', () => {
     assert.ok(existsSync(path.join(root, 'vendor', 'gaze')))
   })
 
+  test('--postinstall refreshes a systemd or schtasks daemon reported by gaze daemon status', { skip: !SUPPORTED }, async () => {
+    const root = packageRoot()
+    const log = path.join(scratch, `calls-${path.basename(root)}`)
+    const result = await installScript(root, ['--postinstall'], { GAZE_FAKE_LOG: log, GAZE_FAKE_INSTALLED: '1' })
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(readFileSync(log, 'utf8'), 'setup\ndaemon install\n')
+  })
+
   test('--postinstall leaves the daemon alone without a launch agent', { skip: !SUPPORTED }, async () => {
     const root = packageRoot()
     const log = path.join(scratch, `calls-${path.basename(root)}`)
@@ -555,6 +586,17 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     rmSync(path.join(current, 'vendor'), { recursive: true, force: true })
     assert.equal(needsRepair(null, { root: current, env }), true)
     assert.equal(needsRepair(path.join(current, 'vendor', 'gaze'), { root: current, env: { ...env, GAZE_BINARY_PATH: '/bin/sh' } }), false)
+  })
+
+  test('needsRepair follows the daemon marker when the unit points to a missing binary', async () => {
+    const env = { ...machine(), GAZE_DATA_DIR: mkdtempSync(path.join(scratch, 'data-')) }
+    const root = await installVersion(VERSION, env)
+    const binary = path.join(root, 'vendor', 'gaze')
+    rmSync(path.join(env.HOME, 'Library', 'LaunchAgents', 'com.kikedealba.gaze.plist'))
+    writeFileSync(daemonMarker(env), JSON.stringify({ manager: 'systemd', bin: '/gone/vendor/gaze' }))
+    assert.equal(needsRepair(binary, { root, env }), true)
+    writeFileSync(daemonMarker(env), JSON.stringify({ manager: 'systemd', bin: realpathSync(binary) }))
+    assert.equal(needsRepair(binary, { root, env }), false)
   })
 
   test('needsRepair notices a plist that points elsewhere', async () => {

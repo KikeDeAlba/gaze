@@ -91,8 +91,12 @@ function removeOrphans(vendor, now = Date.now()) {
     return
   }
   for (const entry of entries) {
-    if (!entry.startsWith('.install-')) continue
     const file = path.join(vendor, entry)
+    if (/\.old-[0-9a-f]+$/.test(entry)) {
+      rmSync(file, { force: true })
+      continue
+    }
+    if (!entry.startsWith('.install-')) continue
     try {
       if (now - statSync(file).mtimeMs > ORPHAN_AGE_MS) rmSync(file, { recursive: true, force: true })
     } catch {}
@@ -272,7 +276,7 @@ export async function ensureBinary(options = {}) {
     try {
       const flags = asset.endsWith('.zip') ? ['-xf'] : ['-xzf']
       const guards = asset.endsWith('.zip') ? [] : ['--no-same-owner', '--no-same-permissions']
-      execFileSync('tar', [...flags, file, ...guards, '-C', unpacked, name], { stdio: ['ignore', 'ignore', 'pipe'] })
+      execFileSync(tarCommand(env), [...flags, file, ...guards, '-C', unpacked, name], { cwd: work, stdio: ['ignore', 'ignore', 'pipe'] })
     } catch (error) {
       throw new InstallError(`Cannot extract ${asset}: ${String(error.stderr ?? error.message).trim()}`)
     }
@@ -287,6 +291,7 @@ export async function ensureBinary(options = {}) {
     if (platform !== 'win32') chmodSync(extracted, 0o755)
     const stamp = path.join(work, '.version')
     writeFileSync(stamp, `${version}\n`)
+    if (platform === 'win32') setAside(binary)
     renameSync(extracted, binary)
     renameSync(stamp, path.join(vendor, '.version'))
   } catch (error) {
@@ -295,6 +300,20 @@ export async function ensureBinary(options = {}) {
     rmSync(work, { recursive: true, force: true })
   }
   return binary
+}
+
+export function tarCommand(env = process.env, platform = process.platform) {
+  if (platform !== 'win32') return 'tar'
+  return path.win32.join(env.SystemRoot || env.SYSTEMROOT || 'C:\\Windows', 'System32', 'tar.exe')
+}
+
+function setAside(binary) {
+  if (!existsSync(binary)) return
+  const old = `${binary}.old-${randomBytes(6).toString('hex')}`
+  renameSync(binary, old)
+  try {
+    rmSync(old, { force: true })
+  } catch {}
 }
 
 function invokedDirectly() {
@@ -353,6 +372,26 @@ function realpathOr(file) {
   }
 }
 
+export function daemonMarker(env = process.env) {
+  return path.join(dataDir(env), 'daemon.json')
+}
+
+export function daemonStatus(binary, env = process.env) {
+  const result = spawnSync(binary, ['daemon', 'status', '--json'], { env, cwd: path.dirname(binary), stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, encoding: 'utf8' })
+  try {
+    const envelope = JSON.parse(String(result.stdout ?? '').trim())
+    if (envelope?.ok === true && typeof envelope.data?.installed === 'boolean') return envelope.data
+  } catch {}
+  return null
+}
+
+function daemonInstalled(binary, env) {
+  const status = daemonStatus(binary, env)
+  if (status) return status.installed
+  const agent = launchAgent(env)
+  return (Boolean(agent) && existsSync(agent)) || existsSync(daemonMarker(env))
+}
+
 export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
   if (env.GAZE_BINARY_PATH) return false
   const registered = readJson(registryManifest(env))
@@ -362,6 +401,8 @@ export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
   if (present && !npmManaged(bin)) return false
   if (!present || olderVersion(registered.version, packageVersion(root))) return true
   if (!binary || realpathOr(bin) !== realpathOr(binary)) return false
+  const marker = readJson(daemonMarker(env))
+  if (typeof marker?.bin === 'string') return !existsSync(marker.bin) || realpathOr(marker.bin) !== realpathOr(bin)
   const plist = launchAgent(env)
   if (!plist || !existsSync(plist)) return false
   try {
@@ -454,25 +495,24 @@ export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
   const lock = repairLock(env)
   if (!acquireLock(lock)) return false
   try {
-    const child = spawn(process.execPath, [path.join(root, 'npm', 'install.js'), '--repair', lock], { env, detached: true, stdio: 'ignore' })
+    const child = spawn(process.execPath, [path.join(root, 'npm', 'install.js'), '--repair', lock], { env, cwd: root, detached: true, stdio: 'ignore', windowsHide: true })
     child.on('error', () => rmSync(lock, { force: true }))
     child.unref()
   } catch {
     rmSync(lock, { force: true })
     return false
   }
-  warn?.(`gaze: the kit registration or the launchd daemon points to an older or missing gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
+  warn?.(`gaze: the kit registration or the daemon points to an older or missing gaze install; refreshing them in the background (gaze setup, gaze daemon install)\n`)
   return true
 }
 
 export function refreshRegistration(binary, { env = process.env, warn = (message) => process.stderr.write(message) } = {}) {
-  const agent = launchAgent(env)
-  const daemon = Boolean(agent) && existsSync(agent)
+  const daemon = daemonInstalled(binary, env)
   const steps = []
   if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
   if (daemon) steps.push(['daemon', 'install'])
   for (const args of steps) {
-    const result = spawnSync(binary, args, { env, stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8' })
+    const result = spawnSync(binary, args, { env, cwd: path.dirname(binary), stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
     if (result.status !== 0) {
       const detail = (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
       warn(`gaze: could not refresh the daemon with \`gaze ${args.join(' ')}\` (${detail}); run \`gaze setup && gaze daemon install\` by hand\n`)
@@ -492,7 +532,7 @@ async function repair(lock) {
         rmSync(lock, { force: true })
         return
       }
-      problems.push(`gaze setup and gaze daemon install finished, but ${[registryManifest(), launchAgent()].filter(Boolean).join(' or ')} still does not point to ${binary}`)
+      problems.push(`gaze setup and gaze daemon install finished, but ${[registryManifest(), daemonMarker(), launchAgent()].filter(Boolean).join(' or ')} still does not point to ${binary}`)
     }
   } catch (error) {
     problems.push(error.message)

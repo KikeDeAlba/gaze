@@ -77,7 +77,7 @@ jobs:
           release_dir="target/${{ matrix.target }}/release"
           if [ "$RUNNER_OS" = "Windows" ]; then
             archive="gaze-${version}-${{ matrix.target }}.zip"
-            tar -a -cf "$archive" -C "$release_dir" gaze.exe
+            pwsh -NoProfile -NonInteractive -Command "\$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath (Join-Path '$release_dir' 'gaze.exe') -DestinationPath '$archive' -CompressionLevel Optimal -Force"
           else
             archive="gaze-${version}-${{ matrix.target }}.tar.gz"
             tar -czf "$archive" -C "$release_dir" gaze

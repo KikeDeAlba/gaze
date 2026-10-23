@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { platformContext } from '@kikedealba/kit/platform'
-import { ANTIGRAVITY_RULES, SKILL_DIR, installAgents, integration, parseArgs, runSetup, selection, shellCommand, uninstallAgents, UsageError } from './setup.js'
+import { ANTIGRAVITY_RULES, SHIM, SKILL_DIR, installAgents, integration, launcher, ownHook, parseArgs, pointsToShim, purgeHooks, runSetup, selection, shellCommand, uninstallAgents, UsageError } from './setup.js'
 
 const KNOWN = ['claude', 'opencode', 'codex', 'gemini', 'antigravity', 'claude-desktop']
 const BINARY = '/opt/gaze pkg/vendor/gaze'
@@ -58,7 +58,7 @@ describe('arguments', () => {
 
 describe('integration', () => {
   test('points the MCP server and the hooks at the absolute binary with the harness flag', () => {
-    const spec = integration({ binary: BINARY, version: '1.2.3', platform: 'darwin' })
+    const spec = integration({ command: [BINARY], version: '1.2.3', platform: 'darwin' })
     assert.deepEqual(spec.mcp, [{ name: 'gaze', command: [BINARY, 'mcp'] }])
     assert.deepEqual(spec.claudeDesktop.mcp, spec.mcp)
     assert.deepEqual(spec.skills, [{ name: 'gaze', dir: SKILL_DIR }])
@@ -130,6 +130,70 @@ describe('integration', () => {
     assert.ok(calls.some((call) => call.join(' ').includes('gaze@gaze')), JSON.stringify(calls))
     assert.equal(existsSync(path.join(home, '.claude', 'skills')), false)
     assert.equal(existsSync(path.join(home, '.claude', 'settings.json')), false)
+  })
+})
+
+describe('launcher and old installs', () => {
+  test('uses the bare gaze command only when gaze on the PATH is this shim', async () => {
+    const { home } = sandbox()
+    const ours = path.join(home, 'ours')
+    const other = path.join(home, 'other')
+    mkdirSync(ours)
+    mkdirSync(other)
+    symlinkSync(SHIM, path.join(ours, 'gaze'))
+    writeFileSync(path.join(other, 'gaze'), '#!/bin/sh\n')
+    chmodSync(path.join(other, 'gaze'), 0o755)
+    const ctx = (dir) => platformContext({ platform: 'darwin', home, env: { HOME: home, PATH: dir } })
+    assert.deepEqual(await launcher(BINARY, { ctx: ctx(ours) }), ['gaze'])
+    assert.deepEqual(await launcher(BINARY, { ctx: ctx(other) }), [BINARY])
+    assert.deepEqual(await launcher(BINARY, { ctx: ctx('') }), [BINARY])
+    const spec = integration({ command: ['gaze'], version: '1.2.3', platform: 'darwin' })
+    assert.deepEqual(spec.mcp, [{ name: 'gaze', command: ['gaze', 'mcp'] }])
+    assert.deepEqual(commands(spec.codex.hooks.SessionStart), ['gaze hook session-start --harness codex'])
+  })
+
+  test('recognizes Windows npm shims that point to this package', () => {
+    const { home } = sandbox()
+    const bin = path.join(home, 'npm')
+    mkdirSync(bin)
+    const cmd = path.join(bin, 'gaze.cmd')
+    const shim = path.win32.join(bin, 'node_modules', '@kikedealba', 'gaze', 'npm', 'gaze.js')
+    writeFileSync(cmd, `@"%dp0%\\node.exe" "%dp0%\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js" %*\r\n`)
+    assert.equal(pointsToShim(cmd, shim, 'win32'), true)
+    assert.equal(pointsToShim(cmd, path.win32.join(bin, 'elsewhere', 'gaze.js'), 'win32'), false)
+  })
+
+  test('tells gaze hooks apart from foreign ones regardless of the path', () => {
+    assert.equal(ownHook("'/old/node/lib/node_modules/@kikedealba/gaze/vendor/gaze' hook prompt --harness codex"), true)
+    assert.equal(ownHook('/old/vendor/gaze hook session-start --harness codex'), true)
+    assert.equal(ownHook('gaze hook prompt --harness codex'), true)
+    assert.equal(ownHook("& 'C:\\old\\vendor\\gaze.exe' hook prompt --harness codex"), true)
+    assert.equal(ownHook('bita hook prompt --harness codex'), false)
+    assert.equal(ownHook('notgaze hook prompt --harness codex'), false)
+    assert.equal(ownHook('gaze hook prompt --harness gemini'), false)
+    const existing = { UserPromptSubmit: [{ hooks: [{ command: 'gaze hook prompt --harness codex' }] }, { hooks: [{ command: 'other' }] }] }
+    assert.deepEqual(purgeHooks(existing, new Set(['gaze hook prompt --harness codex'])).removed, 0)
+    assert.deepEqual(purgeHooks(existing).hooks, { UserPromptSubmit: [{ hooks: [{ command: 'other' }] }] })
+  })
+
+  test('setup replaces codex hooks from an older vendor path and uninstall removes them', async () => {
+    const { home, options } = sandbox()
+    const file = path.join(home, '.codex', 'hooks.json')
+    mkdirSync(path.dirname(file), { recursive: true })
+    const old = "'/old node/vendor/gaze' hook prompt --harness codex"
+    writeFileSync(file, JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: old }] }, { hooks: [{ type: 'command', command: 'keep me' }] }] } }))
+    const source = { binary: BINARY, version: '1.2.3' }
+    const { steps } = await installAgents(['codex'], source, options)
+    assert.ok(steps.some((step) => step.item === 'old hooks' && step.state === 'removed'))
+    assert.deepEqual(commands(readJson(file).hooks.UserPromptSubmit), ['keep me', `'${BINARY}' hook prompt --harness codex`])
+    const again = await installAgents(['codex'], source, options)
+    assert.ok(again.steps.some((step) => step.item === 'hooks' && step.state === 'present'))
+    assert.ok(!again.steps.some((step) => step.item === 'old hooks'))
+
+    writeFileSync(file, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: '/older/vendor/gaze hook session-start --harness codex' }] }], UserPromptSubmit: readJson(file).hooks.UserPromptSubmit } }))
+    await uninstallAgents(['codex'], { binary: '/newer/vendor/gaze', version: '1.2.3' }, options)
+    assert.deepEqual(readJson(file).hooks, { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'keep me' }] }] })
+    assert.equal(existsSync(path.join(home, '.codex', 'config.toml')) && readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').includes('mcp_servers.gaze'), false)
   })
 })
 

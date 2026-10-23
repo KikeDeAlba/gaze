@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -9,6 +9,7 @@ export const ROOT = path.dirname(path.dirname(SELF))
 export const TOOL = 'gaze'
 export const SKILL_DIR = path.join(ROOT, 'skills', 'gaze')
 export const ANTIGRAVITY_RULES = path.join(ROOT, 'npm', 'antigravity.md')
+export const SHIM = path.join(ROOT, 'npm', 'gaze.js')
 export const CLAUDE_PLUGIN = { marketplace: 'KikeDeAlba/gaze', marketplaceName: 'gaze', plugin: 'gaze' }
 
 const STATES = {
@@ -72,9 +73,65 @@ function packageVersion() {
   return JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version
 }
 
-export function integration({ binary, version = packageVersion(), platform = process.platform }) {
-  const hook = (op, harness, timeout) => ({ type: 'command', name: `gaze-${op}`, command: `${shellCommand([binary], platform)} hook ${op} --harness ${harness}`, timeout })
-  const server = { name: TOOL, command: [binary, 'mcp'] }
+export function pointsToShim(found, shim = SHIM, platform = process.platform) {
+  if (realpathOr(found) === realpathOr(shim)) return true
+  if (platform !== 'win32') return false
+  try {
+    const text = readFileSync(found, 'utf8').toLowerCase()
+    return text.includes(path.win32.relative(path.win32.dirname(found), shim).toLowerCase())
+  } catch {
+    return false
+  }
+}
+
+export async function launcher(binary, { ctx, shim = SHIM } = {}) {
+  const { platformContext, which } = await import('@kikedealba/kit/platform')
+  const context = ctx ?? platformContext()
+  const found = await which(TOOL, context)
+  return found && pointsToShim(found, shim, context.platform) ? [TOOL] : [binary]
+}
+
+const OWN_HOOK = /(?:^|[\s'"/\\&])gaze(?:\.exe|\.cmd)?'?\s+hook\s+(?:session-start|prompt|harvest)\s+--harness\s+codex\s*$/
+
+export function ownHook(command) {
+  return typeof command === 'string' && OWN_HOOK.test(command)
+}
+
+export function purgeHooks(existing, keep = new Set()) {
+  const hooks = typeof existing === 'object' && existing !== null ? { ...existing } : {}
+  let removed = 0
+  for (const [event, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) continue
+    const kept = groups.filter((group) => {
+      const list = Array.isArray(group?.hooks) ? group.hooks.map((hook) => hook?.command) : []
+      const stale = list.length > 0 && list.every((command) => ownHook(command) && !keep.has(command))
+      if (stale) removed += 1
+      return !stale
+    })
+    if (kept.length === 0) delete hooks[event]
+    else hooks[event] = kept
+  }
+  return { hooks, removed }
+}
+
+function purgeCodexHooks(agents, options, keep) {
+  const file = path.join(agents.agentHomes(options.ctx, options.homes).codex, 'hooks.json')
+  if (!existsSync(file)) return null
+  let value
+  try {
+    value = JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+  const { hooks, removed } = purgeHooks(value.hooks, keep)
+  if (removed === 0) return null
+  writeFileSync(file, `${JSON.stringify({ ...value, hooks }, null, 2)}\n`)
+  return { agent: 'codex', item: 'old hooks', state: 'removed', detail: `removed ${removed} gaze hooks from another install in ${file}`, path: file }
+}
+
+export function integration({ command, version = packageVersion(), platform = process.platform }) {
+  const hook = (op, harness, timeout) => ({ type: 'command', name: `gaze-${op}`, command: `${shellCommand(command, platform)} hook ${op} --harness ${harness}`, timeout })
+  const server = { name: TOOL, command: [...command, 'mcp'] }
   return {
     tool: TOOL,
     version,
@@ -118,8 +175,20 @@ export async function installAgents(wanted, source, options = {}) {
   const steps = []
   if (targets.includes('claude')) steps.push(...(await agents.installClaudePlugin(CLAUDE_PLUGIN, options)))
   const others = targets.filter((agent) => agent !== 'claude')
-  if (others.length > 0) steps.push(...(await agents.installIntegration(integration({ ...source, platform: options.ctx?.platform }), { ...options, agents: others })))
+  if (others.length === 0) return { targets, steps }
+  const spec = await specFor(source, options)
+  if (others.includes('codex')) {
+    const keep = new Set(Object.values(spec.codex.hooks).flatMap((groups) => groups.flatMap((group) => group.hooks.map((hook) => hook.command))))
+    const purged = purgeCodexHooks(agents, options, keep)
+    if (purged) steps.push(purged)
+  }
+  steps.push(...(await agents.installIntegration(spec, { ...options, agents: others })))
   return { targets, steps }
+}
+
+async function specFor(source, options) {
+  const command = source.command ?? (await launcher(source.binary, { ctx: options.ctx, shim: source.shim }))
+  return integration({ command, version: source.version, platform: options.ctx?.platform })
 }
 
 export async function uninstallAgents(wanted, source, options = {}) {
@@ -128,7 +197,13 @@ export async function uninstallAgents(wanted, source, options = {}) {
   const steps = []
   if (targets.includes('claude')) steps.push(...(await agents.uninstallClaudePlugin(CLAUDE_PLUGIN, options)))
   const others = targets.filter((agent) => agent !== 'claude')
-  if (others.length > 0) steps.push(...(await agents.uninstallIntegration(integration({ ...source, platform: options.ctx?.platform }), { ...options, agents: others })))
+  if (others.length === 0) return { targets, steps }
+  const spec = await specFor(source, options)
+  steps.push(...(await agents.uninstallIntegration(spec, { ...options, agents: others })))
+  if (others.includes('codex')) {
+    const purged = purgeCodexHooks(agents, options, new Set())
+    if (purged) steps.push(purged)
+  }
   return { targets, steps }
 }
 

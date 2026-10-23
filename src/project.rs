@@ -376,7 +376,7 @@ fn resolve_env(store: &Store, cwd: &Path, refresh: bool, env: &Resolver) -> Resu
         let slug = if forced == GLOBAL { forced } else { text::slugify(&forced) };
         return Ok(Project { slug, name: None, bita_id: None, key: None, source: "env".into(), repo: None });
     }
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = crate::paths::canonical(cwd);
     let key = cwd.to_string_lossy().to_string();
     if !refresh {
         let cached: Option<(String, String, i64)> = store
@@ -498,7 +498,7 @@ mod tests {
 
     fn fake_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().canonicalize().unwrap().join("home");
+        let home = crate::paths::canonical(dir.path()).join("home");
         let folder = home.join("dev/github.com/KikeDeAlba");
         std::fs::create_dir_all(folder.join("gaze/.git")).unwrap();
         (dir, home, folder)
@@ -724,7 +724,7 @@ mod tests {
     fn global_cache_entries_expire_after_an_hour() {
         let store = Store::in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().canonicalize().unwrap();
+        let cwd = crate::paths::canonical(dir.path());
         let key = cwd.to_string_lossy().to_string();
         let insert = |project: &str, age: i64| {
             store

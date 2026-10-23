@@ -620,7 +620,15 @@ mod tests {
         store.cfg.hooks.prompt_margin = 0.0;
         let e = FakeEmbedder;
         unsafe { std::env::set_var("GAZE_EMBEDDER", "fake") };
-        store.conn.execute("INSERT INTO project_cache (cwd, project, source, resolved_at) VALUES ('/', 'den', 'test', ?1)", [project::now_secs()]).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let cwd = crate::paths::canonical(work.path()).to_string_lossy().into_owned();
+        store
+            .conn
+            .execute(
+                "INSERT INTO project_cache (cwd, project, source, resolved_at) VALUES (?1, 'den', 'test', ?2)",
+                rusqlite::params![cwd, project::now_secs()],
+            )
+            .unwrap();
         for i in 0..6 {
             store
                 .remember(
@@ -650,7 +658,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let input = json!({"session_id": "s1", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": "/"});
+        let input = json!({"session_id": "s1", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": cwd});
         let out = prompt(&store, &input, Agent::Claude).unwrap().expect("should inject");
         let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
         assert!(estimate_tokens(context) <= 150, "{}", estimate_tokens(context));
@@ -664,10 +672,10 @@ mod tests {
                 assert!(!second.contains(line));
             }
         }
-        let unrelated = json!({"session_id": "s2", "prompt": "escribe un poema sobre gatos y la luna llena", "cwd": "/"});
+        let unrelated = json!({"session_id": "s2", "prompt": "escribe un poema sobre gatos y la luna llena", "cwd": cwd});
         assert!(prompt(&store, &unrelated, Agent::Claude).unwrap().is_none());
         let gemini =
-            prompt(&store, &json!({"session_id": "s3", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": "/"}), Agent::Gemini)
+            prompt(&store, &json!({"session_id": "s3", "prompt": "¿cómo es el despliegue de la api de pagos en aws lambda?", "cwd": cwd}), Agent::Gemini)
                 .unwrap()
                 .expect("gemini should inject");
         assert_eq!(gemini["hookSpecificOutput"]["hookEventName"], "BeforeAgent");

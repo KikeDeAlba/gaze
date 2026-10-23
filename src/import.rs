@@ -44,12 +44,20 @@ pub fn decode_dir_name(name: &str) -> PathBuf {
     decode_dir_name_exact(name).0
 }
 
+pub fn split_root(name: &str, windows: bool) -> (PathBuf, &str) {
+    let bytes = name.as_bytes();
+    if windows && bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b'-' && bytes[2] == b'-' {
+        return (PathBuf::from(format!("{}:\\", bytes[0].to_ascii_uppercase() as char)), &name[3..]);
+    }
+    (PathBuf::from("/"), name.strip_prefix('-').unwrap_or(name))
+}
+
 pub fn decode_dir_name_exact(name: &str) -> (PathBuf, bool) {
-    let rest = name.strip_prefix('-').unwrap_or(name);
-    if let Some(found) = decode_from(Path::new("/"), rest, 0) {
+    let (root, rest) = split_root(name, cfg!(windows));
+    if let Some(found) = decode_from(&root, rest, 0) {
         return (found, true);
     }
-    (decode_prefix(rest), false)
+    (decode_prefix(&root, rest), false)
 }
 
 pub fn guess_project(name: &str, slugs: &[String]) -> Option<String> {
@@ -85,9 +93,9 @@ fn known_slugs(store: &Store) -> Vec<String> {
     slugs
 }
 
-fn decode_prefix(rest: &str) -> PathBuf {
-    let mut best = PathBuf::from("/");
-    let mut current = PathBuf::from("/");
+fn decode_prefix(root: &Path, rest: &str) -> PathBuf {
+    let mut best = root.to_path_buf();
+    let mut current = root.to_path_buf();
     let mut remaining = rest.to_string();
     loop {
         let Ok(entries) = std::fs::read_dir(&current) else { break };
@@ -228,7 +236,7 @@ mod tests {
     #[test]
     fn decodes_dir_names_against_the_filesystem() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().canonicalize().unwrap();
+        let base = crate::paths::canonical(dir.path());
         let target = base.join("dev/github.com/my-org/repo.v2/.claude/worktrees/x");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(base.join("dev/github")).unwrap();
@@ -236,6 +244,14 @@ mod tests {
         assert_eq!(decode_dir_name(&name), target);
         let missing = encode(&base.join("dev/github.com/my-org/gone").to_string_lossy());
         assert_eq!(decode_dir_name(&missing), base.join("dev/github.com/my-org"));
+    }
+
+    #[test]
+    fn splits_windows_drive_roots_from_encoded_names() {
+        assert_eq!(split_root("C--Users-kike-dev", true), (PathBuf::from("C:\\"), "Users-kike-dev"));
+        assert_eq!(split_root("d--work", true), (PathBuf::from("D:\\"), "work"));
+        assert_eq!(split_root("-Users-kike-dev", true), (PathBuf::from("/"), "Users-kike-dev"));
+        assert_eq!(split_root("C--Users", false), (PathBuf::from("/"), "C--Users"));
     }
 
     #[test]
@@ -251,10 +267,10 @@ mod tests {
     fn imports_memories_with_links_and_kinds() {
         unsafe { std::env::set_var("GAZE_BITA_BIN", "/nonexistent/bita") };
         let store = Store::in_memory().unwrap();
-        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
-        assert!(!skip_dir(&encode(&dir.path().canonicalize().unwrap().to_string_lossy())), "the fixture must live outside a skipped temp dir");
+        let dir = if cfg!(windows) { tempfile::tempdir().unwrap() } else { tempfile::tempdir_in("/var/tmp").unwrap() };
+        assert!(!skip_dir(&encode(&crate::paths::canonical(dir.path()).to_string_lossy())), "the fixture must live outside a skipped temp dir");
         let root = dir.path().join("projects");
-        let work = dir.path().canonicalize().unwrap().join("work/app");
+        let work = crate::paths::canonical(dir.path()).join("work").join("app");
         std::fs::create_dir_all(work.join(".git")).unwrap();
         std::fs::write(work.join("gaze.toml"), "project = \"App\"\n").unwrap();
         let mem = root.join(encode(&work.to_string_lossy())).join("memory");

@@ -107,6 +107,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
@@ -115,9 +117,11 @@ jobs:
           merge-multiple: true
 
       - name: embed the checksums of the built assets
+        shell: bash
         env:
           ARCHIVES: ${{ runner.temp }}/archives
         run: |
+          set -euo pipefail
           version="$(jq -r .version package.json)"
           assets='{}'
           for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
@@ -129,6 +133,7 @@ jobs:
           done
           jq -n --arg version "$version" --argjson assets "$assets" '{version: $version, assets: $assets}' > npm/checksums.json
           jq -e '.assets | length == 4' npm/checksums.json
+          jq -e 'all(.assets[]; .sha256 | test("^[0-9a-f]{64}$"))' npm/checksums.json
           jq -e '.assets["x86_64-pc-windows-msvc"].file | endswith(".exe")' npm/checksums.json
 
       - uses: actions/upload-artifact@v4
@@ -145,6 +150,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -188,15 +195,29 @@ jobs:
           node "$(cygpath -m "$RUNNER_TEMP/serve.mjs")" "$(cygpath -m "$serve_root")" &
           server=$!
           trap 'kill $server' EXIT
+          ready=0
           for _ in $(seq 1 20); do
-            if curl -fsS -o /dev/null "http://127.0.0.1:38417/v$version/gaze-$version-x86_64-pc-windows-msvc.exe.sha256"; then break; fi
+            if curl -fsS -o /dev/null "http://127.0.0.1:38417/v$version/gaze-$version-x86_64-pc-windows-msvc.exe"; then ready=1; break; fi
             sleep 0.5
           done
+          if [ "$ready" != "1" ]; then
+            echo "the local server never served the windows asset" >&2
+            exit 1
+          fi
           tarball="$(npm pack --pack-destination "$(cygpath -m "$RUNNER_TEMP")" --silent | tail -1)"
           prefix="$RUNNER_TEMP/prefix"
-          GAZE_DOWNLOAD_BASE="http://127.0.0.1:38417" npm install -g --prefix "$(cygpath -m "$prefix")" "$(cygpath -m "$RUNNER_TEMP/$tarball")"
-          PATH="$prefix:$PATH" gaze capabilities --json | jq -e .ok
+          npm --version
+          GAZE_DOWNLOAD_BASE="http://127.0.0.1:38417" npm install -g --allow-scripts=@kikedealba/gaze --prefix "$(cygpath -m "$prefix")" "$(cygpath -m "$RUNNER_TEMP/$tarball")"
           vendor="$prefix/node_modules/@kikedealba/gaze/vendor"
+          expected="$(jq -r '.assets["x86_64-pc-windows-msvc"].sha256' npm/checksums.json)"
+          test -f "$vendor/$version/gaze.exe"
+          test -f "$vendor/$version/.verified"
+          if [ "$(head -c 64 "$vendor/$version/.verified")" != "$expected" ]; then
+            echo "the postinstall did not leave a .verified marker with $expected" >&2
+            exit 1
+          fi
+          prefix_unix="$(cygpath -u "$prefix")"
+          GAZE_DOWNLOAD_BASE="http://127.0.0.1:1" PATH="$prefix_unix:$PATH" gaze capabilities --json | jq -e .ok
           ls -la "$vendor"
           leftovers="$(find "$vendor" \( -name '*.old-*' -o -name '.install-*' -o -name '*.zip' -o -name '*.tar.gz' \) )"
           if [ -n "$leftovers" ]; then
@@ -205,8 +226,36 @@ jobs:
             exit 1
           fi
 
+  linux-smoke:
+    needs: checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-checksums
+          path: npm
+
+      - name: install the tarball the way a person would, and run it
+        run: |
+          set -euo pipefail
+          npm --version
+          tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)"
+          npm install -g --allow-scripts=@kikedealba/gaze --prefix "$RUNNER_TEMP/prefix" "$RUNNER_TEMP/$tarball"
+          "$RUNNER_TEMP/prefix/bin/gaze" capabilities --json | jq -e .ok
+
   npm:
-    needs: [checksums, windows-smoke]
+    needs: [checksums, windows-smoke, linux-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -214,6 +263,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -224,12 +275,6 @@ jobs:
         with:
           name: npm-checksums
           path: npm
-
-      - name: install the tarball the way a person would, and run it
-        run: |
-          tarball="$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -1)"
-          npm install -g --prefix "$RUNNER_TEMP/prefix" "$RUNNER_TEMP/$tarball"
-          "$RUNNER_TEMP/prefix/bin/gaze" capabilities --json
 
       - name: publish to npm
         env:

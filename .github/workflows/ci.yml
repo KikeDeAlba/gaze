@@ -64,5 +64,8 @@ jobs:
             exit 1
           fi
 
+      - name: npm dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
       - name: npm tests
         run: npm run test:npm

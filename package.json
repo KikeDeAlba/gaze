@@ -19,7 +19,11 @@
     "mcp",
     "cli",
     "claude-code",
-    "claude-code-plugin"
+    "claude-code-plugin",
+    "codex",
+    "gemini-cli",
+    "opencode",
+    "antigravity"
   ],
   "type": "module",
   "engines": {
@@ -40,6 +44,7 @@
   "files": [
     "npm",
     "!npm/*.test.js",
+    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -49,5 +54,8 @@
   "scripts": {
     "postinstall": "node npm/install.js --postinstall",
     "test:npm": "node --test \"npm/*.test.js\""
+  },
+  "dependencies": {
+    "@kikedealba/kit": "^0.7.0"
   }
 }

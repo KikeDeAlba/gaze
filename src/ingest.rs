@@ -759,6 +759,7 @@ mod tests {
         assert_eq!(folder_project(&store, &spaces, "dp-personalizationx"), GLOBAL);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bita_events_refresh_projects_when_the_entry_project_is_unknown() {
         use std::os::unix::fs::PermissionsExt;
@@ -783,6 +784,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn inkwell_ingest_refreshes_bita_projects_first() {
         use std::os::unix::fs::PermissionsExt;
@@ -1086,6 +1088,7 @@ mod tests {
         assert!(store.by_source_ref("inkwell:dp/b.md").unwrap().is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn inkwell_events_refresh_projects_once_when_a_folder_is_unknown() {
         use std::os::unix::fs::PermissionsExt;

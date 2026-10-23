@@ -567,8 +567,10 @@ mod tests {
         assert_eq!(suggest_scope("gitlab.com/acme/vivaaerobus", &single).map(|s| s.1), Some(2));
     }
 
+    #[cfg(unix)]
     const KIKE_MODULES: &str = r#"[{"id":7,"name":"KikeDeAlba Modules","key":"KM"}]"#;
 
+    #[cfg(unix)]
     fn fake_bita(dir: &Path, projects: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let calls = dir.join("calls");
@@ -586,10 +588,12 @@ mod tests {
         (script, calls)
     }
 
+    #[cfg(unix)]
     fn calls_of(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
+    #[cfg(unix)]
     #[test]
     fn automatic_scope_uses_the_fresh_bita_list_over_a_partial_table() {
         let store = Store::in_memory().unwrap();
@@ -606,6 +610,7 @@ mod tests {
         assert!(!logged.contains("scope set"), "{logged}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn gaze_toml_wins_over_the_automatic_scope() {
         let store = Store::in_memory().unwrap();
@@ -619,6 +624,7 @@ mod tests {
         assert!(!calls_of(&calls).contains("scope set"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn fast_resolution_skips_bita_projects_and_scope_set_but_caches() {
         let store = Store::in_memory().unwrap();
@@ -674,6 +680,7 @@ mod tests {
         assert_eq!(resolved.repo.as_deref(), Some("github.com/kikedealba"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn folder_outside_a_repo_creates_the_scope_automatically() {
         use std::os::unix::fs::PermissionsExt;

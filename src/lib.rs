@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod config;
 pub mod daemon;
 pub mod db;
@@ -6,6 +7,7 @@ pub mod envelope;
 pub mod hooks;
 pub mod import;
 pub mod ingest;
+pub mod ipc;
 pub mod mcp;
 pub mod paths;
 pub mod project;

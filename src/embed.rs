@@ -1,7 +1,5 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -107,19 +105,13 @@ impl Embedder for LocalModel {
 }
 
 pub fn socket_alive(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    crate::ipc::alive(path)
 }
 
 pub fn socket_request(path: &Path, request: &Value, timeout: Duration) -> Result<Value> {
-    let mut stream = UnixStream::connect(path).with_context(|| format!("connect {}", path.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
-    stream.write_all(&line)?;
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
+    let response = crate::ipc::request(path, &line, timeout).with_context(|| format!("connect {}", path.display()))?;
     let value: Value = serde_json::from_str(&response).context("daemon response")?;
     if value["ok"] != json!(true) {
         return Err(anyhow!("daemon error: {}", value["error"].as_str().unwrap_or("unknown")));

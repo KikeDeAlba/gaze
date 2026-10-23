@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -9,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::embed::{self, Embedder, LocalModel, Mode};
+use crate::ipc;
 use crate::paths;
 use crate::project::now_secs;
 
@@ -30,19 +30,23 @@ fn handle(model: &dyn Embedder, request: &Value) -> Value {
     }
 }
 
-fn serve_connection(model: &dyn Embedder, stream: UnixStream, last: &AtomicU64) -> Result<()> {
-    let mut writer = stream.try_clone()?;
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = line?;
+fn serve_connection<S: Read + Write>(model: &dyn Embedder, stream: S, last: &AtomicU64) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
         last.store(now_secs() as u64, Ordering::Relaxed);
-        let response = match serde_json::from_str::<Value>(&line) {
+        let response = match serde_json::from_str::<Value>(line.trim_end()) {
             Ok(request) => handle(model, &request),
             Err(error) => json!({"ok": false, "error": format!("bad request: {error}")}),
         };
+        let writer = reader.get_mut();
         writer.write_all(format!("{response}\n").as_bytes())?;
+        writer.flush()?;
     }
-    Ok(())
 }
 
 pub fn ping(path: &Path) -> Option<Value> {
@@ -51,18 +55,13 @@ pub fn ping(path: &Path) -> Option<Value> {
 
 pub fn serve(idle_minutes: Option<u64>) -> Result<()> {
     let socket = paths::socket_path();
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if socket.exists() {
-        if ping(&socket).is_some() {
-            return Err(anyhow!("gaze serve ya corre en {}", socket.display()));
-        }
-        std::fs::remove_file(&socket)?;
+    std::fs::create_dir_all(paths::data_dir())?;
+    if ping(&socket).is_some() {
+        return Err(anyhow!("gaze serve ya corre en {}", socket.display()));
     }
     let model: Arc<dyn Embedder> = if embed::fake_requested() { Arc::new(embed::FakeEmbedder) } else { Arc::new(LocalModel::load()?) };
     model.embed(&["warmup".to_string()], Mode::Query)?;
-    let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
+    let listener = ipc::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     eprintln!("{} gaze serve listening on {}", crate::text::now_iso(), socket.display());
     let last = Arc::new(AtomicU64::new(now_secs() as u64));
     if let Some(minutes) = idle_minutes.filter(|m| *m > 0) {
@@ -72,54 +71,73 @@ pub fn serve(idle_minutes: Option<u64>) -> Result<()> {
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 if now_secs() as u64 - last.load(Ordering::Relaxed) > minutes * 60 {
-                    let _ = std::fs::remove_file(&socket);
+                    ipc::cleanup(&socket);
                     eprintln!("{} gaze serve idle, exiting", crate::text::now_iso());
                     std::process::exit(0);
                 }
             }
         });
     }
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+    loop {
+        let Ok(stream) = listener.accept() else { continue };
         let model = model.clone();
         let last = last.clone();
         std::thread::spawn(move || {
             let _ = serve_connection(model.as_ref(), stream, &last);
         });
     }
-    Ok(())
 }
 
 pub fn render_plist(bin: &str) -> String {
     PLIST_TEMPLATE.replace("{{BIN}}", bin).replace("{{HOME}}", &paths::home().to_string_lossy()).replace("{{LOG}}", &paths::serve_log().to_string_lossy())
 }
 
-pub struct LaunchctlOutput {
+pub struct CommandOutput {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
 }
 
 pub trait Launchctl {
-    fn run(&self, args: &[&str]) -> LaunchctlOutput;
+    fn run(&self, args: &[&str]) -> CommandOutput;
 
     fn pause(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
 }
 
+pub fn system_run(program: &str, args: &[&str]) -> CommandOutput {
+    match Command::new(program).args(args).output() {
+        Ok(output) => CommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        Err(error) => CommandOutput { success: false, stdout: String::new(), stderr: format!("{program}: {error}") },
+    }
+}
+
 pub struct SystemLaunchctl;
 
 impl Launchctl for SystemLaunchctl {
-    fn run(&self, args: &[&str]) -> LaunchctlOutput {
-        match Command::new("launchctl").args(args).output() {
-            Ok(output) => LaunchctlOutput {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            },
-            Err(error) => LaunchctlOutput { success: false, stdout: String::new(), stderr: format!("launchctl: {error}") },
-        }
+    fn run(&self, args: &[&str]) -> CommandOutput {
+        system_run("launchctl", args)
+    }
+}
+
+pub trait Exec {
+    fn exec(&self, program: &str, args: &[&str]) -> CommandOutput;
+
+    fn pause(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+pub struct SystemExec;
+
+impl Exec for SystemExec {
+    fn exec(&self, program: &str, args: &[&str]) -> CommandOutput {
+        system_run(program, args)
     }
 }
 
@@ -225,18 +243,185 @@ fn domain() -> String {
     format!("gui/{}", uid())
 }
 
-pub fn install() -> Result<Value> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Manager {
+    Launchd,
+    Systemd,
+    Schtasks,
+}
+
+impl Manager {
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Manager::Launchd
+        } else if cfg!(windows) {
+            Manager::Schtasks
+        } else {
+            Manager::Systemd
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Manager::Launchd => "launchd",
+            Manager::Systemd => "systemd",
+            Manager::Schtasks => "schtasks",
+        }
+    }
+
+    pub fn unit(self) -> String {
+        match self {
+            Manager::Launchd => paths::launch_agent().to_string_lossy().into_owned(),
+            Manager::Systemd => paths::systemd_unit().to_string_lossy().into_owned(),
+            Manager::Schtasks => TASK_NAME.to_string(),
+        }
+    }
+}
+
+pub const SYSTEMD_UNIT: &str = "gaze.service";
+pub const TASK_NAME: &str = "gaze-daemon";
+
+fn current_bin() -> Result<String> {
     let bin = std::env::current_exe()?.canonicalize()?;
+    let raw = bin.to_string_lossy().into_owned();
+    Ok(raw.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(raw))
+}
+
+fn wait_ready(exec: &dyn Exec, ready: &dyn Fn() -> bool) -> bool {
+    for poll in 0..READY_POLLS {
+        if ready() {
+            return true;
+        }
+        if poll + 1 < READY_POLLS {
+            exec.pause(POLL);
+        }
+    }
+    false
+}
+
+pub fn install() -> Result<Value> {
+    let bin = current_bin()?;
+    std::fs::create_dir_all(paths::data_dir())?;
+    let socket = paths::socket_path();
+    let ready = || ping(&socket).is_some();
+    let mut result = match Manager::current() {
+        Manager::Launchd => install_launchd(&bin, &ready)?,
+        Manager::Systemd => install_systemd(&SystemExec, &paths::systemd_unit(), &bin, &ready)?,
+        Manager::Schtasks => install_schtasks(&SystemExec, &bin, &ready)?,
+    };
+    result["socket"] = json!(socket);
+    result["bin"] = json!(bin);
+    result["log"] = json!(paths::serve_log());
+    if result["pid"].is_null() {
+        result["pid"] = json!(ping(&socket).and_then(|v| v["pid"].as_u64()));
+    }
+    Ok(result)
+}
+
+fn install_launchd(bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
     let plist = paths::launch_agent();
     std::fs::create_dir_all(plist.parent().context("plist dir")?)?;
-    std::fs::create_dir_all(paths::data_dir())?;
     let ctl = SystemLaunchctl;
     let domain = domain();
     unload(&ctl, &format!("{domain}/{LABEL}"))?;
-    std::fs::write(&plist, render_plist(&bin.to_string_lossy()))?;
-    let socket = paths::socket_path();
-    let started = load(&ctl, &domain, &plist.to_string_lossy(), &|| ping(&socket).is_some())?;
-    Ok(json!({"plist": plist, "label": LABEL, "socket": socket, "bin": bin, "pid": started.pid, "ready": started.ready, "log": paths::serve_log()}))
+    std::fs::write(&plist, render_plist(bin))?;
+    let started = load(&ctl, &domain, &plist.to_string_lossy(), ready)?;
+    Ok(json!({"manager": "launchd", "unit": plist, "plist": plist, "label": LABEL, "pid": started.pid, "ready": started.ready}))
+}
+
+fn systemd_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub fn render_systemd_unit(bin: &str, log: &str) -> String {
+    format!(
+        "[Unit]\nDescription=gaze embedding daemon\n\n[Service]\nExecStart={} serve\nRestart=on-failure\nRestartSec=5\nStandardOutput=append:{log}\nStandardError=append:{log}\n\n[Install]\nWantedBy=default.target\n",
+        systemd_quote(bin)
+    )
+}
+
+pub fn missing_user_bus(output: &CommandOutput) -> bool {
+    let text = format!("{}{}", output.stdout, output.stderr);
+    ["Failed to connect to bus", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "No medium found", "systemctl: No such file"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn systemctl(exec: &dyn Exec, args: &[&str]) -> CommandOutput {
+    let mut full = vec!["--user"];
+    full.extend_from_slice(args);
+    exec.exec("systemctl", &full)
+}
+
+fn systemd_pid(exec: &dyn Exec) -> Option<u32> {
+    let output = systemctl(exec, &["show", "-p", "MainPID", "--value", SYSTEMD_UNIT]);
+    output.stdout.trim().parse().ok().filter(|pid| *pid > 0)
+}
+
+pub fn install_systemd(exec: &dyn Exec, unit: &Path, bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
+    std::fs::create_dir_all(unit.parent().context("unit dir")?)?;
+    std::fs::write(unit, render_systemd_unit(bin, &paths::serve_log().to_string_lossy()))?;
+    let base = json!({"manager": "systemd", "unit": unit, "label": SYSTEMD_UNIT});
+    for args in [&["daemon-reload"][..], &["enable", "--now", SYSTEMD_UNIT][..]] {
+        let output = systemctl(exec, args);
+        if output.success {
+            continue;
+        }
+        if missing_user_bus(&output) {
+            let mut result = base;
+            result["ready"] = json!(false);
+            result["warning"] = json!(format!(
+                "no hay bus de usuario de systemd ({}); la unidad quedó en {} pero no se activó. Actívala en una sesión con bus: systemctl --user enable --now {SYSTEMD_UNIT}",
+                output.stderr.trim(),
+                unit.display()
+            ));
+            return Ok(result);
+        }
+        return Err(anyhow!("systemctl --user {} falló: {}", args.join(" "), output.stderr.trim()));
+    }
+    let mut result = base;
+    result["ready"] = json!(wait_ready(exec, ready));
+    result["pid"] = json!(systemd_pid(exec));
+    Ok(result)
+}
+
+pub fn uninstall_systemd(exec: &dyn Exec, unit: &Path) -> Result<bool> {
+    systemctl(exec, &["disable", "--now", SYSTEMD_UNIT]);
+    let existed = unit.exists();
+    if existed {
+        std::fs::remove_file(unit)?;
+    }
+    systemctl(exec, &["daemon-reload"]);
+    Ok(existed)
+}
+
+pub fn schtasks_command(bin: &str) -> String {
+    format!("\"{bin}\" serve")
+}
+
+pub fn install_schtasks(exec: &dyn Exec, bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
+    let command = schtasks_command(bin);
+    let created = exec.exec("schtasks", &["/Create", "/SC", "ONLOGON", "/TN", TASK_NAME, "/TR", &command, "/RL", "LIMITED", "/F"]);
+    if !created.success {
+        return Err(anyhow!("schtasks /Create falló: {}", created.stderr.trim()));
+    }
+    let run = exec.exec("schtasks", &["/Run", "/TN", TASK_NAME]);
+    if !run.success {
+        return Err(anyhow!("schtasks /Run falló: {}", run.stderr.trim()));
+    }
+    Ok(json!({"manager": "schtasks", "unit": TASK_NAME, "label": TASK_NAME, "ready": wait_ready(exec, ready)}))
+}
+
+pub fn uninstall_schtasks(exec: &dyn Exec) -> Result<bool> {
+    if !exec.exec("schtasks", &["/Query", "/TN", TASK_NAME]).success {
+        return Ok(false);
+    }
+    exec.exec("schtasks", &["/End", "/TN", TASK_NAME]);
+    let deleted = exec.exec("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"]);
+    if !deleted.success {
+        return Err(anyhow!("schtasks /Delete falló: {}", deleted.stderr.trim()));
+    }
+    Ok(true)
 }
 
 pub fn remove(ctl: &dyn Launchctl, service: &str, plist: &Path) -> Result<bool> {
@@ -249,24 +434,69 @@ pub fn remove(ctl: &dyn Launchctl, service: &str, plist: &Path) -> Result<bool> 
 }
 
 pub fn uninstall() -> Result<Value> {
-    let plist = paths::launch_agent();
-    let removed = remove(&SystemLaunchctl, &format!("{}/{LABEL}", domain()), &plist)?;
-    Ok(json!({"plist": plist, "removed": removed}))
+    let manager = Manager::current();
+    let removed = match manager {
+        Manager::Launchd => remove(&SystemLaunchctl, &format!("{}/{LABEL}", domain()), &paths::launch_agent())?,
+        Manager::Systemd => uninstall_systemd(&SystemExec, &paths::systemd_unit())?,
+        Manager::Schtasks => uninstall_schtasks(&SystemExec)?,
+    };
+    let mut result = json!({"manager": manager.name(), "unit": manager.unit(), "removed": removed});
+    if manager == Manager::Launchd {
+        result["plist"] = json!(paths::launch_agent());
+    }
+    Ok(result)
+}
+
+fn service_state(manager: Manager, exec: &dyn Exec) -> (bool, JobState) {
+    match manager {
+        Manager::Launchd => {
+            let installed = paths::launch_agent().exists();
+            let job = if installed { job_state(&SystemLaunchctl, &format!("{}/{LABEL}", domain())) } else { JobState::Missing };
+            (installed, job)
+        }
+        Manager::Systemd => {
+            let installed = paths::systemd_unit().exists();
+            if !installed {
+                return (false, JobState::Missing);
+            }
+            let active = systemctl(exec, &["is-active", SYSTEMD_UNIT]);
+            let state = active.stdout.trim();
+            if state == "active" || state == "activating" || state == "reloading" {
+                (true, JobState::Loaded { pid: systemd_pid(exec) })
+            } else {
+                (true, JobState::Missing)
+            }
+        }
+        Manager::Schtasks => {
+            let query = exec.exec("schtasks", &["/Query", "/TN", TASK_NAME, "/FO", "LIST"]);
+            if !query.success {
+                return (false, JobState::Missing);
+            }
+            if query.stdout.contains("Running") { (true, JobState::Loaded { pid: None }) } else { (true, JobState::Missing) }
+        }
+    }
 }
 
 pub fn status() -> Value {
     let socket = paths::socket_path();
     let alive = ping(&socket);
-    let plist = paths::launch_agent();
-    let installed = plist.exists();
-    let job = if installed { job_state(&SystemLaunchctl, &format!("{}/{LABEL}", domain())) } else { JobState::Missing };
+    let manager = Manager::current();
+    let (installed, job) = service_state(manager, &SystemExec);
+    let manager_pid = match job {
+        JobState::Loaded { pid } => pid,
+        JobState::Missing => None,
+    };
     json!({
         "socket": socket,
         "running": alive.is_some(),
         "pid": alive.as_ref().and_then(|v| v["pid"].as_u64()),
+        "manager": manager.name(),
+        "unit": manager.unit(),
+        "installed": installed,
         "launchAgent": installed,
         "loaded": matches!(job, JobState::Loaded { .. }),
-        "launchdPid": match job { JobState::Loaded { pid } => pid, JobState::Missing => None },
+        "managerPid": manager_pid,
+        "launchdPid": manager_pid,
         "state": status_state(alive.is_some(), installed, &job),
     })
 }
@@ -316,17 +546,17 @@ mod tests {
             self.calls.borrow().iter().map(|call| call.split(' ').next().unwrap_or_default().to_string()).collect()
         }
 
-        fn ok(stdout: String) -> LaunchctlOutput {
-            LaunchctlOutput { success: true, stdout, stderr: String::new() }
+        fn ok(stdout: String) -> CommandOutput {
+            CommandOutput { success: true, stdout, stderr: String::new() }
         }
 
-        fn fail(stderr: &str) -> LaunchctlOutput {
-            LaunchctlOutput { success: false, stdout: String::new(), stderr: stderr.into() }
+        fn fail(stderr: &str) -> CommandOutput {
+            CommandOutput { success: false, stdout: String::new(), stderr: stderr.into() }
         }
     }
 
     impl Launchctl for FakeLaunchctl {
-        fn run(&self, args: &[&str]) -> LaunchctlOutput {
+        fn run(&self, args: &[&str]) -> CommandOutput {
             self.calls.borrow_mut().push(args.join(" "));
             match args[0] {
                 "print" => {
@@ -519,5 +749,82 @@ mod tests {
         assert_eq!(status_state(false, true, &JobState::Missing), "not-loaded");
         assert_eq!(status_state(false, true, &JobState::Loaded { pid: None }), "starting");
         assert_eq!(status_state(false, false, &JobState::Missing), "stopped");
+    }
+
+    struct FakeExec {
+        calls: RefCell<Vec<String>>,
+        fail_with: Option<&'static str>,
+    }
+
+    impl FakeExec {
+        fn new(fail_with: Option<&'static str>) -> Self {
+            Self { calls: RefCell::new(Vec::new()), fail_with }
+        }
+    }
+
+    impl Exec for FakeExec {
+        fn exec(&self, program: &str, args: &[&str]) -> CommandOutput {
+            self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
+            if let Some(stderr) = self.fail_with {
+                return CommandOutput { success: false, stdout: String::new(), stderr: stderr.into() };
+            }
+            let stdout = if args.contains(&"MainPID") { "4321\n".to_string() } else { String::new() };
+            CommandOutput { success: true, stdout, stderr: String::new() }
+        }
+
+        fn pause(&self, _duration: Duration) {}
+    }
+
+    #[test]
+    fn systemd_unit_quotes_the_binary_and_logs_to_the_serve_log() {
+        let unit = render_systemd_unit("/opt/my gaze/gaze", "/home/k/.local/share/gaze/serve.log");
+        assert!(unit.contains("ExecStart=\"/opt/my gaze/gaze\" serve\n"), "{unit}");
+        assert!(unit.contains("StandardOutput=append:/home/k/.local/share/gaze/serve.log"));
+        assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn systemd_install_enables_the_user_unit_and_reports_the_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("systemd/user/gaze.service");
+        let exec = FakeExec::new(None);
+        let result = install_systemd(&exec, &unit, "/usr/bin/gaze", &|| true).unwrap();
+        assert!(unit.exists());
+        assert_eq!(result["ready"], true);
+        assert_eq!(result["pid"], 4321);
+        let calls = exec.calls.borrow();
+        assert_eq!(calls[0], "systemctl --user daemon-reload");
+        assert_eq!(calls[1], "systemctl --user enable --now gaze.service");
+        drop(calls);
+        assert!(uninstall_systemd(&exec, &unit).unwrap());
+        assert!(!unit.exists());
+        assert!(exec.calls.borrow().contains(&"systemctl --user disable --now gaze.service".to_string()));
+    }
+
+    #[test]
+    fn systemd_install_warns_instead_of_failing_without_a_user_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("gaze.service");
+        let exec = FakeExec::new(Some("Failed to connect to bus: No medium found"));
+        let result = install_systemd(&exec, &unit, "/usr/bin/gaze", &|| true).unwrap();
+        assert_eq!(result["ready"], false);
+        assert!(result["warning"].as_str().unwrap().contains("systemctl --user enable --now gaze.service"));
+        assert!(unit.exists());
+        let other = FakeExec::new(Some("Unit file is masked"));
+        assert!(install_systemd(&other, &unit, "/usr/bin/gaze", &|| true).is_err());
+    }
+
+    #[test]
+    fn schtasks_install_creates_a_logon_task_and_runs_it() {
+        let exec = FakeExec::new(None);
+        let result = install_schtasks(&exec, r"C:\Users\k\gaze.exe", &|| true).unwrap();
+        assert_eq!(result["ready"], true);
+        let calls = exec.calls.borrow();
+        assert_eq!(calls[0], r#"schtasks /Create /SC ONLOGON /TN gaze-daemon /TR "C:\Users\k\gaze.exe" serve /RL LIMITED /F"#);
+        assert_eq!(calls[1], "schtasks /Run /TN gaze-daemon");
+        drop(calls);
+        assert!(uninstall_schtasks(&exec).unwrap());
+        assert!(exec.calls.borrow().contains(&"schtasks /Delete /TN gaze-daemon /F".to_string()));
+        assert!(!uninstall_schtasks(&FakeExec::new(Some("ERROR: not found"))).unwrap());
     }
 }

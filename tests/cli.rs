@@ -15,6 +15,7 @@ fn gaze(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
         .env("GAZE_PROJECT", "den")
         .env("GAZE_BITA_BIN", "/nonexistent/bita")
         .env_remove("GAZE_HARVEST")
+        .env_remove("KIT_HEADLESS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -73,8 +74,14 @@ fn cli_contracts() {
     let context = start["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     assert!(context.contains("Nunca uses npm"));
     assert_eq!(start["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    let gemini: Value =
+        serde_json::from_str(gaze(d, &["hook", "session-start", "--harness", "gemini"], Some("{\"session_id\":\"g\",\"cwd\":\"/\"}")).trim()).unwrap();
+    assert!(gemini["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("Nunca uses npm"));
 
     let setup = envelope(&gaze(d, &["setup", "--json"], None));
+    let next = setup["data"]["next"].to_string();
+    assert!(!next.contains("claude plugin"), "{next}");
+    assert!(next.contains("gaze daemon install"));
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(setup["data"]["manifest"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(manifest["subscribes"][0]["tool"], "bita");
     assert_eq!(manifest["subscribes"][1]["tool"], "inkwell");
@@ -118,6 +125,22 @@ fn hooks_are_silent_during_harvest() {
         .output()
         .unwrap();
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn hooks_are_silent_inside_a_kit_headless_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+        .args(["hook", "prompt", "--harness", "codex"])
+        .env("GAZE_DATA_DIR", dir.path())
+        .env("GAZE_EMBEDDER", "fake")
+        .env_remove("GAZE_HARVEST")
+        .env("KIT_HEADLESS", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty());
+    assert!(!dir.path().join("gaze.db").exists());
 }
 
 #[test]

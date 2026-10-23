@@ -89,7 +89,7 @@ fn cli_contracts() {
     assert_eq!(manifest["subscribes"][1]["command"][1], "inkwell-hook");
     assert_eq!(manifest["manifestVersion"], 1);
     assert_eq!(manifest["install"], "npm install -g @kikedealba/gaze && gaze setup");
-    let native = std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap();
+    let native = gaze::paths::simplify(std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap());
     assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
     assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
 }

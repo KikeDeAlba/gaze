@@ -376,7 +376,7 @@ fn resolve_env(store: &Store, cwd: &Path, refresh: bool, env: &Resolver) -> Resu
         let slug = if forced == GLOBAL { forced } else { text::slugify(&forced) };
         return Ok(Project { slug, name: None, bita_id: None, key: None, source: "env".into(), repo: None });
     }
-    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = crate::paths::canonical(cwd);
     let key = cwd.to_string_lossy().to_string();
     if !refresh {
         let cached: Option<(String, String, i64)> = store

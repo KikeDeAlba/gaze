@@ -165,8 +165,13 @@ fn frontmatter_project(store: &Store, meta: &BTreeMap<String, String>) -> Option
         .or_else(|| meta.get("project").map(|name| project::project_for_name(store, name)).filter(|slug| slug != GLOBAL && known_project(store, slug)))
 }
 
+pub fn slash_rel(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/")
+}
+
 pub fn inkwell_note(store: &Store, emb: &dyn Embedder, root: &Path, path: &Path) -> Result<Option<(String, &'static str)>> {
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    let rel = slash_rel(root, path);
     let key = format!("inkwell:{rel}");
     let modified = mtime(path);
     let raw = std::fs::read_to_string(path)?;
@@ -225,7 +230,7 @@ pub fn ingest_inkwell(store: &Store, emb: &dyn Embedder, root: &Path, progress: 
     files.sort();
     let mut present = HashSet::new();
     for (index, path) in files.iter().enumerate() {
-        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+        let rel = slash_rel(root, path);
         let key = format!("inkwell:{rel}");
         present.insert(key.clone());
         report.scanned += 1;
@@ -557,7 +562,7 @@ impl DocsBatch<'_> {
 }
 
 fn canonical_or_raw(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    crate::paths::canonical(path)
 }
 
 pub fn inkwell_event(store: &Store, emb: &dyn Embedder, event: &Value, docs: &Path, bita: &str) -> Result<Value> {
@@ -1275,6 +1280,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn inkwell_ingest_recovers_stranded_moving_keys() {
         let store = Store::in_memory().unwrap();

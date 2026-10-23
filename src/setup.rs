@@ -45,7 +45,7 @@ pub const INTEGRATIONS_NOTE: &str =
     "Las integraciones con cada agente (plugin, skill, MCP y hooks) las instala el paquete npm con kit; este binario solo registra gaze y prepara sus datos.";
 
 pub fn setup() -> Result<Value> {
-    let bin = std::env::current_exe()?.canonicalize()?.to_string_lossy().to_string();
+    let bin = crate::paths::simplify(std::env::current_exe()?.canonicalize()?).to_string_lossy().to_string();
     let registry = paths::registry_dir();
     std::fs::create_dir_all(&registry)?;
     let target = registry.join("gaze.json");

@@ -42,6 +42,23 @@ fn dirs() -> Dirs<fn(&str) -> Option<PathBuf>> {
     Dirs { windows: cfg!(windows), var: env_path }
 }
 
+pub fn simplify(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+pub fn canonical(path: &std::path::Path) -> PathBuf {
+    simplify(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
 pub fn home() -> PathBuf {
     dirs().home()
 }
@@ -172,6 +189,14 @@ mod tests {
         assert_eq!(dirs.data_home(), PathBuf::from("/data"));
         assert_eq!(dirs.config_home(), PathBuf::from("/home/kike/.config"));
         assert_eq!(dirs.cache_home(), PathBuf::from("/home/kike/.cache/gaze"));
+    }
+
+    #[test]
+    fn simplify_drops_verbatim_prefixes_only() {
+        assert_eq!(simplify(PathBuf::from(r"\\?\C:\Users\k")), PathBuf::from(r"C:\Users\k"));
+        assert_eq!(simplify(PathBuf::from(r"\\?\UNC\server\share\x")), PathBuf::from(r"\\server\share\x"));
+        assert_eq!(simplify(PathBuf::from(r"\\?\Volume{abc}\x")), PathBuf::from(r"\\?\Volume{abc}\x"));
+        assert_eq!(simplify(PathBuf::from("/home/k")), PathBuf::from("/home/k"));
     }
 
     #[test]

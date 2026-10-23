@@ -391,9 +391,7 @@ pub const SYSTEMD_UNIT: &str = "gaze.service";
 pub const TASK_NAME: &str = "gaze-daemon";
 
 fn current_bin() -> Result<String> {
-    let bin = std::env::current_exe()?.canonicalize()?;
-    let raw = bin.to_string_lossy().into_owned();
-    Ok(raw.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(raw))
+    Ok(paths::simplify(std::env::current_exe()?.canonicalize()?).to_string_lossy().into_owned())
 }
 
 fn wait_ready(exec: &dyn Exec, ready: &dyn Fn() -> bool) -> bool {
@@ -936,6 +934,7 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn systemd_install_enables_the_user_unit_and_reports_the_pid() {
         let dir = tempfile::tempdir().unwrap();
@@ -954,6 +953,7 @@ mod tests {
         assert!(exec.calls.borrow().contains(&"systemctl --user disable --now gaze.service".to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn systemd_install_warns_instead_of_failing_without_a_user_bus() {
         let dir = tempfile::tempdir().unwrap();

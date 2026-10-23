@@ -16,7 +16,7 @@ Claude tiene 4 herramientas MCP (`gaze_search`, `gaze_remember`, `gaze_rule_add`
 
 ## Instalación
 
-Plataformas con binario precompilado: macOS arm64 (Apple Silicon) y Linux x64. Requiere Node 24.5 o más nuevo. El daemon usa launchd, así que `gaze daemon install` solo aplica en macOS; el resto funciona en ambas.
+Plataformas con binario precompilado: macOS arm64 (Apple Silicon), Linux x64 y Windows x64. Requiere Node 24.5 o más nuevo. En macOS el daemon usa launchd y en Windows una tarea programada (`gaze-daemon`); si tu equipo tiene antivirus o EDR corporativo, lee [Windows con antivirus o EDR corporativo](#windows-con-antivirus-o-edr-corporativo).
 
 ```sh
 npm install -g @kikedealba/gaze && gaze setup   # registra gaze en kit, crea ~/.config/gaze/config.toml y la base
@@ -25,11 +25,18 @@ claude plugin marketplace add KikeDeAlba/gaze
 claude plugin install gaze@gaze                 # hooks, skill y servidor MCP
 ```
 
-El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` lo genera el pipeline de publicación para cada target. Al instalarse, el `postinstall` descarga `gaze-<versión>-<target>.tar.gz` del release `v<versión>` en GitHub (solo por https y solo desde `github.com` y sus hosts de assets, con hasta 3 redirecciones y un tope de 200 MB), lo compara con ese hash y deja el binario en `vendor/gaze` dentro del paquete. Si el hash no coincide, falta `checksums.json` o el tar trae algo que no es un archivo normal, la instalación falla; si el problema es de red (sin conexión, HTTP o timeout), la instalación termina bien y avisa.
+El paquete de npm no trae el binario, pero sí su SHA-256: `npm/checksums.json` lo genera el pipeline de publicación para cada target. Al instalarse, el `postinstall` descarga el asset del release `v<versión>` en GitHub (solo por https y solo desde `github.com` y sus hosts de assets, con hasta 3 redirecciones y un tope de 200 MB) y lo compara con ese hash. Si el hash no coincide, falta `checksums.json` o el tar trae algo que no es un archivo normal, la instalación falla; si el problema es de red (sin conexión, HTTP o timeout), la instalación termina bien y avisa. Lo que se descarga y dónde queda depende de la plataforma:
+
+| Plataforma | Asset del release | Dónde queda | Marca de versión |
+|---|---|---|---|
+| macOS y Linux | `gaze-<versión>-<target>.tar.gz` | `vendor/gaze` dentro del paquete | `vendor/.version` |
+| Windows | `gaze-<versión>-x86_64-pc-windows-msvc.exe`, sin comprimir | `vendor\<versión>\gaze.exe` dentro del paquete | `vendor\<versión>\.verified` |
+
+En Windows no hay zip, tar, renames ni directorios temporales: el instalador verifica el sha256 del `.exe` contra `npm/checksums.json` y lo escribe una sola vez en su destino final, junto con `.verified`. Las versiones viejas de `vendor\` se borran en cuanto se puede. Así se reduce lo que dispara la heurística por comportamiento de un antivirus: Check Point Harmony Endpoint Anti-Ransomware marcó la instalación de 0.6.1.
 
 El comando `gaze` es un lanzador de Node que ejecuta ese binario. Si el `postinstall` no corrió (por red, por `npm install --ignore-scripts` o porque npm bloqueó los scripts), **la primera ejecución de `gaze` descarga el binario**; por eso conviene que esa primera ejecución sea `gaze setup` y no un hook, que tiene pocos segundos. `GAZE_BINARY_PATH` usa un binario propio en lugar del descargado y avisa por stderr en cada ejecución.
 
-El manifiesto de kit (`~/.config/kikedealba/tools.d/gaze.json`) y el plist de launchd guardan la ruta del binario nativo dentro de `vendor/`, que cambia con cada versión (con pnpm vive en su store versionado) y con el prefijo global de npm. Tras `npm i -g` o `pnpm add -g` de otra versión, eso se repara solo:
+El manifiesto de kit (`~/.config/kikedealba/tools.d/gaze.json`) y el plist de launchd guardan la ruta del binario nativo dentro de `vendor/` (en Windows, `vendor\<versión>\gaze.exe`), que cambia con cada versión (con pnpm vive en su store versionado) y con el prefijo global de npm. Tras `npm i -g` o `pnpm add -g` de otra versión, eso se repara solo:
 
 - El `postinstall` corre `gaze setup` y `gaze daemon install` si ya existían el manifiesto o el plist. pnpm no corre `postinstall` sin aprobación, así que no se puede depender de él.
 - Por eso el lanzador revisa en cada ejecución el manifiesto de kit. Repara si el binario registrado ya no existe, si su versión es menor que la del paquete o si el plist no apunta al binario registrado cuando ese binario es el suyo. En ese caso lanza en segundo plano `install.js --repair`, que descarga el binario si falta y corre `gaze setup` y `gaze daemon install`. El hook o comando en curso no espera. Basta con la siguiente ejecución de `gaze`, aunque sea un hook de Claude Code.
@@ -39,7 +46,7 @@ El manifiesto de kit (`~/.config/kikedealba/tools.d/gaze.json`) y el plist de la
 
 El manifiesto y el plist apuntan al binario nativo y no al lanzador del `PATH` (`~/Library/pnpm/bin/gaze` o `<prefijo>/bin/gaze`): launchd arranca el daemon con `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, donde no está el `node` de nvm, Volta o Homebrew, y el lanzador dejaría un proceso de Node residente (~44 MB) junto al daemon. Con el binario nativo, Den y kit tampoco pagan los ~24 ms del lanzador en cada llamada.
 
-Si hace falta a mano: `gaze setup && gaze daemon install`. `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar.
+Si hace falta a mano: `gaze setup && gaze daemon install`. En macOS y Linux, `vendor/.version` guarda la versión del binario descargado: si no coincide con la del paquete, se vuelve a descargar. En Windows no hay `.version`: la versión es el nombre de la carpeta, y `.verified` registra el sha256, el tamaño y la fecha del `.exe` ya verificado; si el exe no coincide con `checksums.json`, se vuelve a descargar. El `postinstall` y la reparación reapuntan al exe nuevo las integraciones de los agentes (el manifiesto de kit y la tarea programada).
 
 `gaze daemon install` saca el job anterior de launchd, espera hasta 10 s a que `launchctl print gui/<uid>/com.kikedealba.gaze` deje de encontrarlo, lo habilita (`launchctl enable`, por si se deshabilitó), carga el plist, espera hasta 10 s a que el job tenga pid y hasta 30 s a que responda en el socket. Reintenta hasta 3 veces y, si no queda cargado, sale con error y el detalle de cada intento. Si el job sigue vivo pero aún no responde (la primera vez puede estar descargando el modelo), termina bien y lo dice. En el peor caso tarda unos 160 s. `gaze daemon uninstall` falla con un error claro si launchd no descarga el job, y entonces no borra el plist. `gaze daemon status` distingue entre corriendo, plist instalado pero no cargado en launchd, cargado sin responder todavía en el socket y apagado (campo `state`: `running`, `not-loaded`, `starting`, `stopped`).
 
@@ -61,6 +68,32 @@ gaze setup
 ```
 
 La primera vez que se calcula un embedding se descarga el modelo `multilingual-e5-small` (~120 MB) a `~/.cache/gaze`.
+
+### Windows con antivirus o EDR corporativo
+
+Para TI. En Windows, gaze se instala sin comprimir y sin renames (ver [Instalación](#instalación)), pero un EDR con protección por comportamiento puede marcar de todos modos la instalación o la primera ejecución. Esto es lo que gaze hace en el equipo.
+
+| Qué | Dónde |
+|---|---|
+| Ejecutable | `%APPDATA%\npm\node_modules\@kikedealba\gaze\vendor\<versión>\gaze.exe` (con el prefijo global de npm por defecto) |
+| Base, bitácoras y bloqueos | `%LOCALAPPDATA%\gaze\` |
+| Caché (modelo) | `%LOCALAPPDATA%\gaze\cache` (el modelo, en `models`) |
+| Configuración | `%APPDATA%\gaze\config.toml` |
+| Tarea programada | `gaze-daemon`: `schtasks /Create /SC ONLOGON`, nivel `LIMITED`, ejecuta `gaze.exe serve --detach` |
+| Canal del daemon | Named pipe `\\.\pipe\gaze-<usuario>` |
+
+La primera ejecución baja el modelo `intfloat/multilingual-e5-small` (~470 MB) desde Hugging Face a `%LOCALAPPDATA%\gaze\cache\models`. Son muchos archivos grandes escritos en poco tiempo, y eso puede parecer actividad de cifrado.
+
+Para verificar el exe, compara su hash con el del asset `gaze-<versión>-x86_64-pc-windows-msvc.exe.sha256` del release `v<versión>` en GitHub:
+
+```powershell
+Get-FileHash "$env:APPDATA\npm\node_modules\@kikedealba\gaze\vendor\<versión>\gaze.exe" -Algorithm SHA256
+```
+
+Qué pedirle a TI:
+
+- Una excepción por carpeta o por proceso en Behavioral Protection / Anti-Ransomware para la carpeta del exe (`...\@kikedealba\gaze\vendor`) y para `%LOCALAPPDATA%\gaze`.
+- Preferir la excepción por carpeta o proceso a la de hash: el binario todavía no está firmado, así que el hash cambia con cada versión.
 
 ### Migrar la memoria de Claude
 

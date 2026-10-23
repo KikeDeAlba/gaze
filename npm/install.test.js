@@ -1107,7 +1107,7 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     rmSync(lock)
   })
 
-  test('a stale lock is renamed aside, checked and recreated on macOS and Linux', async () => {
+  test('a stale lock is removed in place and recreated without renaming it', async () => {
     const env = machine()
     await installVersion('9.9.7', env)
     const root = packageRoot({ version: '9.9.8' }, '9.9.8')
@@ -1119,49 +1119,50 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     const calls = []
     const full = { ...process.env, ...NO_PROXY_ENV, ...env, GAZE_DOWNLOAD_BASE: base }
     assert.equal(await watchingFs(calls, () => startRepair({ root, env: full })), true)
-    assert.ok(calls.some(([name, from]) => name === 'renameSync' && from === lock))
+    assert.deepEqual(calls.filter(([name]) => name === 'renameSync'), [])
+    assert.ok(calls.some(([name, target]) => name === 'rmSync' && target === lock))
     assert.deepEqual(readdirSync(path.dirname(lock)).filter((entry) => entry.startsWith('repair.lock.')), [])
     await settled(env)
     assert.equal(registered(env).version, '9.9.8')
   })
 
-  test('on win32 a stale lock is removed in place without renaming it', async () => {
+  test('acquireLock removes a stale lock under the reclaim guard and takes it', async () => {
     const dir = mkdtempSync(path.join(scratch, 'lock-'))
     const lock = path.join(dir, 'repair.lock')
     writeFileSync(lock, '999999999\n')
     const stale = new Date(Date.now() - 20 * 60 * 1000)
     utimesSync(lock, stale, stale)
     const calls = []
-    assert.equal(await watchingFs(calls, () => acquireLock(lock, { platform: 'win32' })), true)
+    assert.equal(await watchingFs(calls, () => acquireLock(lock)), true)
     assert.deepEqual(calls.filter(([name]) => name === 'renameSync'), [])
     assert.ok(calls.some(([name, target]) => name === 'rmSync' && target === lock))
     assert.equal(readFileSync(lock, 'utf8'), `${process.pid}\n`)
     assert.deepEqual(readdirSync(dir), ['repair.lock'])
   })
 
-  test('on win32 a stale lock is left alone while another repair holds the reclaim guard', async () => {
+  test('a stale lock is left alone while another repair holds the reclaim guard', async () => {
     const dir = mkdtempSync(path.join(scratch, 'lock-'))
     const lock = path.join(dir, 'repair.lock')
     writeFileSync(lock, '999999999\n')
     const stale = new Date(Date.now() - 20 * 60 * 1000)
     utimesSync(lock, stale, stale)
     mkdirSync(`${lock}.reclaim`)
-    assert.equal(acquireLock(lock, { platform: 'win32' }), false)
+    assert.equal(acquireLock(lock), false)
     assert.equal(readFileSync(lock, 'utf8'), '999999999\n')
     const abandoned = new Date(Date.now() - 5 * 60 * 1000)
     utimesSync(`${lock}.reclaim`, abandoned, abandoned)
-    assert.equal(acquireLock(lock, { platform: 'win32' }), false)
+    assert.equal(acquireLock(lock), false)
     assert.equal(existsSync(`${lock}.reclaim`), false)
-    assert.equal(acquireLock(lock, { platform: 'win32' }), true)
+    assert.equal(acquireLock(lock), true)
   })
 
-  for (const platform of ['win32', 'posix']) {
-    test(`only one of many concurrent repairs takes a stale lock (${platform})`, { timeout: 60_000 }, async () => {
-      const runner = path.join(scratch, `lock-runner-${platform}.mjs`)
+  for (const batch of [1, 2]) {
+    test(`only one of many concurrent repairs takes a stale lock (batch ${batch})`, { timeout: 60_000 }, async () => {
+      const runner = path.join(scratch, `lock-runner-${batch}.mjs`)
       writeFileSync(runner, `import { acquireLock } from ${JSON.stringify(pathToFileURL(path.join(HERE, 'install.js')).href)}
-const [lock, start, platform] = process.argv.slice(2)
+const [lock, start] = process.argv.slice(2)
 while (Date.now() < Number(start)) {}
-process.stdout.write(String(acquireLock(lock, { platform })))
+process.stdout.write(String(acquireLock(lock)))
 `)
       for (let round = 0; round < 5; round++) {
         const dir = mkdtempSync(path.join(scratch, 'lock-'))
@@ -1170,7 +1171,7 @@ process.stdout.write(String(acquireLock(lock, { platform })))
         const stale = new Date(Date.now() - 20 * 60 * 1000)
         utimesSync(lock, stale, stale)
         const start = Date.now() + 1500
-        const results = await Promise.all(Array.from({ length: 8 }, () => node(runner, [lock, String(start), platform])))
+        const results = await Promise.all(Array.from({ length: 8 }, () => node(runner, [lock, String(start)])))
         const winners = results.filter((result) => result.stdout === 'true')
         assert.equal(winners.length, 1, JSON.stringify(results.map((result) => result.stdout + result.stderr)))
         assert.deepEqual(readdirSync(dir), ['repair.lock'])

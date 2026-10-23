@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { createHash, randomBytes } from 'node:crypto'
-import { accessSync, chmodSync, constants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -630,31 +630,7 @@ function staleLock(file, stats, now) {
   return age >= ABANDONED_LOCK_MS || (age >= REPAIR_RETRY_MS && !alive(lockOwner(file)))
 }
 
-function reclaimByRename(file, before) {
-  const moved = `${file}.${process.pid}.${randomBytes(6).toString('hex')}`
-  try {
-    renameSync(file, moved)
-  } catch {
-    return false
-  }
-  let after
-  try {
-    after = statSync(moved)
-  } catch {
-    return false
-  }
-  if (after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) {
-    try {
-      linkSync(moved, file)
-    } catch {}
-    rmSync(moved, { force: true })
-    return false
-  }
-  rmSync(moved, { force: true })
-  return true
-}
-
-function reclaimInPlace(file, before, now) {
+function reclaimUnderGuard(file, before, now) {
   const guard = `${file}.reclaim`
   try {
     mkdirSync(guard, { mode: 0o700 })
@@ -686,7 +662,7 @@ function reclaimInPlace(file, before, now) {
   }
 }
 
-function reclaim(file, now, platform) {
+function reclaim(file, now) {
   let before
   try {
     before = statSync(file)
@@ -694,10 +670,10 @@ function reclaim(file, now, platform) {
     return true
   }
   if (!staleLock(file, before, now)) return false
-  return platform === 'win32' ? reclaimInPlace(file, before, now) : reclaimByRename(file, before)
+  return reclaimUnderGuard(file, before, now)
 }
 
-export function acquireLock(file, { now = Date.now(), platform = process.platform } = {}) {
+export function acquireLock(file, { now = Date.now() } = {}) {
   try {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   } catch {
@@ -710,7 +686,7 @@ export function acquireLock(file, { now = Date.now(), platform = process.platfor
     } catch (error) {
       if (error.code !== 'EEXIST') return false
     }
-    if (!reclaim(file, now, platform)) return false
+    if (!reclaim(file, now)) return false
   }
   return false
 }

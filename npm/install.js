@@ -145,7 +145,7 @@ async function pruneOtherVersions(vendor, binary, version, root, env, options) {
     return
   }
   if (entries.length === 0) return
-  const configs = await agentConfigs(binary, root, env, options.install)
+  const configs = await agentConfigs(binary, root, env, options.install, options.euid ?? process.geteuid?.())
   if (configs === null) return
   const references = configs.flatMap(({ refs }) => refs)
   const dirs = [...new Set([vendor, realpathOr(vendor)])]
@@ -813,7 +813,8 @@ async function loadKit(env, install = {}) {
   }
 }
 
-async function agentConfigs(binary, root, env, install) {
+async function agentConfigs(binary, root, env, install, euid) {
+  if (euid === 0) return null
   try {
     const kit = await loadKit(env, install)
     return kit ? staleConfigs(binary, kit.homes, root, { strict: true }) : []
@@ -830,11 +831,12 @@ function sameInode(a, b) {
   return a.ino === b.ino && a.dev === b.dev
 }
 
-function openNoFollow(file, flags, expected) {
+function openNoFollow(file, flags, { uid, ino, dev }) {
   const before = lstatSync(file)
-  if (!before.isFile() || (expected && !sameInode(before, expected))) return null
+  if (!before.isFile() || (ino !== undefined && !sameInode(before, { ino, dev }))) return null
   const fd = openSync(file, flags | NOFOLLOW)
-  if (sameInode(fstatSync(fd), before)) return fd
+  const opened = fstatSync(fd)
+  if (sameInode(opened, before) && opened.nlink === 1 && opened.uid === uid) return fd
   closeSync(fd)
   return null
 }
@@ -866,11 +868,11 @@ export function snapshotConfigs(files) {
   })
 }
 
-function restoreLink({ file, link, target, mode, ino, dev }) {
+function restoreLink({ file, link, target, mode, ino, dev, uid }) {
   const now = lstatSync(file)
-  if (now.isSymbolicLink()) return realpathSync(file) === target && chmodNoFollow(target, mode, { ino, dev })
+  if (now.isSymbolicLink()) return realpathSync(file) === target && chmodNoFollow(target, mode, { ino, dev, uid })
   if (realpathSync(path.resolve(path.dirname(file), link)) !== target) return false
-  const source = openNoFollow(file, constants.O_RDONLY)
+  const source = openNoFollow(file, constants.O_RDONLY, { uid })
   if (source === null) return false
   let content
   try {
@@ -878,7 +880,7 @@ function restoreLink({ file, link, target, mode, ino, dev }) {
   } finally {
     closeSync(source)
   }
-  const fd = openNoFollow(target, constants.O_WRONLY, { ino, dev })
+  const fd = openNoFollow(target, constants.O_WRONLY, { ino, dev, uid })
   if (fd === null) return false
   try {
     ftruncateSync(fd, 0)
@@ -896,16 +898,12 @@ function restoreLink({ file, link, target, mode, ino, dev }) {
   return true
 }
 
-export function restoreConfigs(snapshots, { euid = process.geteuid?.(), warn = (message) => process.stderr.write(message) } = {}) {
+export function restoreConfigs(snapshots, { warn = (message) => process.stderr.write(message) } = {}) {
   for (const snapshot of snapshots) {
     const { file, link, mode, uid } = snapshot
-    if (euid === 0 && uid !== 0) {
-      warn(`gaze: running as root, so the mode${link === undefined ? '' : ' and symlink'} of ${file} were not restored; run \`gaze setup\` as its owner\n`)
-      continue
-    }
     let restored
     try {
-      restored = link === undefined ? chmodNoFollow(file, mode) : restoreLink(snapshot)
+      restored = link === undefined ? chmodNoFollow(file, mode, { uid }) : restoreLink(snapshot)
     } catch {
       restored = false
     }
@@ -913,13 +911,22 @@ export function restoreConfigs(snapshots, { euid = process.geteuid?.(), warn = (
       warn(`gaze: ${link === undefined ? file : `${file} -> ${snapshot.target}`} changed while gaze setup rewrote it, so its mode${link === undefined ? '' : ' and symlink'} were not restored; check it and run \`gaze setup\`\n`)
       continue
     }
+    const backup = `${file}.backup`
+    let backed
     try {
-      chmodNoFollow(`${file}.backup`, mode)
-    } catch {}
+      backed = chmodNoFollow(backup, mode, { uid })
+    } catch (error) {
+      backed = MISSING.has(error.code)
+    }
+    if (!backed) warn(`gaze: ${backup} is not a regular file owned by the owner of ${file} with a single link, so its mode was not restored; check it\n`)
   }
 }
 
-export async function refreshIntegrations(binary, { root = ROOT, env = process.env, install = {}, euid, warn = (message) => process.stderr.write(message) } = {}) {
+export async function refreshIntegrations(binary, { root = ROOT, env = process.env, install = {}, euid = process.geteuid?.(), warn = (message) => process.stderr.write(message) } = {}) {
+  if (euid === 0) {
+    warn('gaze: running as root; agent integrations were not refreshed. Run `gaze setup` as your user\n')
+    return false
+  }
   let kit
   let setup
   try {
@@ -947,7 +954,7 @@ export async function refreshIntegrations(binary, { root = ROOT, env = process.e
     warn(`gaze: could not point ${stale.join(', ')} at ${binary} (${error.message}); run \`gaze setup\` by hand\n`)
     ok = false
   } finally {
-    restoreConfigs(snapshots, { ...(euid === undefined ? {} : { euid }), warn })
+    restoreConfigs(snapshots, { warn })
   }
   for (const { file, refs } of staleConfigs(binary, kit.homes, root)) {
     warn(`gaze: ${file} still points to ${refs.join(', ')}; run \`gaze setup\`\n`)

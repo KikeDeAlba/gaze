@@ -16,6 +16,14 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VERSION = '9.9.9'
 const TARGETS = ['aarch64-apple-darwin', 'x86_64-unknown-linux-gnu', 'x86_64-pc-windows-msvc']
 const SUPPORTED = { 'darwin-arm64': 'aarch64-apple-darwin', 'linux-x64': 'x86_64-unknown-linux-gnu' }[`${process.platform}-${process.arch}`]
+const HOST = (() => {
+  try {
+    const target = resolveTarget(process.platform, process.arch)
+    return TARGETS.includes(target) ? target : undefined
+  } catch {
+    return undefined
+  }
+})()
 const SCRIPT = '#!/bin/sh\nif [ "$1 $2" = "daemon status" ]; then if [ -n "$GAZE_FAKE_INSTALLED" ]; then echo \'{"ok":true,"data":{"installed":true}}\'; fi; exit 0; fi\nif [ -n "$GAZE_FAKE_LOG" ]; then echo "$*" >> "$GAZE_FAKE_LOG"; fi\nif [ "$1" = "die" ]; then kill -TERM $$; fi\nif [ "$1" = "cat" ]; then exec cat; fi\necho "fake gaze $*"\nexit "${GAZE_FAKE_EXIT:-0}"\n'
 const REGISTERING_SCRIPT = `#!/bin/sh
 self="$(cd "$(dirname "$0")" && pwd -P)/gaze"
@@ -238,7 +246,7 @@ describe('ensureBinary', () => {
     const root = packageRoot()
     const binary = await install(root, { env: { GAZE_DOWNLOAD_BASE: `${base}/` } })
     assert.equal(binary, path.join(root, 'vendor', 'gaze'))
-    assert.equal(statSync(binary).mode & 0o777, 0o755)
+    if (process.platform !== 'win32') assert.equal(statSync(binary).mode & 0o777, 0o755)
     assert.equal(readFileSync(binary, 'utf8'), SCRIPT)
     assert.deepEqual(vendorEntries(root), ['.version', 'gaze'])
     assert.deepEqual(requests, [`/v${VERSION}/${asset('x86_64-unknown-linux-gnu')}`, `/files/${asset('x86_64-unknown-linux-gnu')}`])
@@ -839,10 +847,10 @@ describe('install.js', () => {
     const root = packageRoot()
     const result = await installScript(root, [], { GAZE_DOWNLOAD_BASE: `${base}/missing` })
     assert.equal(result.code, 1)
-    assert.match(result.stderr, SUPPORTED ? /^gaze: Cannot download .*HTTP 404/m : /^gaze: gaze has no prebuilt binary/m)
+    assert.match(result.stderr, HOST ? /^gaze: Cannot download .*HTTP 404/m : /^gaze: gaze has no prebuilt binary/m)
   })
 
-  test('--postinstall tolerates a network failure and defers the download', { skip: !SUPPORTED }, async () => {
+  test('--postinstall tolerates a network failure and defers the download', { skip: !HOST }, async () => {
     const root = packageRoot()
     const result = await installScript(root, ['--postinstall'], { GAZE_DOWNLOAD_BASE: `${base}/missing` })
     assert.equal(result.code, 0, result.stderr)
@@ -850,7 +858,7 @@ describe('install.js', () => {
     assert.deepEqual(vendorEntries(root), [])
   })
 
-  test('--postinstall fails on a checksum mismatch', { skip: !SUPPORTED }, async () => {
+  test('--postinstall fails on a checksum mismatch', { skip: !HOST }, async () => {
     const root = packageRoot({ hash: '0'.repeat(64) })
     const result = await installScript(root, ['--postinstall'])
     assert.notEqual(result.code, 0)
@@ -900,7 +908,7 @@ describe('install.js', () => {
     const root = packageRoot(null)
     const result = await installScript(root, ['--postinstall'])
     assert.notEqual(result.code, 0)
-    assert.match(result.stderr, SUPPORTED ? /checksums\.json is missing/ : /no prebuilt binary/)
+    assert.match(result.stderr, HOST ? /checksums\.json is missing/ : /no prebuilt binary/)
   })
 })
 
@@ -1400,7 +1408,7 @@ describe('agent integrations after a windows upgrade', () => {
   }
 
   function referenced(agentHome) {
-    return configs(agentHome).flatMap((text) => text.match(/\/[^"'\s]*\/vendor\/[^"'\s]*/g) ?? [])
+    return configs(agentHome).flatMap((text) => (text.match(/[^"'\s]*[\\/]vendor[\\/][^"'\s]*/g) ?? []).map((ref) => ref.replaceAll('\\\\', '\\')))
   }
 
   test('postinstall and repair point every integrated agent at the exe of the new version', async () => {

@@ -14,6 +14,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: the tag and the manifests have to agree
         run: |
@@ -32,7 +34,7 @@ jobs:
     needs: check
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +50,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: build dependencies for onnxruntime and native-tls
         if: runner.os == 'Linux'
@@ -80,11 +84,6 @@ jobs:
             archive="gaze-${version}-${{ matrix.target }}.tar.gz"
             tar -czf "$archive" -C "$release_dir" gaze
           fi
-          if command -v sha256sum > /dev/null; then
-            sha256sum "$archive" > "$archive.sha256"
-          else
-            shasum -a 256 "$archive" > "$archive.sha256"
-          fi
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
@@ -93,11 +92,30 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
-      - name: upload the assets to the release
+  upload:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: ${{ runner.temp }}/archives
+          merge-multiple: true
+
+      - name: upload the assets and their checksums to the release
         shell: bash
-        run: gh release upload "$GITHUB_REF_NAME" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+        working-directory: ${{ runner.temp }}/archives
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for file in gaze-*; do
+            sha256sum "$file" > "$file.sha256"
+          done
+          gh release upload "$GITHUB_REF_NAME" gaze-* --clobber --repo "$GITHUB_REPOSITORY"
 
   checksums:
     needs: build
@@ -181,12 +199,19 @@ jobs:
           import path from 'node:path'
           const root = path.resolve(process.argv[2])
           createServer((req, res) => {
-            const file = path.join(root, decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname))
+            let file
+            try {
+              file = path.join(root, decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname))
+            } catch {
+              res.writeHead(400).end()
+              return
+            }
             if (!file.startsWith(root + path.sep)) { res.writeHead(403).end(); return }
             try {
-              const size = statSync(file).size
-              res.writeHead(200, { 'content-length': size })
-              createReadStream(file).pipe(res)
+              const stats = statSync(file)
+              if (!stats.isFile()) { res.writeHead(404).end(); return }
+              res.writeHead(200, { 'content-length': stats.size })
+              createReadStream(file).on('error', () => res.destroy()).pipe(res)
             } catch {
               res.writeHead(404).end()
             }
@@ -212,8 +237,11 @@ jobs:
           expected="$(jq -r '.assets["x86_64-pc-windows-msvc"].sha256' npm/checksums.json)"
           test -f "$vendor/$version/gaze.exe"
           test -f "$vendor/$version/.verified"
-          if [ "$(head -c 64 "$vendor/$version/.verified")" != "$expected" ]; then
-            echo "the postinstall did not leave a .verified marker with $expected" >&2
+          marker="$vendor/$version/.verified"
+          actual_size="$(wc -c < "$vendor/$version/gaze.exe" | tr -d ' ')"
+          if [ "$(jq -r .sha256 "$marker")" != "$expected" ] || [ "$(jq -r .size "$marker")" != "$actual_size" ]; then
+            echo "the .verified marker does not match sha256 $expected and size $actual_size" >&2
+            cat "$marker" >&2
             exit 1
           fi
           prefix_unix="$(cygpath -u "$prefix")"
@@ -227,7 +255,7 @@ jobs:
           fi
 
   linux-smoke:
-    needs: checksums
+    needs: [checksums, upload]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -255,7 +283,7 @@ jobs:
           "$RUNNER_TEMP/prefix/bin/gaze" capabilities --json | jq -e .ok
 
   npm:
-    needs: [checksums, windows-smoke, linux-smoke]
+    needs: [checksums, upload, windows-smoke, linux-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: read

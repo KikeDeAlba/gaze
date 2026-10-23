@@ -202,3 +202,32 @@ fn inkwell_hook_exits_non_zero_when_a_change_fails() {
     assert_eq!(summary["changes"][1]["result"], "created");
     assert!(run(&["dp/ok.md"]).status.success());
 }
+
+#[cfg(unix)]
+#[test]
+fn serve_detach_logs_to_the_file_and_stops_on_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let log = dir.path().join("logs/serve.log");
+    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+        .args(["serve", "--detach", "--log"])
+        .arg(&log)
+        .env("GAZE_DATA_DIR", dir.path())
+        .env("GAZE_SOCKET", &socket)
+        .env("GAZE_EMBEDDER", "fake")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let started = std::time::Instant::now();
+    while gaze::daemon::ping(&socket).is_none() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "daemon never answered");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(gaze::daemon::shutdown(&socket));
+    let started = std::time::Instant::now();
+    while gaze::daemon::ping(&socket).is_some() {
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "daemon kept running");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(std::fs::read_to_string(&log).unwrap().contains("gaze serve listening on"));
+}

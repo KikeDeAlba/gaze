@@ -107,6 +107,10 @@ enum Command {
     Serve {
         #[arg(long)]
         idle_minutes: Option<u64>,
+        #[arg(long, help = "Escribe el log del daemon en esta ruta (con --detach, por omisión serve.log del directorio de datos)")]
+        log: Option<PathBuf>,
+        #[arg(long, help = "Se relanza en segundo plano sin consola y sale")]
+        detach: bool,
     },
     #[command(about = "Instala o quita el daemon (launchd, systemd --user o schtasks)")]
     Daemon {
@@ -634,8 +638,19 @@ fn main() {
             }
             return;
         }
-        Command::Serve { idle_minutes } => {
-            if let Err(error) = daemon::serve(idle_minutes) {
+        Command::Serve { idle_minutes, log, detach } => {
+            if detach {
+                let log = log.unwrap_or_else(paths::serve_log);
+                match daemon::spawn_detached(idle_minutes, &log) {
+                    Ok(pid) => println!("gaze serve en segundo plano con pid {pid}; log en {}", log.display()),
+                    Err(error) => {
+                        eprintln!("gaze serve --detach: {error:#}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            if let Err(error) = daemon::serve(idle_minutes, daemon::ServeLog::new(log)) {
                 eprintln!("gaze serve: {error:#}");
                 std::process::exit(1);
             }

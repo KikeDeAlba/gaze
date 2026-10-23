@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +26,7 @@ fn handle(model: &dyn Embedder, request: &Value) -> Value {
                 Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
             }
         }
+        "shutdown" => json!({"ok": true, "pid": std::process::id()}),
         other => json!({"ok": false, "error": format!("unknown op: {other}")}),
     }
 }
@@ -46,14 +47,82 @@ fn serve_connection<S: Read + Write>(model: &dyn Embedder, stream: S, last: &Ato
         let writer = reader.get_mut();
         writer.write_all(format!("{response}\n").as_bytes())?;
         writer.flush()?;
+        if is_shutdown(&line) {
+            ipc::cleanup(&paths::socket_path());
+            std::process::exit(0);
+        }
     }
+}
+
+fn is_shutdown(line: &str) -> bool {
+    serde_json::from_str::<Value>(line.trim_end()).is_ok_and(|request| request["op"] == "shutdown")
+}
+
+pub fn shutdown(path: &Path) -> bool {
+    embed::socket_request(path, &json!({"op": "shutdown"}), Duration::from_secs(2)).is_ok()
+}
+
+pub struct ServeLog(Option<PathBuf>);
+
+impl ServeLog {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self(path)
+    }
+
+    pub fn line(&self, message: &str) {
+        let line = format!("{} {message}", crate::text::now_iso());
+        let written = self.0.as_ref().is_some_and(|path| {
+            path.parent().is_none_or(|dir| std::fs::create_dir_all(dir).is_ok())
+                && std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut file| writeln!(file, "{line}")).is_ok()
+        });
+        if !written {
+            eprintln!("{line}");
+        }
+    }
+}
+
+pub fn serve_args(idle_minutes: Option<u64>) -> Vec<String> {
+    let mut args = vec!["serve".to_string()];
+    if let Some(minutes) = idle_minutes {
+        args.extend(["--idle-minutes".to_string(), minutes.to_string()]);
+    }
+    args
+}
+
+#[cfg(windows)]
+fn spawn_hidden(command: &mut Command) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    command.creation_flags(base | CREATE_BREAKAWAY_FROM_JOB);
+    command.spawn().or_else(|_| command.creation_flags(base).spawn())
+}
+
+#[cfg(unix)]
+fn spawn_hidden(command: &mut Command) -> std::io::Result<std::process::Child> {
+    crate::hooks::detach(command);
+    command.spawn()
+}
+
+pub fn spawn_detached(idle_minutes: Option<u64>, log: &Path) -> Result<u32> {
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(log).with_context(|| format!("open {}", log.display()))?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command.args(serve_args(idle_minutes)).stdin(std::process::Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    let child = spawn_hidden(&mut command).context("spawn gaze serve")?;
+    Ok(child.id())
 }
 
 pub fn ping(path: &Path) -> Option<Value> {
     embed::socket_request(path, &json!({"op": "ping"}), Duration::from_secs(2)).ok()
 }
 
-pub fn serve(idle_minutes: Option<u64>) -> Result<()> {
+pub fn serve(idle_minutes: Option<u64>, log: ServeLog) -> Result<()> {
     let socket = paths::socket_path();
     std::fs::create_dir_all(paths::data_dir())?;
     if ping(&socket).is_some() {
@@ -62,17 +131,18 @@ pub fn serve(idle_minutes: Option<u64>) -> Result<()> {
     let model: Arc<dyn Embedder> = if embed::fake_requested() { Arc::new(embed::FakeEmbedder) } else { Arc::new(LocalModel::load()?) };
     model.embed(&["warmup".to_string()], Mode::Query)?;
     let listener = ipc::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-    eprintln!("{} gaze serve listening on {}", crate::text::now_iso(), socket.display());
+    log.line(&format!("gaze serve listening on {}", socket.display()));
     let last = Arc::new(AtomicU64::new(now_secs() as u64));
     if let Some(minutes) = idle_minutes.filter(|m| *m > 0) {
         let last = last.clone();
         let socket = socket.clone();
+        let log = ServeLog::new(log.0.clone());
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 if now_secs() as u64 - last.load(Ordering::Relaxed) > minutes * 60 {
                     ipc::cleanup(&socket);
-                    eprintln!("{} gaze serve idle, exiting", crate::text::now_iso());
+                    log.line("gaze serve idle, exiting");
                     std::process::exit(0);
                 }
             }
@@ -396,7 +466,7 @@ pub fn uninstall_systemd(exec: &dyn Exec, unit: &Path) -> Result<bool> {
 }
 
 pub fn schtasks_command(bin: &str) -> String {
-    format!("\"{bin}\" serve")
+    format!("\"{bin}\" serve --detach")
 }
 
 pub fn install_schtasks(exec: &dyn Exec, bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
@@ -412,11 +482,12 @@ pub fn install_schtasks(exec: &dyn Exec, bin: &str, ready: &dyn Fn() -> bool) ->
     Ok(json!({"manager": "schtasks", "unit": TASK_NAME, "label": TASK_NAME, "ready": wait_ready(exec, ready)}))
 }
 
-pub fn uninstall_schtasks(exec: &dyn Exec) -> Result<bool> {
+pub fn uninstall_schtasks(exec: &dyn Exec, stop: &dyn Fn() -> bool) -> Result<bool> {
     if !exec.exec("schtasks", &["/Query", "/TN", TASK_NAME]).success {
         return Ok(false);
     }
     exec.exec("schtasks", &["/End", "/TN", TASK_NAME]);
+    stop();
     let deleted = exec.exec("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"]);
     if !deleted.success {
         return Err(anyhow!("schtasks /Delete falló: {}", deleted.stderr.trim()));
@@ -438,7 +509,7 @@ pub fn uninstall() -> Result<Value> {
     let removed = match manager {
         Manager::Launchd => remove(&SystemLaunchctl, &format!("{}/{LABEL}", domain()), &paths::launch_agent())?,
         Manager::Systemd => uninstall_systemd(&SystemExec, &paths::systemd_unit())?,
-        Manager::Schtasks => uninstall_schtasks(&SystemExec)?,
+        Manager::Schtasks => uninstall_schtasks(&SystemExec, &|| shutdown(&paths::socket_path()))?,
     };
     let mut result = json!({"manager": manager.name(), "unit": manager.unit(), "removed": removed});
     if manager == Manager::Launchd {
@@ -820,11 +891,34 @@ mod tests {
         let result = install_schtasks(&exec, r"C:\Users\k\gaze.exe", &|| true).unwrap();
         assert_eq!(result["ready"], true);
         let calls = exec.calls.borrow();
-        assert_eq!(calls[0], r#"schtasks /Create /SC ONLOGON /TN gaze-daemon /TR "C:\Users\k\gaze.exe" serve /RL LIMITED /F"#);
+        assert_eq!(calls[0], r#"schtasks /Create /SC ONLOGON /TN gaze-daemon /TR "C:\Users\k\gaze.exe" serve --detach /RL LIMITED /F"#);
         assert_eq!(calls[1], "schtasks /Run /TN gaze-daemon");
         drop(calls);
-        assert!(uninstall_schtasks(&exec).unwrap());
+        let stopped = Cell::new(false);
+        assert!(
+            uninstall_schtasks(&exec, &|| {
+                stopped.set(true);
+                true
+            })
+            .unwrap()
+        );
+        assert!(stopped.get());
         assert!(exec.calls.borrow().contains(&"schtasks /Delete /TN gaze-daemon /F".to_string()));
-        assert!(!uninstall_schtasks(&FakeExec::new(Some("ERROR: not found"))).unwrap());
+        assert!(!uninstall_schtasks(&FakeExec::new(Some("ERROR: not found")), &|| panic!("nothing to stop")).unwrap());
+    }
+
+    #[test]
+    fn serve_log_appends_lines_and_detects_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs/serve.log");
+        let log = ServeLog::new(Some(path.clone()));
+        log.line("one");
+        log.line("two");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.lines().count() == 2 && text.contains(" one\n") && text.ends_with(" two\n"), "{text}");
+        assert!(is_shutdown("{\"op\":\"shutdown\"}\n"));
+        assert!(!is_shutdown("{\"op\":\"ping\"}"));
+        assert_eq!(serve_args(Some(5)), ["serve", "--idle-minutes", "5"]);
+        assert_eq!(serve_args(None), ["serve"]);
     }
 }

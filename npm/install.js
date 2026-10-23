@@ -1,9 +1,9 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { accessSync, chmodSync, constants, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const SELF = fileURLToPath(import.meta.url)
 export const ROOT = path.dirname(path.dirname(SELF))
@@ -30,6 +30,18 @@ const REFRESH_TIMEOUT_MS = 180_000
 const REPAIR_RETRY_MS = 10 * 60 * 1000
 const ABANDONED_LOCK_MS = 60 * 60 * 1000
 const SETTLE_MS = 2000
+const BUSY = new Set(['EBUSY', 'EPERM', 'EACCES'])
+const BUSY_ATTEMPTS = 5
+const BUSY_DELAY_MS = 200
+const RECLAIM_GUARD_MS = 60 * 1000
+const VERSION_ENTRIES = new Set(['gaze.exe', '.verified'])
+const INTEGRATION_FILES = {
+  codex: (homes) => [path.join(homes.codex, 'hooks.json'), path.join(homes.codex, 'config.toml')],
+  gemini: (homes) => [path.join(homes.gemini, 'extensions', 'gaze', 'gemini-extension.json'), path.join(homes.gemini, 'extensions', 'gaze', 'hooks', 'hooks.json')],
+  opencode: (homes) => [path.join(homes.opencode, 'opencode.json'), path.join(homes.opencode, 'opencode.jsonc')],
+  antigravity: (homes) => [path.join(homes.antigravity, 'mcp_config.json')],
+  'claude-desktop': (homes) => (homes.claudeDesktop ? [path.join(homes.claudeDesktop, 'claude_desktop_config.json')] : []),
+}
 
 export class InstallError extends Error {
   constructor(message) {
@@ -115,25 +127,32 @@ function removeOtherVersions(vendor, version) {
   }
 }
 
-function matches(file, sha256) {
-  try {
-    return createHash('sha256').update(readFileSync(file)).digest('hex') === sha256
-  } catch {
-    return false
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function readBinary(file) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return readFileSync(file)
+    } catch (error) {
+      if (!BUSY.has(error.code)) return null
+      if (attempt >= BUSY_ATTEMPTS) throw new InstallError(`Cannot read ${file}: ${error.code}. Another process, usually an antivirus scan, keeps it open; run gaze again in a moment`)
+    }
+    await pause(BUSY_DELAY_MS)
   }
+}
+
+async function matches(file, sha256) {
+  const data = await readBinary(file)
+  return data !== null && createHash('sha256').update(data).digest('hex') === sha256
 }
 
 async function settled(file, sha256) {
   for (;;) {
-    if (matches(file, sha256)) return true
-    let stats
-    try {
-      stats = statSync(file)
-    } catch {
-      return false
-    }
-    if (Date.now() - stats.mtimeMs > SETTLE_MS) return false
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    const stats = regularFile(file)
+    if (!stats) return null
+    if (await matches(file, sha256)) return stats
+    if (Date.now() - stats.mtimeMs > SETTLE_MS) return null
+    await pause(100)
   }
 }
 
@@ -141,26 +160,52 @@ function verifiedMarker(binary) {
   return path.join(path.dirname(binary), '.verified')
 }
 
-function marked(binary, sha256) {
+function regularFile(file) {
   try {
-    return readFileSync(verifiedMarker(binary), 'utf8').trim() === sha256 && statSync(binary).isFile()
+    const stats = lstatSync(file)
+    return stats.isFile() ? stats : null
+  } catch {
+    return null
+  }
+}
+
+function sameFile(a, b) {
+  return a !== null && b !== null && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino
+}
+
+function marked(binary, sha256) {
+  const marker = verifiedMarker(binary)
+  const stats = regularFile(binary)
+  if (!stats || !regularFile(marker)) return false
+  try {
+    const mark = JSON.parse(readFileSync(marker, 'utf8'))
+    return mark?.sha256 === sha256 && mark.size === stats.size && mark.mtimeMs === stats.mtimeMs
   } catch {
     return false
   }
 }
 
-function markVerified(binary, sha256) {
+function markVerified(binary, sha256, verified) {
+  const stats = regularFile(binary)
+  if (!sameFile(stats, verified)) return
   const marker = verifiedMarker(binary)
+  const content = `${JSON.stringify({ sha256, size: stats.size, mtimeMs: stats.mtimeMs })}\n`
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      writeFileSync(marker, `${sha256}\n`, { flag: 'wx' })
+      writeFileSync(marker, content, { flag: 'wx' })
       return
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
     }
     if (marked(binary, sha256)) return
-    rmSync(marker, { force: true })
+    rmSync(marker, { recursive: true, force: true })
   }
+}
+
+function tryMarkVerified(binary, sha256, verified) {
+  try {
+    markVerified(binary, sha256, verified)
+  } catch {}
 }
 
 async function writeOnce(binary, data, sha256) {
@@ -169,16 +214,39 @@ async function writeOnce(binary, data, sha256) {
       writeFileSync(binary, data, { flag: 'wx' })
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
-      if (!(await settled(binary, sha256))) {
-        rmSync(verifiedMarker(binary), { force: true })
+      const verified = await settled(binary, sha256)
+      if (!verified) {
+        rmSync(verifiedMarker(binary), { recursive: true, force: true })
         rmSync(binary, { force: true })
         continue
       }
+      tryMarkVerified(binary, sha256, verified)
+      return
     }
-    markVerified(binary, sha256)
+    const written = regularFile(binary)
+    if (written?.size !== data.length) throw new InstallError(`Wrote ${data.length} bytes to ${binary}, but it has ${written?.size ?? 'no'} bytes on disk`)
+    tryMarkVerified(binary, sha256, written)
     return
   }
   throw new InstallError(`Cannot write ${binary}: another install keeps replacing it`)
+}
+
+function pruneVersionDir(dir) {
+  let entries
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (VERSION_ENTRIES.has(entry)) continue
+    const file = path.join(dir, entry)
+    try {
+      rmSync(file, { recursive: true, force: true })
+    } catch (error) {
+      throw new InstallError(`Cannot remove ${file}, which does not belong in ${dir}: ${error.code ?? error.message}. Delete it and run gaze again`)
+    }
+  }
 }
 
 function packageVersion(root) {
@@ -382,14 +450,14 @@ async function ensureVersionedBinary(binary, version, root, env, warn, options) 
   const vendor = path.dirname(path.dirname(binary))
   const target = resolveTarget(options.platform, options.arch)
   const { asset, sha256 } = readChecksum(root, version, target)
+  pruneVersionDir(path.dirname(binary))
   if (marked(binary, sha256)) {
     removeOtherVersions(vendor, version)
     return binary
   }
-  if (matches(binary, sha256)) {
-    try {
-      markVerified(binary, sha256)
-    } catch {}
+  const before = regularFile(binary)
+  if (before && (await matches(binary, sha256))) {
+    tryMarkVerified(binary, sha256, before)
     removeOtherVersions(vendor, version)
     return binary
   }
@@ -404,6 +472,7 @@ async function ensureVersionedBinary(binary, version, root, env, warn, options) 
   try {
     mkdirSync(path.dirname(binary), { recursive: true })
     removeOtherVersions(vendor, version)
+    pruneVersionDir(path.dirname(binary))
     await writeOnce(binary, data, sha256)
   } catch (error) {
     throw unwritable(error, vendor)
@@ -449,6 +518,10 @@ function vendorRoot(bin) {
   return null
 }
 
+function spawnDir(binary) {
+  return vendorRoot(binary) ?? path.dirname(binary)
+}
+
 function npmManaged(bin) {
   const root = vendorRoot(bin)
   return root !== null && readJson(path.join(root, 'package.json'))?.name === '@kikedealba/gaze'
@@ -480,7 +553,7 @@ export function daemonMarker(env = process.env) {
 }
 
 export function daemonStatus(binary, env = process.env) {
-  const result = spawnSync(binary, ['daemon', 'status', '--json'], { env, cwd: path.dirname(binary), stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, encoding: 'utf8' })
+  const result = spawnSync(binary, ['daemon', 'status', '--json'], { env, cwd: spawnDir(binary), stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, encoding: 'utf8' })
   try {
     const envelope = JSON.parse(String(result.stdout ?? '').trim())
     if (envelope?.ok === true && typeof envelope.data?.installed === 'boolean') return envelope.data
@@ -552,24 +625,79 @@ function lockOwner(file) {
   }
 }
 
-function reclaim(file, now) {
-  let stats
-  try {
-    stats = statSync(file)
-  } catch {
-    return true
-  }
+function staleLock(file, stats, now) {
   const age = now - stats.mtimeMs
-  if (age < REPAIR_RETRY_MS || (age < ABANDONED_LOCK_MS && alive(lockOwner(file)))) return false
+  return age >= ABANDONED_LOCK_MS || (age >= REPAIR_RETRY_MS && !alive(lockOwner(file)))
+}
+
+function reclaimByRename(file, before) {
+  const moved = `${file}.${process.pid}.${randomBytes(6).toString('hex')}`
   try {
-    rmSync(file, { force: true })
+    renameSync(file, moved)
   } catch {
     return false
   }
+  let after
+  try {
+    after = statSync(moved)
+  } catch {
+    return false
+  }
+  if (after.ino !== before.ino || after.mtimeMs !== before.mtimeMs) {
+    try {
+      linkSync(moved, file)
+    } catch {}
+    rmSync(moved, { force: true })
+    return false
+  }
+  rmSync(moved, { force: true })
   return true
 }
 
-function acquireLock(file, now = Date.now()) {
+function reclaimInPlace(file, before, now) {
+  const guard = `${file}.reclaim`
+  try {
+    mkdirSync(guard, { mode: 0o700 })
+  } catch (error) {
+    if (error.code !== 'EEXIST') return false
+    try {
+      if (now - statSync(guard).mtimeMs > RECLAIM_GUARD_MS) rmdirSync(guard)
+    } catch {}
+    return false
+  }
+  try {
+    let current
+    try {
+      current = statSync(file)
+    } catch {
+      return true
+    }
+    if (current.ino !== before.ino || current.mtimeMs !== before.mtimeMs) return false
+    try {
+      rmSync(file, { force: true })
+    } catch {
+      return false
+    }
+    return true
+  } finally {
+    try {
+      rmdirSync(guard)
+    } catch {}
+  }
+}
+
+function reclaim(file, now, platform) {
+  let before
+  try {
+    before = statSync(file)
+  } catch {
+    return true
+  }
+  if (!staleLock(file, before, now)) return false
+  return platform === 'win32' ? reclaimInPlace(file, before, now) : reclaimByRename(file, before)
+}
+
+export function acquireLock(file, { now = Date.now(), platform = process.platform } = {}) {
   try {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   } catch {
@@ -582,7 +710,7 @@ function acquireLock(file, now = Date.now()) {
     } catch (error) {
       if (error.code !== 'EEXIST') return false
     }
-    if (!reclaim(file, now)) return false
+    if (!reclaim(file, now, platform)) return false
   }
   return false
 }
@@ -602,20 +730,73 @@ export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
   return true
 }
 
-export function refreshRegistration(binary, { env = process.env, warn = (message) => process.stderr.write(message) } = {}) {
+function escapedForms(value) {
+  return [...new Set([value, JSON.stringify(value).slice(1, -1)])]
+}
+
+function referencesOtherBinary(text, prefixes, current) {
+  let rest = text
+  for (const form of current.flatMap(escapedForms)) rest = rest.replaceAll(form, '')
+  return prefixes.flatMap(escapedForms).some((prefix) => rest.includes(prefix))
+}
+
+export function staleIntegrations(binary, homes, root = ROOT) {
+  const prefixes = [...new Set([root, realpathOr(root)])].map((dir) => path.join(dir, 'vendor') + path.sep)
+  const current = [...new Set([binary, realpathOr(binary)])]
+  const stale = (file) => {
+    try {
+      return referencesOtherBinary(readFileSync(file, 'utf8'), prefixes, current)
+    } catch {
+      return false
+    }
+  }
+  return Object.entries(INTEGRATION_FILES)
+    .filter(([, files]) => files(homes).some(stale))
+    .map(([agent]) => agent)
+}
+
+export async function refreshIntegrations(binary, { root = ROOT, install = {}, warn = (message) => process.stderr.write(message) } = {}) {
+  let setup
+  let agents
+  let ctx
+  try {
+    agents = await import('@kikedealba/kit/agents')
+    ctx = install.ctx ?? (await import('@kikedealba/kit/platform')).platformContext()
+    setup = await import(pathToFileURL(path.join(root, 'npm', 'setup.js')).href)
+  } catch (error) {
+    if (error.code === 'ERR_MODULE_NOT_FOUND') return true
+    warn(`gaze: could not load the agent integrations (${error.message}); run \`gaze setup\` by hand\n`)
+    return false
+  }
+  const stale = staleIntegrations(binary, agents.agentHomes(ctx, install.homes), root)
+  if (stale.length === 0) return true
+  try {
+    const { steps } = await setup.installAgents(stale, { binary: realpathOr(binary) }, { ...install, ctx })
+    const failed = steps.filter((step) => step.state === 'failed')
+    if (failed.length === 0) return true
+    warn(`gaze: could not point ${failed.map((step) => `${step.agent} ${step.item}`).join(', ')} at ${binary} (${failed[0].detail}); run \`gaze setup\` by hand\n`)
+  } catch (error) {
+    warn(`gaze: could not point ${stale.join(', ')} at ${binary} (${error.message}); run \`gaze setup\` by hand\n`)
+  }
+  return false
+}
+
+export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, warn = (message) => process.stderr.write(message) } = {}) {
   const daemon = daemonInstalled(binary, env)
   const steps = []
   if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
   if (daemon) steps.push(['daemon', 'install'])
+  let refreshed = true
   for (const args of steps) {
-    const result = spawnSync(binary, args, { env, cwd: path.dirname(binary), stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
+    const result = spawnSync(binary, args, { env, cwd: spawnDir(binary), stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
     if (result.status !== 0) {
       const detail = (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
       warn(`gaze: could not refresh the daemon with \`gaze ${args.join(' ')}\` (${detail}); run \`gaze setup && gaze daemon install\` by hand\n`)
-      return false
+      refreshed = false
+      break
     }
   }
-  return true
+  return (await refreshIntegrations(binary, { root, install, warn })) && refreshed
 }
 
 async function repair(lock) {
@@ -623,7 +804,7 @@ async function repair(lock) {
   try {
     writeFileSync(lock, `${process.pid}\n`)
     const binary = await ensureBinary({ warn: (message) => problems.push(message.trim()) })
-    if (refreshRegistration(binary, { warn: (message) => problems.push(message.trim()) })) {
+    if (await refreshRegistration(binary, { warn: (message) => problems.push(message.trim()) })) {
       if (!needsRepair(binary)) {
         rmSync(lock, { force: true })
         return
@@ -641,7 +822,7 @@ async function main(mode, argument) {
   if (mode === '--repair') return repair(argument)
   try {
     const binary = await ensureBinary(mode === '--proxy-child' ? { root: argument } : {})
-    if (mode === '--postinstall') refreshRegistration(binary)
+    if (mode === '--postinstall') await refreshRegistration(binary)
   } catch (error) {
     if (mode === '--postinstall' && error instanceof NetworkError) {
       process.stderr.write(`gaze: could not download the binary during install (${error.message}); it will be downloaded the first time gaze runs\n`)

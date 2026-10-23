@@ -12,7 +12,8 @@ pub struct Dirs<F: Fn(&str) -> Option<PathBuf>> {
 
 impl<F: Fn(&str) -> Option<PathBuf>> Dirs<F> {
     pub fn home(&self) -> PathBuf {
-        (self.var)("HOME").or_else(|| (self.var)("USERPROFILE")).unwrap_or_else(|| PathBuf::from(if self.windows { r"C:\" } else { "/" }))
+        let (first, second) = if self.windows { ("USERPROFILE", "HOME") } else { ("HOME", "USERPROFILE") };
+        (self.var)(first).or_else(|| (self.var)(second)).unwrap_or_else(|| PathBuf::from(if self.windows { r"C:\" } else { "/" }))
     }
 
     pub fn config_home(&self) -> PathBuf {
@@ -92,6 +93,10 @@ pub fn harvest_log() -> PathBuf {
     data_dir().join("harvest.log")
 }
 
+pub fn harvest_dir() -> PathBuf {
+    data_dir().join("harvest")
+}
+
 pub fn serve_log() -> PathBuf {
     data_dir().join("serve.log")
 }
@@ -124,6 +129,10 @@ pub fn launch_agent() -> PathBuf {
     home().join("Library/LaunchAgents").join(format!("{}.plist", crate::daemon::LABEL))
 }
 
+pub fn daemon_marker() -> PathBuf {
+    data_dir().join("daemon.json")
+}
+
 pub fn systemd_unit() -> PathBuf {
     config_dir().join("systemd").join("user").join(crate::daemon::SYSTEMD_UNIT)
 }
@@ -141,6 +150,8 @@ mod tests {
     #[test]
     fn home_falls_back_to_userprofile() {
         assert_eq!(with(true, &[("USERPROFILE", r"C:\Users\kike")]).home(), PathBuf::from(r"C:\Users\kike"));
+        assert_eq!(with(true, &[("HOME", "/c/msys"), ("USERPROFILE", r"C:\Users\kike")]).home(), PathBuf::from(r"C:\Users\kike"));
+        assert_eq!(with(true, &[("HOME", "/c/msys")]).home(), PathBuf::from("/c/msys"));
         assert_eq!(with(false, &[("HOME", "/home/kike"), ("USERPROFILE", "x")]).home(), PathBuf::from("/home/kike"));
     }
 

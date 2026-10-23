@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ fn serve_connection<S: Read + Write>(model: &dyn Embedder, stream: S, last: &Ato
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if ipc::read_line_capped(&mut reader, &mut line)? == 0 {
             return Ok(());
         }
         last.store(now_secs() as u64, Ordering::Relaxed);
@@ -158,8 +158,47 @@ pub fn serve(idle_minutes: Option<u64>, log: ServeLog) -> Result<()> {
     }
 }
 
+pub fn xml_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+}
+
+pub fn xml_unescape(value: &str) -> String {
+    value.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 pub fn render_plist(bin: &str) -> String {
-    PLIST_TEMPLATE.replace("{{BIN}}", bin).replace("{{HOME}}", &paths::home().to_string_lossy()).replace("{{LOG}}", &paths::serve_log().to_string_lossy())
+    PLIST_TEMPLATE
+        .replace("{{BIN}}", &xml_escape(bin))
+        .replace("{{HOME}}", &xml_escape(&paths::home().to_string_lossy()))
+        .replace("{{LOG}}", &xml_escape(&paths::serve_log().to_string_lossy()))
+}
+
+pub fn plist_bin(plist: &str) -> Option<String> {
+    let after = &plist[plist.find("<key>ProgramArguments</key>")?..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")?;
+    Some(xml_unescape(&after[start..start + end]))
+}
+
+pub fn systemd_bin(unit: &str) -> Option<String> {
+    let value = unit.lines().find_map(|line| line.strip_prefix("ExecStart="))?;
+    let quoted = value.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            '"' => return Some(out.replace("%%", "%").replace("$$", "$")),
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+pub fn schtasks_bin(xml: &str) -> Option<String> {
+    let start = xml.find("<Command>")? + "<Command>".len();
+    let end = xml[start..].find("</Command>")?;
+    Some(xml_unescape(xml[start..start + end].trim()).trim_matches('"').to_string())
 }
 
 pub struct CommandOutput {
@@ -377,8 +416,9 @@ pub fn install() -> Result<Value> {
     let mut result = match Manager::current() {
         Manager::Launchd => install_launchd(&bin, &ready)?,
         Manager::Systemd => install_systemd(&SystemExec, &paths::systemd_unit(), &bin, &ready)?,
-        Manager::Schtasks => install_schtasks(&SystemExec, &bin, &ready)?,
+        Manager::Schtasks => install_schtasks(&SystemExec, &bin, &ready, &|| shutdown(&socket))?,
     };
+    write_marker(&json!({"manager": result["manager"], "unit": result["unit"], "bin": bin}))?;
     result["socket"] = json!(socket);
     result["bin"] = json!(bin);
     result["log"] = json!(paths::serve_log());
@@ -399,15 +439,32 @@ fn install_launchd(bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
     Ok(json!({"manager": "launchd", "unit": plist, "plist": plist, "label": LABEL, "pid": started.pid, "ready": started.ready}))
 }
 
-fn systemd_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+fn reject_control(value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(anyhow!("la ruta {value:?} tiene caracteres de control; no se puede escribir en una unidad de systemd"));
+    }
+    Ok(())
 }
 
-pub fn render_systemd_unit(bin: &str, log: &str) -> String {
-    format!(
+pub fn systemd_quote(value: &str) -> Result<String> {
+    reject_control(value)?;
+    Ok(format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replace('$', "$$")))
+}
+
+pub fn systemd_path(value: &str) -> Result<String> {
+    reject_control(value)?;
+    if !value.starts_with('/') {
+        return Err(anyhow!("la ruta del log debe ser absoluta: {value}"));
+    }
+    Ok(value.replace('%', "%%"))
+}
+
+pub fn render_systemd_unit(bin: &str, log: &str) -> Result<String> {
+    let log = systemd_path(log)?;
+    Ok(format!(
         "[Unit]\nDescription=gaze embedding daemon\n\n[Service]\nExecStart={} serve\nRestart=on-failure\nRestartSec=5\nStandardOutput=append:{log}\nStandardError=append:{log}\n\n[Install]\nWantedBy=default.target\n",
-        systemd_quote(bin)
-    )
+        systemd_quote(bin)?
+    ))
 }
 
 pub fn missing_user_bus(output: &CommandOutput) -> bool {
@@ -430,7 +487,7 @@ fn systemd_pid(exec: &dyn Exec) -> Option<u32> {
 
 pub fn install_systemd(exec: &dyn Exec, unit: &Path, bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
     std::fs::create_dir_all(unit.parent().context("unit dir")?)?;
-    std::fs::write(unit, render_systemd_unit(bin, &paths::serve_log().to_string_lossy()))?;
+    std::fs::write(unit, render_systemd_unit(bin, &paths::serve_log().to_string_lossy())?)?;
     let base = json!({"manager": "systemd", "unit": unit, "label": SYSTEMD_UNIT});
     for args in [&["daemon-reload"][..], &["enable", "--now", SYSTEMD_UNIT][..]] {
         let output = systemctl(exec, args);
@@ -469,12 +526,16 @@ pub fn schtasks_command(bin: &str) -> String {
     format!("\"{bin}\" serve --detach")
 }
 
-pub fn install_schtasks(exec: &dyn Exec, bin: &str, ready: &dyn Fn() -> bool) -> Result<Value> {
+pub fn install_schtasks(exec: &dyn Exec, bin: &str, ready: &dyn Fn() -> bool, stop: &dyn Fn() -> bool) -> Result<Value> {
+    if bin.contains('"') {
+        return Err(anyhow!("la ruta del binario no puede tener comillas: {bin}"));
+    }
     let command = schtasks_command(bin);
     let created = exec.exec("schtasks", &["/Create", "/SC", "ONLOGON", "/TN", TASK_NAME, "/TR", &command, "/RL", "LIMITED", "/F"]);
     if !created.success {
         return Err(anyhow!("schtasks /Create falló: {}", created.stderr.trim()));
     }
+    stop();
     let run = exec.exec("schtasks", &["/Run", "/TN", TASK_NAME]);
     if !run.success {
         return Err(anyhow!("schtasks /Run falló: {}", run.stderr.trim()));
@@ -511,6 +572,7 @@ pub fn uninstall() -> Result<Value> {
         Manager::Systemd => uninstall_systemd(&SystemExec, &paths::systemd_unit())?,
         Manager::Schtasks => uninstall_schtasks(&SystemExec, &|| shutdown(&paths::socket_path()))?,
     };
+    let _ = std::fs::remove_file(paths::daemon_marker());
     let mut result = json!({"manager": manager.name(), "unit": manager.unit(), "removed": removed});
     if manager == Manager::Launchd {
         result["plist"] = json!(paths::launch_agent());
@@ -548,6 +610,25 @@ fn service_state(manager: Manager, exec: &dyn Exec) -> (bool, JobState) {
     }
 }
 
+fn write_marker(value: &Value) -> Result<()> {
+    let marker = paths::daemon_marker();
+    let temporary = marker.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, format!("{value}\n"))?;
+    std::fs::rename(&temporary, &marker)?;
+    Ok(())
+}
+
+fn unit_bin(manager: Manager, exec: &dyn Exec) -> Option<String> {
+    match manager {
+        Manager::Launchd => plist_bin(&std::fs::read_to_string(paths::launch_agent()).ok()?),
+        Manager::Systemd => systemd_bin(&std::fs::read_to_string(paths::systemd_unit()).ok()?),
+        Manager::Schtasks => {
+            let query = exec.exec("schtasks", &["/Query", "/TN", TASK_NAME, "/XML"]);
+            if query.success { schtasks_bin(&query.stdout) } else { None }
+        }
+    }
+}
+
 pub fn status() -> Value {
     let socket = paths::socket_path();
     let alive = ping(&socket);
@@ -564,6 +645,7 @@ pub fn status() -> Value {
         "manager": manager.name(),
         "unit": manager.unit(),
         "installed": installed,
+        "unitBin": if installed { unit_bin(manager, &SystemExec) } else { None },
         "launchAgent": installed,
         "loaded": matches!(job, JobState::Loaded { .. }),
         "managerPid": manager_pid,
@@ -848,7 +930,7 @@ mod tests {
 
     #[test]
     fn systemd_unit_quotes_the_binary_and_logs_to_the_serve_log() {
-        let unit = render_systemd_unit("/opt/my gaze/gaze", "/home/k/.local/share/gaze/serve.log");
+        let unit = render_systemd_unit("/opt/my gaze/gaze", "/home/k/.local/share/gaze/serve.log").unwrap();
         assert!(unit.contains("ExecStart=\"/opt/my gaze/gaze\" serve\n"), "{unit}");
         assert!(unit.contains("StandardOutput=append:/home/k/.local/share/gaze/serve.log"));
         assert!(unit.contains("WantedBy=default.target"));
@@ -888,7 +970,14 @@ mod tests {
     #[test]
     fn schtasks_install_creates_a_logon_task_and_runs_it() {
         let exec = FakeExec::new(None);
-        let result = install_schtasks(&exec, r"C:\Users\k\gaze.exe", &|| true).unwrap();
+        let stopped_before_run = Cell::new(false);
+        let result = install_schtasks(&exec, r"C:\Users\k\gaze.exe", &|| true, &|| {
+            stopped_before_run.set(exec.calls.borrow().len() == 1);
+            true
+        })
+        .unwrap();
+        assert!(stopped_before_run.get());
+        assert!(install_schtasks(&exec, "C:\\a\"b.exe", &|| true, &|| true).is_err());
         assert_eq!(result["ready"], true);
         let calls = exec.calls.borrow();
         assert_eq!(calls[0], r#"schtasks /Create /SC ONLOGON /TN gaze-daemon /TR "C:\Users\k\gaze.exe" serve --detach /RL LIMITED /F"#);
@@ -920,5 +1009,21 @@ mod tests {
         assert!(!is_shutdown("{\"op\":\"ping\"}"));
         assert_eq!(serve_args(Some(5)), ["serve", "--idle-minutes", "5"]);
         assert_eq!(serve_args(None), ["serve"]);
+    }
+
+    #[test]
+    fn unit_values_are_escaped_and_read_back() {
+        let tricky = "/opt/100% $HOME/\"q\"\\x/gaze";
+        let unit = render_systemd_unit(tricky, "/var/log/50%/serve.log").unwrap();
+        assert!(unit.contains("ExecStart=\"/opt/100%% $$HOME/\\\"q\\\"\\\\x/gaze\" serve\n"), "{unit}");
+        assert!(unit.contains("StandardOutput=append:/var/log/50%%/serve.log\n"));
+        assert_eq!(systemd_bin(&unit).as_deref(), Some(tricky));
+        assert!(render_systemd_unit("/opt/a\nExecStartPre=/bin/evil", "/l").is_err());
+        assert!(render_systemd_unit("/opt/gaze", "relative.log").is_err());
+        let plist = PLIST_TEMPLATE.replace("{{BIN}}", &xml_escape("/opt/a&b<c>/gaze")).replace("{{HOME}}", "/h").replace("{{LOG}}", "/l");
+        assert!(plist.contains("<string>/opt/a&amp;b&lt;c&gt;/gaze</string>"));
+        assert_eq!(plist_bin(&plist).as_deref(), Some("/opt/a&b<c>/gaze"));
+        let xml = "<Exec>\n<Command>\"C:\\Program Files\\gaze.exe\"</Command>\n<Arguments>serve --detach</Arguments></Exec>";
+        assert_eq!(schtasks_bin(xml).as_deref(), Some("C:\\Program Files\\gaze.exe"));
     }
 }

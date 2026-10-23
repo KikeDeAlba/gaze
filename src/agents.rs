@@ -157,16 +157,68 @@ pub fn invocation(agent: Agent, bin: &str, prompt: &str, model: Option<&str>, cw
     Invocation { program: bin.to_string(), args, stdin, env }
 }
 
-pub const ENV_NAMES: [&str; 12] =
-    ["PATH", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemRoot", "SYSTEMROOT", "TMP", "TEMP", "TMPDIR", "LANG", "ComSpec"];
-pub const ENV_PREFIXES: [&str; 10] = ["LC_", "XDG_", "ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_", "GEMINI_", "GOOGLE_", "OPENCODE_", "ANTIGRAVITY_"];
+pub const BASE_ENV: [&str; 30] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "TERM",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SystemRoot",
+    "ComSpec",
+    "PATHEXT",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    HEADLESS_ENV,
+    "SystemDrive",
+    "windir",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+];
+pub const BASE_PREFIXES: [&str; 3] = ["LC_", "XDG_", "NVM_"];
 
-pub fn allowed_env(name: &str) -> bool {
-    ENV_NAMES.iter().any(|allowed| allowed.eq_ignore_ascii_case(name)) || ENV_PREFIXES.iter().any(|prefix| name.to_ascii_uppercase().starts_with(prefix))
+fn agent_allows(agent: Agent, name: &str, present: &dyn Fn(&str) -> bool) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let has = |prefix: &str| upper.starts_with(prefix);
+    match agent {
+        Agent::Claude => {
+            has("ANTHROPIC_")
+                || has("CLAUDE_")
+                || (present("CLAUDE_CODE_USE_BEDROCK") && has("AWS_"))
+                || (present("CLAUDE_CODE_USE_VERTEX") && (has("GOOGLE_") || upper == "CLOUD_ML_REGION"))
+        }
+        Agent::Codex => has("OPENAI_") || has("CODEX_"),
+        Agent::Gemini => has("GEMINI_") || (has("GOOGLE_") && (upper != "GOOGLE_APPLICATION_CREDENTIALS" || present("GOOGLE_GENAI_USE_VERTEXAI"))),
+        Agent::Antigravity => has("ANTIGRAVITY_") || has("GEMINI_"),
+        Agent::Opencode => has("OPENCODE_"),
+    }
 }
 
-pub fn child_env(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    vars.into_iter().filter(|(name, _)| name.to_str().is_some_and(allowed_env)).collect()
+pub fn allowed_env(agent: Agent, name: &str, present: &dyn Fn(&str) -> bool) -> bool {
+    BASE_ENV.iter().any(|allowed| allowed.eq_ignore_ascii_case(name))
+        || BASE_PREFIXES.iter().any(|prefix| name.to_ascii_uppercase().starts_with(prefix))
+        || agent_allows(agent, name, present)
+}
+
+pub fn child_env(agent: Agent, vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let vars: Vec<_> = vars.into_iter().collect();
+    let names: Vec<String> = vars.iter().filter(|(_, v)| !v.is_empty()).filter_map(|(k, _)| k.to_str().map(str::to_ascii_uppercase)).collect();
+    let present = |wanted: &str| names.iter().any(|name| name == wanted);
+    vars.into_iter().filter(|(name, _)| name.to_str().is_some_and(|name| allowed_env(agent, name, &present))).collect()
 }
 
 fn lenient_json(stdout: &str) -> Option<Value> {
@@ -235,14 +287,70 @@ pub enum Outcome {
     Failed(String),
 }
 
-fn drain<R: Read + Send + 'static>(source: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+struct Drain {
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+fn drain<R: Read + Send + 'static>(source: Option<R>) -> Drain {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (sender, done) = std::sync::mpsc::channel();
+    let sink = buffer.clone();
     std::thread::spawn(move || {
-        let mut out = Vec::new();
         if let Some(mut source) = source {
-            let _ = source.read_to_end(&mut out);
+            let mut chunk = [0u8; 64 * 1024];
+            while let Ok(read) = source.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut out) = sink.lock() {
+                    out.extend_from_slice(&chunk[..read]);
+                }
+            }
         }
-        out
-    })
+        let _ = sender.send(());
+    });
+    Drain { buffer, done }
+}
+
+impl Drain {
+    fn finished(&self, wait: Duration) -> bool {
+        !matches!(self.done.recv_timeout(wait), Err(std::sync::mpsc::RecvTimeoutError::Timeout))
+    }
+
+    fn text(&self) -> String {
+        self.buffer.lock().map(|out| String::from_utf8_lossy(&out).into_owned()).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+fn own_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn own_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+fn kill_group(pid: u32) {
+    let pid = pid.to_string();
+    #[cfg(unix)]
+    let _ = Command::new("kill").args(["-KILL", &format!("-{pid}")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
+fn kill_tree(child: &mut std::process::Child) {
+    kill_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn run(agent: Agent, prompt: &str, model: Option<&str>, cwd: &Path, timeout: Duration, extra_env: &[(&str, &str)]) -> Result<Outcome> {
@@ -252,7 +360,8 @@ pub fn run(agent: Agent, prompt: &str, model: Option<&str>, cwd: &Path, timeout:
     let spec = invocation(agent, &program.to_string_lossy(), prompt, model, cwd);
     let mut command = Command::new(&program);
     command.args(&spec.args).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).env_clear();
-    command.envs(child_env(std::env::vars_os()));
+    command.envs(child_env(agent, std::env::vars_os()));
+    own_group(&mut command);
     for (key, value) in extra_env.iter().copied().chain(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
         command.env(key, value);
     }
@@ -277,15 +386,20 @@ pub fn run(agent: Agent, prompt: &str, model: Option<&str>, cwd: &Path, timeout:
             break status;
         }
         if started.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return Ok(Outcome::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let written = writer.join().unwrap_or(Ok(()));
-    let stdout = String::from_utf8_lossy(&stdout.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+    let deadline = Instant::now() + DRAIN_GRACE;
+    if !stdout.finished(DRAIN_GRACE) | !stderr.finished(deadline.saturating_duration_since(Instant::now())) {
+        kill_group(child.id());
+        stdout.finished(Duration::from_millis(500));
+        stderr.finished(Duration::from_millis(500));
+    }
+    let stdout = stdout.text();
+    let stderr = stderr.text();
+    let written = if writer.is_finished() { writer.join().unwrap_or(Ok(())) } else { Ok(()) };
     if !status.success() {
         return Ok(Outcome::Failed(stderr));
     }
@@ -352,24 +466,30 @@ mod tests {
         }
     }
 
+    fn kept(agent: Agent, names: &[&str]) -> Vec<String> {
+        let vars = names.iter().map(|name| (std::ffi::OsString::from(name), std::ffi::OsString::from("v")));
+        child_env(agent, vars).into_iter().map(|(k, _)| k.into_string().unwrap()).collect()
+    }
+
     #[test]
-    fn child_env_keeps_only_the_allow_list() {
-        let vars = [
-            "PATH",
-            "HOME",
-            "Path",
-            "SystemRoot",
-            "LC_ALL",
-            "XDG_CONFIG_HOME",
-            "ANTHROPIC_API_KEY",
-            "GOOGLE_CLOUD_PROJECT",
-            "AWS_SECRET_ACCESS_KEY",
-            "GITHUB_TOKEN",
-            "NPM_TOKEN",
-        ]
-        .map(|name| (std::ffi::OsString::from(name), std::ffi::OsString::from("v")));
-        let kept: Vec<String> = child_env(vars).into_iter().map(|(k, _)| k.into_string().unwrap()).collect();
-        assert_eq!(kept, ["PATH", "HOME", "Path", "SystemRoot", "LC_ALL", "XDG_CONFIG_HOME", "ANTHROPIC_API_KEY", "GOOGLE_CLOUD_PROJECT"]);
+    fn child_env_only_carries_the_invoked_agent_credentials() {
+        let common = ["PATH", "HOME", "USER", "https_proxy", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "LC_ALL", "NVM_DIR"];
+        let secrets =
+            ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "NPM_TOKEN"];
+        let all: Vec<&str> = common.iter().chain(secrets.iter()).copied().collect();
+        let claude = kept(Agent::Claude, &all);
+        assert_eq!(claude, [&common[..], &["ANTHROPIC_API_KEY"]].concat());
+        assert!(!claude.contains(&"OPENAI_API_KEY".to_string()));
+        assert_eq!(kept(Agent::Codex, &all), [&common[..], &["OPENAI_API_KEY"]].concat());
+        assert_eq!(kept(Agent::Gemini, &all), [&common[..], &["GEMINI_API_KEY"]].concat());
+        assert_eq!(kept(Agent::Antigravity, &all), [&common[..], &["GEMINI_API_KEY"]].concat());
+        assert_eq!(kept(Agent::Opencode, &all), common);
+        let bedrock = kept(Agent::Claude, &["CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "GOOGLE_CLOUD_PROJECT"]);
+        assert_eq!(bedrock, ["CLAUDE_CODE_USE_BEDROCK", "AWS_REGION"]);
+        let vertex = kept(Agent::Claude, &["CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION", "GOOGLE_CLOUD_PROJECT", "AWS_REGION"]);
+        assert_eq!(vertex, ["CLAUDE_CODE_USE_VERTEX", "CLOUD_ML_REGION", "GOOGLE_CLOUD_PROJECT"]);
+        let genai = kept(Agent::Gemini, &["GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_APPLICATION_CREDENTIALS"]);
+        assert_eq!(genai, ["GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_APPLICATION_CREDENTIALS"]);
     }
 
     #[test]
@@ -428,13 +548,24 @@ mod tests {
         let guard = script("guard", "cat >/dev/null\nprintf '{\"result\":\"%s|%s\"}' \"$KIT_HEADLESS\" \"${GITHUB_TOKEN:-none}\"");
         let noisy = script("noisy", "head -c 2000000 /dev/zero | tr '\\0' x >&2\ncat >/dev/null\nprintf '{\"result\":\"ok\"}'");
         let deaf = script("deaf", "printf '{\"result\":\"early\"}'");
+        let lingering = script("lingering", "cat >/dev/null\n(sleep 30) &\nprintf '{\"result\":\"done\"}'");
+        let stuck = script("stuck", "sleep 30 &\nsleep 30\n");
         let failing = script("failing", "cat >/dev/null\necho boom >&2\nexit 3");
         let big = "y".repeat(4_000_000);
         unsafe { std::env::set_var("GITHUB_TOKEN", "leak") };
-        let cases: [(&PathBuf, &str, &str); 4] = [(&guard, "hola", "1|none"), (&noisy, &big, "ok"), (&deaf, &big, "early"), (&failing, "x", "FAILED:boom")];
-        for (bin, prompt, expected) in cases {
+        let cases: [(&PathBuf, &str, &str, u64); 6] = [
+            (&guard, "hola", "1|none", 20),
+            (&noisy, &big, "ok", 20),
+            (&deaf, &big, "early", 20),
+            (&failing, "x", "FAILED:boom", 20),
+            (&lingering, "x", "done", 20),
+            (&stuck, "x", "TIMEOUT", 1),
+        ];
+        for (bin, prompt, expected, seconds) in cases {
             unsafe { std::env::set_var("GAZE_HARVEST_BIN", bin) };
-            let outcome = run(Agent::Claude, prompt, None, dir.path(), Duration::from_secs(20), &[]).unwrap();
+            let started = Instant::now();
+            let outcome = run(Agent::Claude, prompt, None, dir.path(), Duration::from_secs(seconds), &[]).unwrap();
+            assert!(started.elapsed() < Duration::from_secs(15), "{} took {:?}", bin.display(), started.elapsed());
             let got = match outcome {
                 Outcome::Text(text) => text,
                 Outcome::Failed(stderr) => format!("FAILED:{}", stderr.trim()),

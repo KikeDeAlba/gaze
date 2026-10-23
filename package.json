@@ -1,6 +1,6 @@
 {
   "name": "@kikedealba/gaze",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Per-project brain for coding agents: local knowledge store with hybrid vector search",
   "license": "MIT",
   "author": "Jesus Enrique De Alba Gaytan",
@@ -56,6 +56,6 @@
     "test:npm": "node --test \"npm/*.test.js\""
   },
   "dependencies": {
-    "@kikedealba/kit": "^0.7.0"
+    "@kikedealba/kit": "^0.7.1"
   }
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_LINE: u64 = 1024 * 1024;
+pub const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 
 pub fn pipe_name(endpoint: &Path) -> String {
     let raw = endpoint.to_string_lossy();
@@ -16,9 +17,13 @@ pub fn pipe_name(endpoint: &Path) -> String {
 }
 
 pub fn read_line_capped<R: BufRead>(reader: &mut R, line: &mut String) -> io::Result<usize> {
-    let read = reader.by_ref().take(MAX_LINE + 1).read_line(line)?;
-    if read as u64 > MAX_LINE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("line over {MAX_LINE} bytes")));
+    read_line_within(reader, line, MAX_LINE)
+}
+
+pub fn read_line_within<R: BufRead>(reader: &mut R, line: &mut String, cap: u64) -> io::Result<usize> {
+    let read = reader.by_ref().take(cap + 1).read_line(line)?;
+    if read as u64 > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("line over {cap} bytes")));
     }
     Ok(read)
 }
@@ -28,14 +33,14 @@ fn exchange<S: Read + Write>(stream: S, line: &[u8]) -> io::Result<String> {
     reader.get_mut().write_all(line)?;
     reader.get_mut().flush()?;
     let mut response = String::new();
-    read_line_capped(&mut reader, &mut response)?;
+    read_line_within(&mut reader, &mut response, MAX_RESPONSE)?;
     Ok(response)
 }
 
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     pub type Stream = UnixStream;
@@ -58,13 +63,32 @@ mod imp {
     }
 
     pub fn bind(endpoint: &Path) -> io::Result<Listener> {
-        if let Some(parent) = endpoint.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let fresh = !parent.exists();
-            std::fs::create_dir_all(parent)?;
-            if fresh || parent == crate::paths::data_dir() {
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
+        let parent = endpoint.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let fresh = !parent.exists();
+        std::fs::create_dir_all(parent)?;
+        if fresh || parent == crate::paths::data_dir() {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let staging = parent.join(format!(".g{:x}", (std::process::id() << 12) ^ nonce));
+        std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+        let staged = staging.join("s");
+        let bound = UnixListener::bind(&staged).and_then(|listener| {
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+            if endpoint.exists() {
+                std::fs::remove_file(endpoint)?;
+            }
+            std::fs::rename(&staged, endpoint)?;
+            Ok(listener)
+        });
+        let _ = std::fs::remove_dir_all(&staging);
+        match bound {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => bind_in_place(endpoint),
+            other => other.map(Listener),
+        }
+    }
+
+    fn bind_in_place(endpoint: &Path) -> io::Result<Listener> {
         if endpoint.exists() {
             std::fs::remove_file(endpoint)?;
         }
@@ -256,6 +280,9 @@ mod tests {
         let mut reader = BufReader::new(&big[..]);
         let mut line = String::new();
         assert_eq!(read_line_capped(&mut reader, &mut line).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let mut within = BufReader::new(&big[..]);
+        let mut long = String::new();
+        assert_eq!(read_line_within(&mut within, &mut long, MAX_RESPONSE).unwrap(), big.len());
         let mut ok = BufReader::new(&b"hola\nmundo\n"[..]);
         let mut first = String::new();
         read_line_capped(&mut ok, &mut first).unwrap();

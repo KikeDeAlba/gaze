@@ -137,16 +137,46 @@ async function settled(file, sha256) {
   }
 }
 
-async function writeOnce(binary, data, sha256) {
+function verifiedMarker(binary) {
+  return path.join(path.dirname(binary), '.verified')
+}
+
+function marked(binary, sha256) {
+  try {
+    return readFileSync(verifiedMarker(binary), 'utf8').trim() === sha256 && statSync(binary).isFile()
+  } catch {
+    return false
+  }
+}
+
+function markVerified(binary, sha256) {
+  const marker = verifiedMarker(binary)
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      writeFileSync(binary, data, { flag: 'wx' })
+      writeFileSync(marker, `${sha256}\n`, { flag: 'wx' })
       return
     } catch (error) {
       if (error.code !== 'EEXIST') throw error
     }
-    if (await settled(binary, sha256)) return
-    rmSync(binary, { force: true })
+    if (marked(binary, sha256)) return
+    rmSync(marker, { force: true })
+  }
+}
+
+async function writeOnce(binary, data, sha256) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(binary, data, { flag: 'wx' })
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+      if (!(await settled(binary, sha256))) {
+        rmSync(verifiedMarker(binary), { force: true })
+        rmSync(binary, { force: true })
+        continue
+      }
+    }
+    markVerified(binary, sha256)
+    return
   }
   throw new InstallError(`Cannot write ${binary}: another install keeps replacing it`)
 }
@@ -352,7 +382,14 @@ async function ensureVersionedBinary(binary, version, root, env, warn, options) 
   const vendor = path.dirname(path.dirname(binary))
   const target = resolveTarget(options.platform, options.arch)
   const { asset, sha256 } = readChecksum(root, version, target)
+  if (marked(binary, sha256)) {
+    removeOtherVersions(vendor, version)
+    return binary
+  }
   if (matches(binary, sha256)) {
+    try {
+      markVerified(binary, sha256)
+    } catch {}
     removeOtherVersions(vendor, version)
     return binary
   }

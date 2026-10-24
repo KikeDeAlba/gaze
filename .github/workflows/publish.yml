@@ -86,7 +86,7 @@ jobs:
           fi
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -154,7 +154,7 @@ jobs:
           jq -e 'all(.assets[]; .sha256 | test("^[0-9a-f]{64}$"))' npm/checksums.json
           jq -e '.assets["x86_64-pc-windows-msvc"].file | endswith(".exe")' npm/checksums.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: npm-checksums
           path: npm/checksums.json

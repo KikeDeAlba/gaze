@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +55,7 @@ jobs:
           node-version: 24
 
       - name: versions have to agree
+        shell: bash
         run: |
           cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
           npm_version="$(jq -r .version package.json)"

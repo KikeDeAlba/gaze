@@ -1,6 +1,6 @@
 {
   "name": "@kikedealba/gaze",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Per-project brain for coding agents: local knowledge store with hybrid vector search",
   "license": "MIT",
   "author": "Jesus Enrique De Alba Gaytan",

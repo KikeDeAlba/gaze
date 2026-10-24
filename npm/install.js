@@ -963,7 +963,11 @@ export async function refreshIntegrations(binary, { root = ROOT, env = process.e
   return ok
 }
 
-export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, euid, warn = (message) => process.stderr.write(message) } = {}) {
+export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, euid = process.geteuid?.(), warn = (message) => process.stderr.write(message) } = {}) {
+  if (euid === 0) {
+    warn('gaze: running as root; the kit registration, the daemon and the agent integrations were not refreshed. Run `gaze setup && gaze daemon install` as your user\n')
+    return false
+  }
   const daemon = daemonInstalled(binary, env)
   const steps = []
   if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
@@ -985,7 +989,8 @@ export async function refreshRegistration(binary, { env = process.env, root = RO
 function writeLock(lock, text) {
   try {
     if (!lstatSync(lock).isFile()) return false
-    const fd = openSync(lock, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0))
+    const fd = openNoFollow(lock, constants.O_RDWR | (constants.O_NONBLOCK ?? 0), { uid: process.geteuid?.() ?? lstatSync(lock).uid })
+    if (fd === null) return false
     try {
       ftruncateSync(fd, 0)
       writeSync(fd, text)

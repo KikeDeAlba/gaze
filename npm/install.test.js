@@ -1535,7 +1535,7 @@ describe('agent integrations after a windows upgrade', () => {
     assert.ok(existsSync(old), 'old versions are kept while the configs cannot be checked')
     const warnings = []
     assert.equal(await refreshRegistration(binary, { env, root, install: options, euid: 0, warn: (message) => warnings.push(message) }), false)
-    assert.deepEqual(warnings, ['gaze: running as root; agent integrations were not refreshed. Run `gaze setup` as your user\n'])
+    assert.deepEqual(warnings, ['gaze: running as root; the kit registration, the daemon and the agent integrations were not refreshed. Run `gaze setup && gaze daemon install` as your user\n'])
     assert.equal(existsSync(path.join(root, 'called')), false)
     assert.deepEqual(configs(agentHome), before)
     assert.deepEqual(vendorEntries(root), ['9.9.8', '9.9.9'])
@@ -1699,5 +1699,20 @@ describe('agent integrations after a windows upgrade', () => {
     await refreshRegistration(binary, { env, root, install: options, warn: quiet })
     const dirs = readFileSync(log, 'utf8').trim().split('\n')
     assert.deepEqual(dirs, [root, root, root])
+  })
+
+  test('as root, never runs gaze setup or gaze daemon install even with a registration and a daemon', { skip: process.platform === 'win32' }, async () => {
+    const root = realpathSync(packageRoot())
+    const binary = path.join(root, 'vendor', VERSION, 'gaze.exe')
+    const log = path.join(root, 'calls.log')
+    mkdirSync(path.dirname(binary), { recursive: true })
+    writeFileSync(binary, `#!/bin/sh\necho "$*" >> ${JSON.stringify(log)}\nif [ "$1 $2" = "daemon status" ]; then echo '{"ok":true,"data":{"installed":true}}'; fi\n`, { mode: 0o755 })
+    const { env, install: options } = agentMachine()
+    mkdirSync(path.dirname(registryManifest(env)), { recursive: true })
+    writeFileSync(registryManifest(env), JSON.stringify({ version: VERSION, bin: [binary] }))
+    const warnings = []
+    assert.equal(await refreshRegistration(binary, { env, root, install: options, euid: 0, warn: (message) => warnings.push(message) }), false)
+    assert.equal(existsSync(log), false)
+    assert.match(warnings.join(''), /running as root/)
   })
 })

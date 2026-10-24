@@ -1169,6 +1169,14 @@ describe('registration repair', { skip: SUPPORTED ? false : `no release target f
     rmSync(lock)
   })
 
+  test('as root, startRepair creates nothing in the data dir and spawns no repair', () => {
+    const env = { ...process.env, ...NO_PROXY_ENV, GAZE_DATA_DIR: path.join(mkdtempSync(path.join(scratch, 'root-')), 'data') }
+    const warnings = []
+    assert.equal(startRepair({ root: packageRoot(), env, euid: 0, warn: (message) => warnings.push(message) }), false)
+    assert.equal(existsSync(env.GAZE_DATA_DIR), false)
+    assert.match(warnings.join(''), /running as root/)
+  })
+
   test('a stale lock is removed in place and recreated without renaming it', async () => {
     const env = machine()
     await installVersion('9.9.7', env)

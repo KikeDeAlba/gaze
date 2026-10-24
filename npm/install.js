@@ -736,7 +736,11 @@ export function acquireLock(file, { now = Date.now() } = {}) {
   return false
 }
 
-export function startRepair({ root = ROOT, env = process.env, warn } = {}) {
+export function startRepair({ root = ROOT, env = process.env, euid = process.geteuid?.(), warn } = {}) {
+  if (euid === 0) {
+    warn?.('gaze: running as root; the kit registration and the daemon were not repaired. Run `gaze setup && gaze daemon install` as your user\n')
+    return false
+  }
   const lock = repairLock(env)
   if (!acquireLock(lock)) return false
   try {

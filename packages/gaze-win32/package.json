@@ -1,6 +1,6 @@
 {
   "name": "@kikedealba/gaze-win32",
-  "version": "0.7.0",
+  "version": "0.6.2",
   "description": "gaze en Windows: port en JavaScript sobre node.exe, sin binarios nativos",
   "license": "MIT",
   "author": "Jesus Enrique De Alba Gaytan",

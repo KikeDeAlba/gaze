@@ -146,13 +146,7 @@ fn inkwell_hook_ingests_docs_changed_events() {
 #[test]
 fn hooks_are_silent_during_harvest() {
     let dir = tempfile::tempdir().unwrap();
-    let out = gaze_cmd()
-        .args(["hook", "session-start"])
-        .env("GAZE_DATA_DIR", dir.path())
-        .env("GAZE_HARVEST", "1")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let out = gaze_cmd().args(["hook", "session-start"]).env("GAZE_DATA_DIR", dir.path()).env("GAZE_HARVEST", "1").stdin(Stdio::null()).output().unwrap();
     assert!(out.stdout.is_empty());
 }
 

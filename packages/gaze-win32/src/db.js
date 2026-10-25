@@ -355,7 +355,7 @@ export function openDb(file, { migrate = process.platform === 'win32', log = def
     refuseMissing(file)
     db = connect(file)
   }
-  db.exec('PRAGMA journal_mode = WAL')
+  if (db.prepare('PRAGMA journal_mode').get().journal_mode !== 'wal') db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
   const version = db.prepare('PRAGMA user_version').get().user_version
   if (version < 1) {

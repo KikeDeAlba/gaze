@@ -122,7 +122,6 @@ export function remoteSlug(url) {
   return trimmed === '' ? null : trimmed
 }
 
-
 export function matchScope(slug, mapping) {
   const lower = slug.toLowerCase()
   let best = null

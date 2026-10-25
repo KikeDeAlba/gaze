@@ -20,6 +20,7 @@ const STATES = {
   skipped: 'omitido',
   unavailable: 'no disponible',
   failed: 'falló',
+  warning: 'aviso',
 }
 
 const USAGE = `Uso: gaze setup [--agents <lista>] [--remove] [--json]
@@ -65,8 +66,10 @@ export function selection(names, known, fallback) {
   return [...new Set(names)]
 }
 
+const WINDOWS_PLAIN = /^[A-Za-z0-9_@+=:./\\-]+$/
+
 export function shellCommand(parts, platform = process.platform) {
-  if (platform === 'win32') return parts.map((part) => (/^[A-Za-z0-9_@%+=:,./\\-]+$/.test(part) ? part : `"${part}"`)).join(' ')
+  if (platform === 'win32') return parts.map((part) => (WINDOWS_PLAIN.test(part) ? part : `"${part}"`)).join(' ')
   return parts.map((part) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(part) ? part : `'${part.replace(/'/g, `'\\''`)}'`)).join(' ')
 }
 
@@ -86,6 +89,40 @@ export async function launcher(binary, { ctx, shim = SHIM } = {}) {
   const found = await which(TOOL, context)
   if (found && pointsToShim(found, shim)) return [TOOL]
   return js ? [process.execPath, binary] : [binary]
+}
+
+export function cmdShimTarget(file) {
+  let text
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch {
+    return null
+  }
+  const match = /"%dp0%\\([^"]+)"\s+%\*/.exec(text)
+  return match ? path.join(path.dirname(file), ...match[1].split('\\')) : null
+}
+
+function pathCmdShim(ctx) {
+  const key = Object.keys(ctx.env).find((name) => name.toUpperCase() === 'PATH') ?? 'PATH'
+  for (const dir of String(ctx.env[key] ?? '').split(';')) {
+    const clean = dir.trim().replace(/^"(.*)"$/, '$1')
+    if (!clean) continue
+    const file = path.join(clean, `${TOOL}.cmd`)
+    if (existsSync(file)) return file
+  }
+  return null
+}
+
+export async function hookLauncher(command, { ctx, shim = SHIM } = {}) {
+  const context = ctx ?? (await import('@kikedealba/kit/platform')).platformContext()
+  const prefix = shellCommand(command, context.platform)
+  if (context.platform !== 'win32' || command.every((part) => WINDOWS_PLAIN.test(part))) return { prefix }
+  if (command.length === 2 && pointsToShim(command[1], shim)) {
+    const cmd = pathCmdShim(context)
+    const target = cmd && cmdShimTarget(cmd)
+    if (target && pointsToShim(target, shim)) return { prefix: `${TOOL}.cmd` }
+  }
+  return { prefix, warning: `la ruta de node o de gaze tiene espacios o caracteres especiales y ${TOOL}.cmd de npm no está en el PATH; los hooks quedan como ${prefix}, que cmd ejecuta pero PowerShell no. Agrega la carpeta de npm (npm config get prefix) al PATH y vuelve a correr gaze setup` }
 }
 
 export const HOOK_FILES = {
@@ -135,8 +172,9 @@ function purgeOldHooks(agents, harness, options, keep) {
   return { agent: harness, item: 'old hooks', state: 'removed', detail: `removed ${removed} gaze hooks from another install in ${file}`, path: file }
 }
 
-export function integration({ command, version = packageVersion(), platform = process.platform }) {
-  const hook = (op, harness, timeout) => ({ type: 'command', name: `gaze-${op}`, command: `${shellCommand(command, platform)} hook ${op} --harness ${harness}`, timeout })
+export function integration({ command, hookPrefix, version = packageVersion(), platform = process.platform }) {
+  const prefix = hookPrefix ?? shellCommand(command, platform)
+  const hook = (op, harness, timeout) => ({ type: 'command', name: `gaze-${op}`, command: `${prefix} hook ${op} --harness ${harness}`, timeout })
   const server = { name: TOOL, command: [...command, 'mcp'] }
   return {
     tool: TOOL,
@@ -182,8 +220,9 @@ export async function installAgents(wanted, source, options = {}) {
   if (targets.includes('claude')) steps.push(...(await agents.installClaudePlugin(CLAUDE_PLUGIN, options)))
   const others = targets.filter((agent) => agent !== 'claude')
   if (others.length === 0) return { targets, steps }
-  const spec = await specFor(source, options)
+  const { spec, warning } = await specFor(source, options)
   for (const harness of Object.keys(HOOK_FILES).filter((agent) => others.includes(agent))) {
+    if (warning) steps.push({ agent: harness, item: 'hooks', state: 'warning', detail: warning })
     const purged = purgeOldHooks(agents, harness, options, harness === 'codex' ? hookCommands(spec, harness) : new Set())
     if (purged) steps.push(purged)
   }
@@ -193,7 +232,8 @@ export async function installAgents(wanted, source, options = {}) {
 
 async function specFor(source, options) {
   const command = source.command ?? (await launcher(source.binary, { ctx: options.ctx, shim: source.shim }))
-  return integration({ command, version: source.version, platform: options.ctx?.platform })
+  const { prefix, warning } = await hookLauncher(command, { ctx: options.ctx, shim: source.shim })
+  return { spec: integration({ command, hookPrefix: prefix, version: source.version, platform: options.ctx?.platform }), warning }
 }
 
 export async function uninstallAgents(wanted, source, options = {}) {
@@ -203,7 +243,7 @@ export async function uninstallAgents(wanted, source, options = {}) {
   if (targets.includes('claude')) steps.push(...(await agents.uninstallClaudePlugin(CLAUDE_PLUGIN, options)))
   const others = targets.filter((agent) => agent !== 'claude')
   if (others.length === 0) return { targets, steps }
-  const spec = await specFor(source, options)
+  const { spec } = await specFor(source, options)
   steps.push(...(await agents.uninstallIntegration(spec, { ...options, agents: others })))
   for (const harness of Object.keys(HOOK_FILES).filter((agent) => others.includes(agent))) {
     const purged = purgeOldHooks(agents, harness, options, new Set())

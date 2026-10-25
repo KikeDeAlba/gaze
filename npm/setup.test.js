@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { platformContext } from '@kikedealba/kit/platform'
-import { ANTIGRAVITY_RULES, SHIM, SKILL_DIR, installAgents, integration, launcher, ownHook, parseArgs, pointsToShim, purgeHooks, runSetup, selection, shellCommand, uninstallAgents, UsageError } from './setup.js'
+import { ANTIGRAVITY_RULES, SHIM, SKILL_DIR, formatSteps, hookLauncher, installAgents, integration, launcher, ownHook, parseArgs, pointsToShim, purgeHooks, runSetup, selection, shellCommand, uninstallAgents, UsageError } from './setup.js'
 
 const KNOWN = ['claude', 'opencode', 'codex', 'gemini', 'antigravity', 'claude-desktop']
 const BINARY = '/opt/gaze pkg/vendor/gaze'
@@ -191,6 +191,51 @@ describe('launcher and old installs', () => {
     assert.equal(ownHook(prompt, 'codex'), true)
     const plain = integration({ command: ['C:\\nvm4w\\nodejs\\node.exe', 'C:\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js'], version: '1.2.3', platform: 'win32' })
     assert.deepEqual(commands(plain.codex.hooks.UserPromptSubmit), ['C:\\nvm4w\\nodejs\\node.exe C:\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js hook prompt --harness codex'])
+  })
+
+  test('leaves plain Windows paths unquoted and quotes the ones PowerShell or cmd would split', () => {
+    assert.equal(shellCommand(['C:\\nodejs\\node.exe', 'C:\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js'], 'win32'), 'C:\\nodejs\\node.exe C:\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js')
+    assert.equal(shellCommand(['C:\\a,b\\node.exe'], 'win32'), '"C:\\a,b\\node.exe"')
+    assert.equal(shellCommand(['C:\\%USER%\\node.exe'], 'win32'), '"C:\\%USER%\\node.exe"')
+  })
+
+  test('picks the hook prefix for Windows: plain paths, then the npm gaze.cmd shim, then quotes with a warning', async () => {
+    const { home } = sandbox()
+    const npmDir = path.join(home, 'npm prefix')
+    const pkg = path.join(npmDir, 'node_modules', '@kikedealba', 'gaze')
+    mkdirSync(path.dirname(pkg), { recursive: true })
+    symlinkSync(path.dirname(path.dirname(SHIM)), pkg, 'junction')
+    const cmdShim = (target) => `@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*\r\n`
+    writeFileSync(path.join(npmDir, 'gaze.cmd'), cmdShim('node_modules\\@kikedealba\\gaze\\npm\\gaze.js'))
+    const other = path.join(home, 'other')
+    mkdirSync(other)
+    writeFileSync(path.join(other, 'gaze.cmd'), cmdShim('node_modules\\someone-else\\gaze.js'))
+    const ctx = (dirs) => platformContext({ platform: 'win32', home, env: { USERPROFILE: home, Path: dirs.join(';') } })
+    const spaced = ['C:\\Program Files\\nodejs\\node.exe', SHIM]
+
+    assert.deepEqual(await hookLauncher(['C:\\nodejs\\node.exe', 'C:\\npm\\gaze.js'], { ctx: ctx([]) }), { prefix: 'C:\\nodejs\\node.exe C:\\npm\\gaze.js' })
+    assert.deepEqual(await hookLauncher(spaced, { ctx: ctx([`"${npmDir}"`]) }), { prefix: 'gaze.cmd' })
+    assert.deepEqual(await hookLauncher(spaced, { ctx: ctx([other, npmDir]) }).then(({ prefix }) => prefix), shellCommand(spaced, 'win32'))
+
+    for (const dirs of [[], [other]]) {
+      const { prefix, warning } = await hookLauncher(spaced, { ctx: ctx(dirs) })
+      assert.equal(prefix, `"C:\\Program Files\\nodejs\\node.exe" ${shellCommand([SHIM], 'win32')}`)
+      assert.match(warning, /gaze\.cmd de npm no está en el PATH.*PowerShell no/)
+    }
+    const native = await hookLauncher(['C:\\Program Files\\gaze\\gaze.exe'], { ctx: ctx([npmDir]) })
+    assert.equal(native.prefix, '"C:\\Program Files\\gaze\\gaze.exe"')
+    assert.ok(native.warning)
+    assert.deepEqual(await hookLauncher(['/opt/my node/node', SHIM], { ctx: platformContext({ platform: 'darwin', home, env: { HOME: home, PATH: npmDir } }) }), { prefix: shellCommand(['/opt/my node/node', SHIM], 'darwin') })
+  })
+
+  test('hooks take the gaze.cmd prefix while the MCP server keeps node and the shim as argv', () => {
+    const command = ['C:\\Program Files\\nodejs\\node.exe', 'C:\\npm\\gaze.js']
+    const spec = integration({ command, hookPrefix: 'gaze.cmd', version: '1.2.3', platform: 'win32' })
+    assert.deepEqual(spec.mcp, [{ name: 'gaze', command: [...command, 'mcp'] }])
+    assert.deepEqual(commands(spec.codex.hooks.UserPromptSubmit), ['gaze.cmd hook prompt --harness codex'])
+    assert.deepEqual(commands(spec.gemini.hooks.BeforeAgent), ['gaze.cmd hook prompt --harness gemini'])
+    assert.equal(ownHook('gaze.cmd hook prompt --harness codex', 'codex'), true)
+    assert.match(formatSteps([{ agent: 'codex', item: 'hooks', state: 'warning', detail: 'x' }], false), /codex {2}hooks: aviso \(x\)/)
   })
 
   test('installs the MCP server and the hooks as node plus npm/gaze.js and swaps the hooks of another node', async () => {

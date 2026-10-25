@@ -97,6 +97,10 @@ class Session {
     if (body && body.command === 'search' && Array.isArray(body.data)) {
       body.data = body.data.map(({ score, ...rest }) => rest).sort((a, b) => a.title.localeCompare(b.title));
     }
+    if (body && body.command === 'stats' && body.data && body.data.daemon) {
+      const { running, socket } = body.data.daemon;
+      body.data.daemon = { running, socket };
+    }
     if (typeof body === 'string' && step.startsWith('search ')) body = sortEntries(body);
     this.trace.push({ step: this.subst(step), code, body });
   }

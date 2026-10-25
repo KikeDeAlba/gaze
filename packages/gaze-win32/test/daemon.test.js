@@ -11,7 +11,7 @@ import {
   LEGACY_TASK, ServeLog, handle, install, ping, removeLegacyTask, schtasksPath, serveArgs, shutdown, spawnDetached, spawnOnDemand, status,
   statusState, uninstall,
 } from '../src/daemon.js'
-import { endpointFor, request } from '../src/ipc.js'
+import { endpointFor, request, requestAuth } from '../src/ipc.js'
 import { VERSION, daemonMarker, serveLog, socketPath, spawnedMarker } from '../src/paths.js'
 
 const unix = process.platform !== 'win32'
@@ -193,9 +193,14 @@ test('serve rejects a request with a wrong hmac and keeps running', { skip: !uni
   startChild()
   await waitFor(() => ping())
   const nonce = crypto.randomBytes(16).toString('hex')
-  const forged = crypto.createHmac('sha256', crypto.randomBytes(32)).update(`gaze-ipc-v1\nclient\n${nonce}`).digest('hex')
-  const reply = await rawExchange(socketPath(), `${JSON.stringify({ op: 'shutdown', nonce, auth: forged })}\n`)
-  assert.deepEqual(JSON.parse(reply), { ok: false, error: 'unauthorized' })
+  const serverNonce = crypto.randomBytes(16).toString('hex')
+  const body = JSON.stringify({ op: 'shutdown' })
+  const forged = requestAuth(crypto.randomBytes(32), nonce, serverNonce, 0, body)
+  const hello = `${JSON.stringify({ op: 'hello', nonce })}\n`
+  const reply = await rawExchange(socketPath(), `${hello}${JSON.stringify({ auth: forged, body })}\n`)
+  const [greeting, refused] = reply.trim().split('\n').map((line) => JSON.parse(line))
+  assert.equal(greeting.ok, true)
+  assert.deepEqual(refused, { ok: false, error: 'unauthorized' })
   const missing = await rawExchange(socketPath(), `${JSON.stringify({ op: 'shutdown' })}\n`)
   assert.deepEqual(JSON.parse(missing), { ok: false, error: 'unauthorized' })
   assert.notEqual(await ping(), null)

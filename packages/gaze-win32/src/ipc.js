@@ -10,7 +10,7 @@ export const SERVER_READ_TIMEOUT_MS = 60000
 export const MAX_LINE = 1048576
 export const MAX_RESPONSE = 67108864
 
-const AUTH_CONTEXT = 'gaze-ipc-v1'
+const AUTH_CONTEXT = 'gaze-ipc-v2'
 const HEX64 = /^[0-9a-f]{64}$/
 const NONCE = /^[0-9a-f]{32}$/
 const PIPE_PREFIX = '\\\\.\\pipe\\'
@@ -68,14 +68,33 @@ export function rotateToken() {
   return token
 }
 
-export function authFor(token, role, nonce) {
-  return crypto.createHmac('sha256', token).update(`${AUTH_CONTEXT}\n${role}\n${nonce}`).digest('hex')
+export const isNonce = (value) => typeof value === 'string' && NONCE.test(value)
+
+export const newNonce = () => crypto.randomBytes(16).toString('hex')
+
+export function digest(text) {
+  return crypto.createHash('sha256').update(text, 'utf8').digest('hex')
 }
 
-export function verifyAuth(token, role, nonce, auth) {
-  if (typeof nonce !== 'string' || !NONCE.test(nonce)) return false
+export function authFor(token, role, ...parts) {
+  return crypto.createHmac('sha256', token).update([AUTH_CONTEXT, role, ...parts].join('\n')).digest('hex')
+}
+
+export function verifyAuth(token, auth, role, ...parts) {
   if (typeof auth !== 'string' || !HEX64.test(auth)) return false
-  return crypto.timingSafeEqual(Buffer.from(authFor(token, role, nonce), 'hex'), Buffer.from(auth, 'hex'))
+  return crypto.timingSafeEqual(Buffer.from(authFor(token, role, ...parts), 'hex'), Buffer.from(auth, 'hex'))
+}
+
+export function helloAuth(token, clientNonce, serverNonce) {
+  return authFor(token, 'hello', clientNonce, serverNonce)
+}
+
+export function requestAuth(token, clientNonce, serverNonce, seq, body) {
+  return authFor(token, 'client', clientNonce, serverNonce, String(seq), digest(body))
+}
+
+export function replyAuth(token, clientNonce, serverNonce, seq) {
+  return authFor(token, 'server', clientNonce, serverNonce, String(seq))
 }
 
 function connect(endpoint, timeoutMs) {
@@ -108,61 +127,110 @@ export async function alive(endpoint, timeoutMs = 200) {
   }
 }
 
-function readLine(socket, cap, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const parts = []
-    let size = 0
-    let settled = false
-    const finish = (error, value) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      socket.removeListener('data', onData)
-      socket.removeListener('end', onEnd)
-      socket.removeListener('error', onError)
-      socket.destroy()
-      if (error) reject(error)
-      else resolve(value)
+function lineReader(socket) {
+  let parts = []
+  let size = 0
+  const lines = []
+  let ended = false
+  let failure = null
+  let wake = null
+  const notify = () => {
+    const waiting = wake
+    wake = null
+    waiting?.()
+  }
+  socket.on('data', (data) => {
+    let rest = data
+    while (rest.length > 0) {
+      const newline = rest.indexOf(10)
+      if (newline === -1) {
+        parts.push(rest)
+        size += rest.length
+        break
+      }
+      parts.push(rest.subarray(0, newline + 1))
+      lines.push(Buffer.concat(parts))
+      parts = []
+      size = 0
+      rest = rest.subarray(newline + 1)
     }
-    const onData = (data) => {
-      const newline = data.indexOf(10)
-      const take = newline === -1 ? data : data.subarray(0, newline + 1)
-      size += take.length
-      parts.push(take)
-      if (size > cap) return finish(new IpcError('TOO_LARGE', `line over ${cap} bytes`))
-      if (newline !== -1) finish(null, Buffer.concat(parts).toString('utf8'))
-    }
-    const onEnd = () => finish(null, Buffer.concat(parts).toString('utf8'))
-    const onError = (error) => finish(new IpcError('CONNECT', `read from daemon: ${error.message}`, { cause: error }))
-    const timer = setTimeout(() => finish(new IpcError('TIMEOUT', 'daemon request timed out')), Math.max(1, timeoutMs))
-    socket.on('data', onData)
-    socket.once('end', onEnd)
-    socket.on('error', onError)
+    notify()
   })
+  socket.on('end', () => {
+    ended = true
+    notify()
+  })
+  socket.on('error', (error) => {
+    failure = error
+    notify()
+  })
+  return (cap, timeoutMs) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        wake = null
+        reject(new IpcError('TIMEOUT', 'daemon request timed out'))
+      }, Math.max(1, timeoutMs))
+      const done = (error, value) => {
+        clearTimeout(timer)
+        if (error) reject(error)
+        else resolve(value)
+      }
+      const check = () => {
+        if (lines.length > 0) {
+          const line = lines.shift()
+          return line.length > cap ? done(new IpcError('TOO_LARGE', `line over ${cap} bytes`)) : done(null, line.toString('utf8'))
+        }
+        if (size > cap) return done(new IpcError('TOO_LARGE', `line over ${cap} bytes`))
+        if (failure !== null) return done(new IpcError('CONNECT', `read from daemon: ${failure.message}`, { cause: failure }))
+        if (ended) {
+          const rest = Buffer.concat(parts).toString('utf8')
+          parts = []
+          size = 0
+          return done(null, rest)
+        }
+        wake = check
+      }
+      check()
+    })
 }
+
+function parseReply(raw) {
+  try {
+    return JSON.parse(raw)
+  } catch (error) {
+    throw new IpcError('DAEMON', `daemon sent an invalid response: ${error.message}`, { cause: error })
+  }
+}
+
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
 
 export async function request(endpoint, message, { timeoutMs = 120000 } = {}) {
   const token = readToken()
   if (token === null) throw new IpcError('NO_TOKEN', `no daemon token at ${tokenPath()}`)
   const started = Date.now()
-  const nonce = crypto.randomBytes(16).toString('hex')
-  const line = `${JSON.stringify({ ...message, nonce, auth: authFor(token, 'client', nonce) })}\n`
+  const left = () => Math.max(1, timeoutMs - (Date.now() - started))
   const socket = await connect(endpoint, Math.min(timeoutMs, CONNECT_TIMEOUT_MS))
-  const reading = readLine(socket, MAX_RESPONSE, Math.max(1, timeoutMs - (Date.now() - started)))
-  socket.write(line)
-  const raw = await reading
-  let response
   try {
-    response = JSON.parse(raw)
-  } catch (error) {
-    throw new IpcError('DAEMON', `daemon sent an invalid response: ${error.message}`, { cause: error })
+    const next = lineReader(socket)
+    const clientNonce = newNonce()
+    socket.write(`${JSON.stringify({ op: 'hello', nonce: clientNonce })}\n`)
+    const hello = parseReply(await next(MAX_LINE, left()))
+    if (!isObject(hello) || hello.ok !== true || !isNonce(hello.nonce) || !verifyAuth(token, hello.auth, 'hello', clientNonce, hello.nonce)) {
+      throw new IpcError('AUTH', 'daemon auth failed')
+    }
+    const serverNonce = hello.nonce
+    const body = JSON.stringify(message)
+    socket.write(`${JSON.stringify({ auth: requestAuth(token, clientNonce, serverNonce, 0, body), body })}\n`)
+    const response = parseReply(await next(MAX_RESPONSE, left()))
+    if (!isObject(response) || !verifyAuth(token, response.auth, 'server', clientNonce, serverNonce, '0')) {
+      throw new IpcError('AUTH', 'daemon auth failed')
+    }
+    if (response.ok !== true) throw new IpcError('DAEMON', `daemon error: ${response.error}`)
+    const { auth, ...rest } = response
+    return rest
+  } finally {
+    socket.destroy()
   }
-  if (response === null || typeof response !== 'object' || !verifyAuth(token, 'server', nonce, response.auth)) {
-    throw new IpcError('AUTH', 'daemon auth failed')
-  }
-  if (response.ok !== true) throw new IpcError('DAEMON', `daemon error: ${response.error}`)
-  const { auth, ...rest } = response
-  return rest
 }
 
 function inUse(endpoint) {
@@ -230,23 +298,44 @@ async function bindPipe(server, endpoint) {
   }
 }
 
-async function respond(token, onMessage, raw) {
-  let message
+const UNAUTHORIZED = { reply: { ok: false, error: 'unauthorized' }, close: true }
+
+function greet(state, message, tokenOf) {
+  if (!isObject(message) || message.op !== 'hello' || !isNonce(message.nonce)) return UNAUTHORIZED
+  const token = tokenOf()
+  if (token === null || token === undefined) return UNAUTHORIZED
+  state.token = Buffer.from(token)
+  state.clientNonce = message.nonce
+  state.serverNonce = newNonce()
+  return { reply: { ok: true, nonce: state.serverNonce, auth: helloAuth(state.token, state.clientNonce, state.serverNonce) }, close: false }
+}
+
+async function respond(state, tokenOf, onMessage, raw) {
+  let envelope
   try {
-    message = JSON.parse(raw.replace(/\s+$/u, ''))
+    envelope = JSON.parse(raw.replace(/\s+$/u, ''))
   } catch (error) {
     return { reply: { ok: false, error: `bad request: ${error.message}` }, close: false }
   }
-  const nonce = message !== null && typeof message === 'object' ? message.nonce : undefined
-  if (!verifyAuth(token, 'client', nonce, message?.auth)) return { reply: { ok: false, error: 'unauthorized' }, close: true }
+  if (state.token === null) return greet(state, envelope, tokenOf)
+  const seq = state.seq
+  if (!isObject(envelope) || typeof envelope.body !== 'string') return UNAUTHORIZED
+  if (!verifyAuth(state.token, envelope.auth, 'client', state.clientNonce, state.serverNonce, String(seq), digest(envelope.body))) return UNAUTHORIZED
+  state.seq += 1
+  let message
+  try {
+    message = JSON.parse(envelope.body)
+  } catch (error) {
+    return { reply: { ok: false, error: `bad request: ${error.message}` }, close: false }
+  }
   let result
   try {
     result = await onMessage(message)
   } catch (error) {
     result = { ok: false, error: errorChain(error) }
   }
-  const body = result !== null && typeof result === 'object' ? result : { ok: false, error: 'empty response' }
-  return { reply: { ...body, auth: authFor(token, 'server', nonce) }, close: false, message }
+  const body = isObject(result) ? result : { ok: false, error: 'empty response' }
+  return { reply: { ...body, auth: replyAuth(state.token, state.clientNonce, state.serverNonce, seq) }, close: false, message }
 }
 
 function write(socket, value) {
@@ -256,9 +345,10 @@ function write(socket, value) {
   })
 }
 
-function serveConnection(socket, token, onMessage, { onLine, afterReply }) {
+function serveConnection(socket, tokenOf, onMessage, { onLine, afterReply }) {
   socket.setTimeout(SERVER_READ_TIMEOUT_MS, () => socket.destroy())
   socket.on('error', () => socket.destroy())
+  const state = { token: null, clientNonce: null, serverNonce: null, seq: 0 }
   let pending = []
   let size = 0
   let chain = Promise.resolve()
@@ -267,7 +357,7 @@ function serveConnection(socket, token, onMessage, { onLine, afterReply }) {
     chain = chain.then(async () => {
       if (closed) return
       onLine?.()
-      const { reply, close, message } = await respond(token, onMessage, raw)
+      const { reply, close, message } = await respond(state, tokenOf, onMessage, raw)
       const written = await write(socket, reply)
       if (close) {
         closed = true
@@ -314,9 +404,14 @@ function serveConnection(socket, token, onMessage, { onLine, afterReply }) {
 }
 
 export async function listen(endpoint, onMessage, { token = readToken(), onLine, afterReply } = {}) {
-  if (token === null || token === undefined) throw new IpcError('NO_TOKEN', `no daemon token at ${tokenPath()}`)
-  const secret = Buffer.from(token)
-  const server = net.createServer((socket) => serveConnection(socket, secret, onMessage, { onLine, afterReply }))
+  let tokenOf
+  if (typeof token === 'function') tokenOf = token
+  else {
+    if (token === null || token === undefined) throw new IpcError('NO_TOKEN', `no daemon token at ${tokenPath()}`)
+    const secret = Buffer.from(token)
+    tokenOf = () => secret
+  }
+  const server = net.createServer((socket) => serveConnection(socket, tokenOf, onMessage, { onLine, afterReply }))
   if (isWindows()) await bindPipe(server, endpoint)
   else await bindUnix(server, String(endpoint))
   return server

@@ -6,8 +6,8 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  CONNECT_TIMEOUT_MS, IpcError, MAX_LINE, MAX_RESPONSE, SERVER_READ_TIMEOUT_MS, alive, authFor, cleanup, endpointFor, listen, pipeName, readToken, request,
-  rotateToken, verifyAuth,
+  CONNECT_TIMEOUT_MS, IpcError, MAX_LINE, MAX_RESPONSE, SERVER_READ_TIMEOUT_MS, alive, authFor, cleanup, digest, endpointFor, helloAuth, listen, pipeName,
+  readToken, replyAuth, request, requestAuth, rotateToken, verifyAuth,
 } from '../src/ipc.js'
 import { tokenPath } from '../src/paths.js'
 
@@ -65,9 +65,51 @@ function rawExchange(ep, payload) {
   })
 }
 
-function signed(token, message) {
-  const nonce = crypto.randomBytes(16).toString('hex')
-  return `${JSON.stringify({ ...message, nonce, auth: authFor(token, 'client', nonce) })}\n`
+async function open(ep) {
+  const socket = net.createConnection(ep)
+  await new Promise((resolve, reject) => {
+    socket.once('connect', resolve)
+    socket.once('error', reject)
+  })
+  const lines = []
+  let buffer = ''
+  let closed = false
+  let notify = null
+  socket.on('data', (data) => {
+    buffer += data
+    for (let at = buffer.indexOf('\n'); at !== -1; at = buffer.indexOf('\n')) {
+      lines.push(JSON.parse(buffer.slice(0, at)))
+      buffer = buffer.slice(at + 1)
+    }
+    notify?.()
+  })
+  socket.on('close', () => {
+    closed = true
+    notify?.()
+  })
+  socket.on('error', () => {})
+  const next = async () => {
+    while (lines.length === 0 && !closed) await new Promise((resolve) => (notify = resolve))
+    return lines.shift() ?? null
+  }
+  const send = (value) => socket.write(typeof value === 'string' ? value : `${JSON.stringify(value)}\n`)
+  const isClosed = async () => {
+    while (!closed) await new Promise((resolve) => (notify = resolve))
+    return true
+  }
+  return { socket, next, send, isClosed }
+}
+
+async function greet(conn) {
+  const clientNonce = crypto.randomBytes(16).toString('hex')
+  conn.send({ op: 'hello', nonce: clientNonce })
+  const hello = await conn.next()
+  return { clientNonce, serverNonce: hello.nonce, hello }
+}
+
+function signed(token, { clientNonce, serverNonce }, seq, message) {
+  const body = JSON.stringify(message)
+  return { auth: requestAuth(token, clientNonce, serverNonce, seq, body), body }
 }
 
 test('limits are the ones in ipc.rs', () => {
@@ -92,16 +134,22 @@ test('pipe names are stable and prefixed, like ipc.rs', () => {
   assert.equal(endpointFor('/tmp/x.sock'), unix ? '/tmp/x.sock' : '\\\\.\\pipe\\gaze-tmp-x-sock')
 })
 
-test('auth is HMAC-SHA256 over the role and the nonce', () => {
+test('auth is HMAC-SHA256 over the role, both nonces, the sequence and the body digest', () => {
   const token = Buffer.alloc(32, 1)
-  const nonce = '00112233445566778899aabbccddeeff'
-  assert.equal(authFor(token, 'client', nonce), '1d8427276194a4bd0ca3077009f28c0aa396fa947c974d14ed774500d4443e0d')
-  assert.equal(authFor(token, 'server', nonce), 'd5da0c42cca240fbc5b471de15c0ea1eb01b975bad707d06efaa7cf05ed0ec06')
-  assert.equal(verifyAuth(token, 'client', nonce, authFor(token, 'client', nonce)), true)
-  assert.equal(verifyAuth(token, 'server', nonce, authFor(token, 'client', nonce)), false)
-  assert.equal(verifyAuth(token, 'client', 'short', authFor(token, 'client', 'short')), false)
-  assert.equal(verifyAuth(token, 'client', nonce, 'zz'), false)
-  assert.equal(verifyAuth(token, 'client', nonce, undefined), false)
+  const cn = '00112233445566778899aabbccddeeff'
+  const sn = 'ffeeddccbbaa99887766554433221100'
+  const body = '{"op":"ping"}'
+  const hmac = (text) => crypto.createHmac('sha256', token).update(text).digest('hex')
+  assert.equal(digest(body), crypto.createHash('sha256').update(body).digest('hex'))
+  assert.equal(helloAuth(token, cn, sn), hmac(`gaze-ipc-v2\nhello\n${cn}\n${sn}`))
+  assert.equal(requestAuth(token, cn, sn, 0, body), hmac(`gaze-ipc-v2\nclient\n${cn}\n${sn}\n0\n${digest(body)}`))
+  assert.equal(replyAuth(token, cn, sn, 3), hmac(`gaze-ipc-v2\nserver\n${cn}\n${sn}\n3`))
+  assert.equal(verifyAuth(token, requestAuth(token, cn, sn, 0, body), 'client', cn, sn, '0', digest(body)), true)
+  assert.equal(verifyAuth(token, requestAuth(token, cn, sn, 0, body), 'client', cn, sn, '1', digest(body)), false)
+  assert.equal(verifyAuth(token, requestAuth(token, cn, sn, 0, body), 'client', cn, sn, '0', digest('{"op":"shutdown"}')), false)
+  assert.equal(verifyAuth(token, authFor(token, 'client', cn), 'server', cn), false)
+  assert.equal(verifyAuth(token, 'zz', 'client', cn), false)
+  assert.equal(verifyAuth(token, undefined, 'client', cn), false)
 })
 
 test('tokens rotate into a private file and bad files read as missing', () => {
@@ -132,9 +180,7 @@ test('request and listen round trip with mutual auth', async () => {
   assert.equal(await alive(ep), true)
   assert.deepEqual(await request(ep, { op: 'ping' }, { timeoutMs: 2000 }), { ok: true, pid: process.pid, version: '0.7.0' })
   assert.deepEqual(await request(ep, { op: 'embed', mode: 'query', texts: ['a', 'b'] }, { timeoutMs: 2000 }), { ok: true, vectors: [[0.5], [0.5]] })
-  assert.equal(seen[0].op, 'ping')
-  assert.match(seen[0].nonce, /^[0-9a-f]{32}$/)
-  assert.match(seen[0].auth, /^[0-9a-f]{64}$/)
+  assert.deepEqual(seen, [{ op: 'ping' }, { op: 'embed', mode: 'query', texts: ['a', 'b'] }])
   for (let waited = 0; replied.length < 2 && waited < 2000; waited += 10) await new Promise((resolve) => setTimeout(resolve, 10))
   assert.deepEqual(replied, [['ping', true], ['embed', true]])
 })
@@ -149,6 +195,18 @@ test('daemon failures surface as DAEMON errors with the daemon text', async () =
   await assert.rejects(request(ep, { op: 'boom' }, { timeoutMs: 2000 }), { code: 'DAEMON', message: 'daemon error: model: exploded' })
 })
 
+test('the server proves it knows the token before it reads a payload', async () => {
+  const token = rotateToken()
+  const { ep } = await serve(async () => ({ ok: true }))
+  const conn = await open(ep)
+  const { clientNonce, serverNonce, hello } = await greet(conn)
+  assert.deepEqual(Object.keys(hello).sort(), ['auth', 'nonce', 'ok'])
+  assert.equal(hello.ok, true)
+  assert.match(serverNonce, /^[0-9a-f]{32}$/)
+  assert.equal(hello.auth, helloAuth(token, clientNonce, serverNonce))
+  conn.socket.destroy()
+})
+
 test('the server rejects requests without a valid auth and closes', async () => {
   const token = rotateToken()
   let calls = 0
@@ -156,26 +214,68 @@ test('the server rejects requests without a valid auth and closes', async () => 
     calls++
     return { ok: true }
   })
-  const unsigned = await rawExchange(ep, `${JSON.stringify({ op: 'ping', nonce: '00112233445566778899aabbccddeeff', auth: '0'.repeat(64) })}\n`)
-  assert.deepEqual(JSON.parse(unsigned), { ok: false, error: 'unauthorized' })
-  const missing = await rawExchange(ep, '{"op":"shutdown"}\n')
-  assert.deepEqual(JSON.parse(missing), { ok: false, error: 'unauthorized' })
-  const wrong = await rawExchange(ep, signed(crypto.randomBytes(32), { op: 'ping' }) + signed(token, { op: 'ping' }))
-  assert.deepEqual(wrong.trim().split('\n').map((l) => JSON.parse(l)), [{ ok: false, error: 'unauthorized' }])
+  const legacy = await rawExchange(ep, `${JSON.stringify({ op: 'ping', nonce: '00112233445566778899aabbccddeeff', auth: '0'.repeat(64) })}\n`)
+  assert.deepEqual(JSON.parse(legacy), { ok: false, error: 'unauthorized' })
+  const badHello = await rawExchange(ep, '{"op":"hello","nonce":"short"}\n')
+  assert.deepEqual(JSON.parse(badHello), { ok: false, error: 'unauthorized' })
+  const cases = [
+    (session) => signed(crypto.randomBytes(32), session, 0, { op: 'ping' }),
+    (session) => signed(token, session, 1, { op: 'ping' }),
+    (session) => ({ ...signed(token, session, 0, { op: 'ping' }), body: '{"op":"shutdown"}' }),
+    (session) => ({ body: '{"op":"shutdown"}' }),
+    () => ({ op: 'shutdown' }),
+    (session) => signed(token, { ...session, serverNonce: crypto.randomBytes(16).toString('hex') }, 0, { op: 'ping' }),
+  ]
+  for (const make of cases) {
+    const conn = await open(ep)
+    const session = await greet(conn)
+    conn.send(make(session))
+    assert.deepEqual(await conn.next(), { ok: false, error: 'unauthorized' })
+    assert.equal(await conn.isClosed(), true)
+  }
   assert.equal(calls, 0)
+})
+
+test('a request cannot be replayed on the same connection', async () => {
+  const token = rotateToken()
+  let calls = 0
+  const { ep } = await serve(async () => ({ ok: true, n: ++calls }))
+  const conn = await open(ep)
+  const session = await greet(conn)
+  const first = signed(token, session, 0, { op: 'ping' })
+  conn.send(first)
+  assert.equal((await conn.next()).n, 1)
+  conn.send(first)
+  assert.deepEqual(await conn.next(), { ok: false, error: 'unauthorized' })
+  assert.equal(calls, 1)
 })
 
 test('one connection serves several lines in order and reports bad json', async () => {
   const token = rotateToken()
   const { ep } = await serve(async (msg) => ({ ok: true, echo: msg.n }))
-  const raw = await rawExchange(ep, signed(token, { op: 'x', n: 1 }) + 'not json\n' + signed(token, { op: 'x', n: 2 }))
-  const replies = raw.trim().split('\n').map((l) => JSON.parse(l))
-  assert.equal(replies.length, 3)
+  const conn = await open(ep)
+  const session = await greet(conn)
+  conn.send(signed(token, session, 0, { op: 'x', n: 1 }))
+  conn.send('not json\n')
+  conn.send(signed(token, session, 1, { op: 'x', n: 2 }))
+  const replies = [await conn.next(), await conn.next(), await conn.next()]
   assert.equal(replies[0].echo, 1)
+  assert.equal(replies[0].auth, replyAuth(token, session.clientNonce, session.serverNonce, 0))
   assert.match(replies[1].error, /^bad request: /)
   assert.equal(replies[1].ok, false)
   assert.equal(replies[1].auth, undefined)
   assert.equal(replies[2].echo, 2)
+  assert.equal(replies[2].auth, replyAuth(token, session.clientNonce, session.serverNonce, 1))
+  conn.socket.destroy()
+})
+
+test('a server without a token yet refuses the hello', async () => {
+  let token = null
+  const { ep } = await serve(async () => ({ ok: true, pid: 9 }), { token: () => token })
+  const refused = await rawExchange(ep, '{"op":"hello","nonce":"00112233445566778899aabbccddeeff"}\n')
+  assert.deepEqual(JSON.parse(refused), { ok: false, error: 'unauthorized' })
+  token = rotateToken()
+  assert.deepEqual(await request(ep, { op: 'ping' }, { timeoutMs: 2000 }), { ok: true, pid: 9 })
 })
 
 test('lines over the cap are rejected and the connection closes', async () => {
@@ -190,19 +290,27 @@ test('lines over the cap are rejected and the connection closes', async () => {
   assert.equal(calls, 0)
 })
 
-test('the client refuses an impostor server that does not know the token', async () => {
+test('the client never sends the payload to an impostor that does not know the token', async () => {
   rotateToken()
+  const received = []
   const impostor = net.createServer((socket) => {
+    socket.on('error', () => {})
     socket.on('data', (data) => {
+      received.push(data.toString('utf8'))
       const msg = JSON.parse(data.toString('utf8'))
-      socket.end(`${JSON.stringify({ ok: true, pid: 1, auth: authFor(crypto.randomBytes(32), 'server', msg.nonce) })}\n`)
+      const serverNonce = crypto.randomBytes(16).toString('hex')
+      socket.write(`${JSON.stringify({ ok: true, nonce: serverNonce, auth: helloAuth(crypto.randomBytes(32), msg.nonce, serverNonce) })}\n`)
     })
   })
   const ep = endpoint('imp.sock')
   fs.mkdirSync(path.dirname(path.join(dir, 'run', 'imp.sock')), { recursive: true })
   await new Promise((resolve) => impostor.listen(ep, resolve))
   track(impostor)
-  await assert.rejects(request(ep, { op: 'ping' }, { timeoutMs: 2000 }), { code: 'AUTH', message: 'daemon auth failed' })
+  await assert.rejects(request(ep, { op: 'embed', mode: 'query', texts: ['secret note'] }, { timeoutMs: 2000 }), { code: 'AUTH', message: 'daemon auth failed' })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(received.length, 1)
+  assert.deepEqual(Object.keys(JSON.parse(received[0])), ['op', 'nonce'])
+  assert.equal(received.join('').includes('secret note'), false)
 })
 
 test('client errors: no token, nothing listening, timeout and oversized replies', async () => {
@@ -218,8 +326,17 @@ test('client errors: no token, nothing listening, timeout and oversized replies'
   const started = Date.now()
   await assert.rejects(request(silentEp, { op: 'ping' }, { timeoutMs: 300 }), { code: 'TIMEOUT' })
   assert.ok(Date.now() - started < 2000)
+  const token = readToken()
   const flood = net.createServer((socket) => {
-    socket.on('data', () => {
+    socket.once('data', (data) => {
+      const { nonce } = JSON.parse(data.toString('utf8'))
+      const serverNonce = crypto.randomBytes(16).toString('hex')
+      socket.write(`${JSON.stringify({ ok: true, nonce: serverNonce, auth: helloAuth(token, nonce, serverNonce) })}\n`)
+      socket.once('data', () => flooding(socket))
+    })
+  })
+  const flooding = (socket) => {
+    {
       const block = Buffer.alloc(1024 * 1024, 0x61)
       let left = 65
       const pump = () => {
@@ -230,8 +347,8 @@ test('client errors: no token, nothing listening, timeout and oversized replies'
       }
       socket.on('error', () => {})
       pump()
-    })
-  })
+    }
+  }
   const floodEp = endpoint('flood.sock')
   await new Promise((resolve) => flood.listen(floodEp, resolve))
   track(flood)

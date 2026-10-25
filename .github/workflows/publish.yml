@@ -264,7 +264,7 @@ jobs:
         working-directory: packages/gaze-win32
         env:
           GAZE_TEST_MODEL: "1"
-          GAZE_MODEL_DIR: ${{ runner.temp }}\gaze-model
+          GAZE_CACHE_DIR: ${{ runner.temp }}\gaze-model
         run: |
           set -euo pipefail
           npm ci --no-audit --no-fund || npm install --force --no-audit --no-fund

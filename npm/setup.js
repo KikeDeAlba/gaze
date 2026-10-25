@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 
 const SELF = fileURLToPath(import.meta.url)
@@ -80,9 +81,11 @@ export function pointsToShim(found, shim = SHIM) {
 export async function launcher(binary, { ctx, shim = SHIM } = {}) {
   const { platformContext, which } = await import('@kikedealba/kit/platform')
   const context = ctx ?? platformContext()
-  if (context.platform === 'win32') return [binary]
+  const js = pointsToShim(binary, shim)
+  if (context.platform === 'win32') return js ? [process.execPath, binary] : [binary]
   const found = await which(TOOL, context)
-  return found && pointsToShim(found, shim) ? [TOOL] : [binary]
+  if (found && pointsToShim(found, shim)) return [TOOL]
+  return js ? [process.execPath, binary] : [binary]
 }
 
 export const HOOK_FILES = {
@@ -91,7 +94,7 @@ export const HOOK_FILES = {
 }
 
 export function ownHook(command, harness) {
-  const pattern = new RegExp(`(?:^|[\\s'"/\\\\&])gaze(?:\\.exe|\\.cmd)?['"]?\\s+hook\\s+(?:session-start|prompt|harvest)\\s+--harness\\s+${harness}\\s*$`)
+  const pattern = new RegExp(`(?:^|[\\s'"/\\\\&])gaze(?:\\.exe|\\.cmd|\\.js)?['"]?\\s+hook\\s+(?:session-start|prompt|harvest)\\s+--harness\\s+${harness}\\s*$`)
   return typeof command === 'string' && pattern.test(command)
 }
 
@@ -216,7 +219,13 @@ export function formatSteps(steps, removing) {
   return `Integraciones:\n${lines.join('\n')}\n`
 }
 
-function runBinary(command, args, json) {
+async function runBinary(command, args, json) {
+  if (typeof command === 'function') {
+    let stdout = ''
+    const capture = { write: (chunk) => ((stdout += String(chunk)), true) }
+    const code = await command(json ? [...args, '--json'] : args, { stdin: Readable.from([]), stdout: json ? capture : process.stdout, stderr: process.stderr })
+    return { code: Number.isInteger(code) ? code : 1, stdout }
+  }
   const [binary, ...prefix] = command
   const result = spawnSync(binary, [...prefix, ...(json ? [...args, '--json'] : args)], { stdio: ['inherit', json ? 'pipe' : 'inherit', 'inherit'], encoding: 'utf8', windowsHide: true })
   if (result.error) throw new Error(`no se pudo correr ${binary}: ${result.error.message}`)
@@ -255,7 +264,7 @@ export async function runSetup(argv, binary, options = {}) {
     fail(`gaze: ${error.message}\n`)
     return 2
   }
-  const native = runBinary(options.native ?? [binary], [removing ? 'uninstall' : 'setup'], parsed.json)
+  const native = await runBinary(options.native ?? [binary], [removing ? 'uninstall' : 'setup'], parsed.json)
   if (native.code !== 0) {
     if (parsed.json) write(native.stdout)
     return native.code
@@ -290,11 +299,13 @@ function invokedDirectly() {
 }
 
 if (invokedDirectly()) {
-  const { ensureBinary } = await import('./install.js')
+  const { ensureBinary, jsMode, loadPort } = await import('./install.js')
   const argv = process.argv.slice(2)
   try {
     const binary = await ensureBinary()
-    process.exitCode = await runSetup(argv[0] === 'setup' || argv[0] === 'uninstall' ? argv : ['setup', ...argv], binary)
+    const port = jsMode() ? await loadPort() : null
+    const options = port ? { native: (args, io) => port.main(args, { self: [process.execPath, binary], io }) } : {}
+    process.exitCode = await runSetup(argv[0] === 'setup' || argv[0] === 'uninstall' ? argv : ['setup', ...argv], binary, options)
   } catch (error) {
     process.stderr.write(`gaze: ${error.message}\n`)
     process.exitCode = 1

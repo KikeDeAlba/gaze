@@ -148,6 +148,10 @@ export class Store {
     return new Store(openMemory(), defaultConfig())
   }
 
+  close() {
+    if (this.db.isOpen) this.db.close()
+  }
+
   tx(fn) {
     this.db.exec('BEGIN IMMEDIATE')
     let value

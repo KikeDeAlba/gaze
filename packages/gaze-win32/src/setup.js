@@ -45,7 +45,7 @@ export function manifestPath() {
   return path.join(registryDir(), 'gaze.json')
 }
 
-export async function setup({ self, open = () => Store.openDefault() } = {}) {
+export async function setup({ self, open = () => Store.openDefault().close() } = {}) {
   const bin = self && self.length > 0 ? self : selfCommand()
   const registry = registryDir()
   fs.mkdirSync(registry, { recursive: true })

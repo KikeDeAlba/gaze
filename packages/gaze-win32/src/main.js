@@ -321,6 +321,11 @@ class Context {
     this.self = self
     this.io = io
     this.cached = null
+    this.opened = []
+  }
+
+  close() {
+    for (const store of this.opened.splice(0)) store.close()
   }
 
   out(line) {
@@ -345,6 +350,7 @@ class Context {
       },
     })
     const store = new Store(db, loadConfig())
+    this.opened.push(store)
     if (migrated) {
       if (background) spawnDetached([...this.self, 'reindex'], {})
       else {
@@ -667,6 +673,14 @@ export async function main(argv, options = {}) {
   }
   const self = Array.isArray(options.self) && options.self.length > 0 ? [...options.self] : paths.selfCommand()
   const ctx = new Context(self, io)
+  try {
+    return await run(ctx, argv)
+  } finally {
+    ctx.close()
+  }
+}
+
+async function run(ctx, argv) {
   let parsed
   try {
     parsed = parse(argv)

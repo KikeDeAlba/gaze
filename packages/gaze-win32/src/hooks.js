@@ -257,7 +257,7 @@ export async function prompt(store, input, agent, { alive = ipc.alive, spawnOnDe
   const session = sessionId(input)
   const already = store.injected(session)
 
-  const endpoint = ipc.endpointFor(paths.socketPath())
+  const endpoint = paths.socketPath()
   const fake = fakeRequested()
   const semantic = fake || (await alive(endpoint, 200))
   let embedder

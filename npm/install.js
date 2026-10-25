@@ -3,17 +3,19 @@ import { createHash } from 'node:crypto'
 import { accessSync, chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const SELF = fileURLToPath(import.meta.url)
 export const ROOT = path.dirname(path.dirname(SELF))
+export const SHIM = path.join(ROOT, 'npm', 'gaze.js')
+export const PORT = '@kikedealba/gaze-win32'
 export const DEFAULT_BASE = 'https://github.com/KikeDeAlba/gaze/releases/download'
 
 const TARGETS = {
   'darwin-arm64': 'aarch64-apple-darwin',
   'linux-x64': 'x86_64-unknown-linux-gnu',
   'linux-arm64': 'aarch64-unknown-linux-gnu',
-  'win32-x64': 'x86_64-pc-windows-msvc',
 }
 
 const GITHUB_HOSTS = new Set(['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'])
@@ -29,15 +31,10 @@ const ORPHAN_AGE_MS = 10 * 60 * 1000
 const REFRESH_TIMEOUT_MS = 180_000
 const REPAIR_RETRY_MS = 10 * 60 * 1000
 const ABANDONED_LOCK_MS = 60 * 60 * 1000
-const SETTLE_MS = 2000
-const BUSY = new Set(['EBUSY', 'EPERM', 'EACCES'])
-const BUSY_ATTEMPTS = 5
-const BUSY_DELAY_MS = 200
 const RECLAIM_GUARD_MS = 60 * 1000
 const FUTURE_LOCK_MS = 60 * 1000
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0
 const MISSING = new Set(['ENOENT', 'ENOTDIR'])
-const VERSION_ENTRIES = new Set(['gaze.exe', '.verified'])
 const INTEGRATION_FILES = {
   codex: (homes) => [path.join(homes.codex, 'hooks.json'), path.join(homes.codex, 'config.toml')],
   gemini: (homes) => [path.join(homes.gemini, 'extensions', 'gaze', 'gemini-extension.json'), path.join(homes.gemini, 'extensions', 'gaze', 'hooks', 'hooks.json')],
@@ -50,13 +47,6 @@ export class InstallError extends Error {
   constructor(message) {
     super(message)
     this.name = 'InstallError'
-  }
-}
-
-export class BusyError extends InstallError {
-  constructor(message) {
-    super(message)
-    this.name = 'BusyError'
   }
 }
 
@@ -81,11 +71,10 @@ export function binaryName(platform = process.platform) {
 }
 
 export function archiveName(version, target) {
-  return `gaze-${version}-${target}.${target.endsWith('-windows-msvc') ? 'exe' : 'tar.gz'}`
+  return `gaze-${version}-${target}.tar.gz`
 }
 
-export function vendorBinary(root = ROOT, platform = process.platform, version = packageVersion(root)) {
-  if (platform === 'win32') return path.join(root, 'vendor', version, binaryName(platform))
+export function vendorBinary(root = ROOT, platform = process.platform) {
   return path.join(root, 'vendor', binaryName(platform))
 }
 
@@ -119,163 +108,6 @@ function removeOrphans(vendor, now = Date.now()) {
     try {
       if (now - statSync(file).mtimeMs > ORPHAN_AGE_MS) rmSync(file, { recursive: true, force: true })
     } catch {}
-  }
-}
-
-function removeOtherVersions(vendor, version, keep = []) {
-  let entries
-  try {
-    entries = readdirSync(vendor)
-  } catch {
-    return
-  }
-  for (const entry of entries) {
-    if (entry === version || keep.includes(entry)) continue
-    try {
-      rmSync(path.join(vendor, entry), { recursive: true, force: true })
-    } catch {}
-  }
-}
-
-async function pruneOtherVersions(vendor, binary, version, root, env, options) {
-  let entries
-  try {
-    entries = readdirSync(vendor).filter((entry) => entry !== version)
-  } catch {
-    return
-  }
-  if (entries.length === 0) return
-  const configs = await agentConfigs(binary, root, env, options.install, options.euid ?? process.geteuid?.())
-  if (configs === null) return
-  const references = configs.flatMap(({ refs }) => refs)
-  const dirs = [...new Set([vendor, realpathOr(vendor)])]
-  const keep = entries.filter((entry) => references.some((ref) => dirs.some((dir) => ref === path.join(dir, entry) || ref.startsWith(path.join(dir, entry) + path.sep))))
-  removeOtherVersions(vendor, version, keep)
-}
-
-const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-async function readBinary(file) {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return readFileSync(file)
-    } catch (error) {
-      if (!BUSY.has(error.code)) return null
-      if (attempt >= BUSY_ATTEMPTS) throw new BusyError(`Cannot read ${file}: ${error.code}. Another process, usually an antivirus scan, keeps it open; run gaze again in a moment`)
-    }
-    await pause(BUSY_DELAY_MS)
-  }
-}
-
-async function matches(file, sha256) {
-  const data = await readBinary(file)
-  return data !== null && createHash('sha256').update(data).digest('hex') === sha256
-}
-
-async function settled(file, sha256) {
-  for (;;) {
-    const stats = regularFile(file)
-    if (!stats) return null
-    if (await matches(file, sha256)) return stats
-    if (Date.now() - stats.mtimeMs > SETTLE_MS) return null
-    await pause(100)
-  }
-}
-
-function verifiedMarker(binary) {
-  return path.join(path.dirname(binary), '.verified')
-}
-
-function regularFile(file) {
-  try {
-    const stats = lstatSync(file)
-    return stats.isFile() ? stats : null
-  } catch {
-    return null
-  }
-}
-
-function sameFile(a, b) {
-  return a !== null && b !== null && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino
-}
-
-function marked(binary, sha256) {
-  const marker = verifiedMarker(binary)
-  const stats = regularFile(binary)
-  if (!stats || !regularFile(marker)) return false
-  try {
-    const mark = JSON.parse(readFileSync(marker, 'utf8'))
-    return mark?.sha256 === sha256 && mark.size === stats.size && mark.mtimeMs === stats.mtimeMs
-  } catch {
-    return false
-  }
-}
-
-function markVerified(binary, sha256, verified) {
-  const stats = regularFile(binary)
-  if (!sameFile(stats, verified)) return
-  const marker = verifiedMarker(binary)
-  const content = `${JSON.stringify({ sha256, size: stats.size, mtimeMs: stats.mtimeMs })}\n`
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      writeFileSync(marker, content, { flag: 'wx' })
-      return
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error
-    }
-    if (marked(binary, sha256)) return
-    rmSync(marker, { recursive: true, force: true })
-  }
-}
-
-function tryMarkVerified(binary, sha256, verified) {
-  try {
-    markVerified(binary, sha256, verified)
-  } catch {}
-}
-
-async function writeOnce(binary, data, sha256) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      writeFileSync(binary, data, { flag: 'wx' })
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error
-      const verified = await settled(binary, sha256)
-      if (!verified) {
-        try {
-          rmSync(verifiedMarker(binary), { recursive: true, force: true })
-          rmSync(binary, { force: true })
-        } catch (failure) {
-          throw new BusyError(`Cannot replace ${binary}, whose sha256 does not match: ${failure.code ?? failure.message}. Another process, usually an antivirus scan or a running gaze, keeps it open; close it and run gaze again`)
-        }
-        continue
-      }
-      tryMarkVerified(binary, sha256, verified)
-      return
-    }
-    const written = regularFile(binary)
-    if (written?.size !== data.length) throw new InstallError(`Wrote ${data.length} bytes to ${binary}, but it has ${written?.size ?? 'no'} bytes on disk`)
-    tryMarkVerified(binary, sha256, written)
-    return
-  }
-  throw new InstallError(`Cannot write ${binary}: another install keeps replacing it`)
-}
-
-function pruneVersionDir(dir) {
-  let entries
-  try {
-    entries = readdirSync(dir)
-  } catch {
-    return
-  }
-  for (const entry of entries) {
-    if (VERSION_ENTRIES.has(entry)) continue
-    const file = path.join(dir, entry)
-    try {
-      rmSync(file, { recursive: true, force: true })
-    } catch (error) {
-      throw new BusyError(`Cannot remove ${file}, which does not belong in ${dir}: ${error.code ?? error.message}. Delete it and run gaze again`)
-    }
   }
 }
 
@@ -423,6 +255,60 @@ function downloadThroughProxy(root, env) {
   })
 }
 
+export function shimFor(root = ROOT) {
+  return path.join(root, 'npm', 'gaze.js')
+}
+
+export function jsMode(platform = process.platform, env = process.env) {
+  if (env.GAZE_BINARY_PATH) return false
+  return platform === 'win32' || env.GAZE_FORCE_JS === '1'
+}
+
+function removeLegacyVendor(root) {
+  try {
+    rmSync(path.join(root, 'vendor'), { recursive: true, force: true })
+  } catch {}
+}
+
+function missingPackage(error) {
+  return error?.code === 'ERR_MODULE_NOT_FOUND' && String(error.message).includes(`'${PORT}'`)
+}
+
+export async function loadPort({ root = ROOT, env = process.env, load = (specifier) => import(specifier) } = {}) {
+  let port
+  try {
+    port = await load(PORT)
+  } catch (error) {
+    if (!missingPackage(error)) throw new InstallError(`cannot load ${PORT}: ${error.message}`)
+    const local = path.join(root, 'packages', 'gaze-win32', 'src', 'index.js')
+    if (env.GAZE_FORCE_JS !== '1' || !existsSync(local)) throw new InstallError(`${PORT} is missing; reinstall with npm install -g @kikedealba/gaze`)
+    try {
+      port = await load(pathToFileURL(local).href)
+    } catch (failure) {
+      throw new InstallError(`cannot load ${local}: ${failure.message}`)
+    }
+  }
+  if (typeof port?.main !== 'function') throw new InstallError(`${PORT} does not export main; reinstall with npm install -g @kikedealba/gaze`)
+  return port
+}
+
+function collector() {
+  let text = ''
+  return { stream: { write: (chunk) => ((text += String(chunk)), true) }, text: () => text }
+}
+
+export async function runPort(argv, { root = ROOT, port } = {}) {
+  const stdout = collector()
+  const stderr = collector()
+  try {
+    const module = port ?? (await loadPort({ root }))
+    const code = await module.main(argv, { self: [process.execPath, shimFor(root)], io: { stdin: Readable.from([]), stdout: stdout.stream, stderr: stderr.stream } })
+    return { code: Number.isInteger(code) ? code : 1, stdout: stdout.text(), stderr: stderr.text() }
+  } catch (error) {
+    return { code: 1, stdout: stdout.text(), stderr: `${stderr.text()}${error.message}` }
+  }
+}
+
 export async function ensureBinary(options = {}) {
   const env = options.env ?? process.env
   const warn = options.warn ?? ((message) => process.stderr.write(message))
@@ -433,9 +319,12 @@ export async function ensureBinary(options = {}) {
   }
   const root = options.root ?? ROOT
   const platform = options.platform ?? process.platform
+  if (jsMode(platform, env)) {
+    if (platform === 'win32') removeLegacyVendor(root)
+    return shimFor(root)
+  }
   const version = packageVersion(root)
-  const binary = vendorBinary(root, platform, version)
-  if (platform === 'win32') return ensureVersionedBinary(binary, version, root, env, warn, options)
+  const binary = vendorBinary(root, platform)
   const name = binaryName(platform)
   if (executable(binary) && vendorVersion(root) === version) return binary
   if (options.offline) return executable(binary) ? binary : null
@@ -489,40 +378,6 @@ export async function ensureBinary(options = {}) {
   return binary
 }
 
-async function ensureVersionedBinary(binary, version, root, env, warn, options) {
-  const vendor = path.dirname(path.dirname(binary))
-  const target = resolveTarget(options.platform, options.arch)
-  const { asset, sha256 } = readChecksum(root, version, target)
-  pruneVersionDir(path.dirname(binary))
-  if (marked(binary, sha256)) {
-    await pruneOtherVersions(vendor, binary, version, root, env, options)
-    return binary
-  }
-  const before = regularFile(binary)
-  if (before && (await matches(binary, sha256))) {
-    tryMarkVerified(binary, sha256, before)
-    await pruneOtherVersions(vendor, binary, version, root, env, options)
-    return binary
-  }
-  if (options.offline) return null
-  if (proxied(env)) return downloadThroughProxy(root, env)
-  const { base, custom } = downloadBase(env, warn)
-
-  const data = await download(`${base}/v${version}/${asset}`, custom)
-  const actual = createHash('sha256').update(data).digest('hex')
-  if (actual !== sha256) throw new InstallError(`Checksum mismatch for ${asset}: expected ${sha256}, got ${actual}`)
-
-  try {
-    mkdirSync(path.dirname(binary), { recursive: true })
-    await pruneOtherVersions(vendor, binary, version, root, env, options)
-    pruneVersionDir(path.dirname(binary))
-    await writeOnce(binary, data, sha256)
-  } catch (error) {
-    throw unwritable(error, vendor)
-  }
-  return binary
-}
-
 function invokedDirectly() {
   try {
     return realpathSync(SELF) === realpathSync(process.argv[1])
@@ -565,8 +420,14 @@ function spawnDir(binary) {
   return vendorRoot(binary) ?? path.dirname(binary)
 }
 
-function npmManaged(bin) {
+function packageRootOf(bin) {
   const root = vendorRoot(bin)
+  if (root !== null) return root
+  return path.basename(path.dirname(bin)) === 'npm' ? path.dirname(path.dirname(bin)) : null
+}
+
+function npmManaged(bin) {
+  const root = packageRootOf(bin)
   return root !== null && readJson(path.join(root, 'package.json'))?.name === '@kikedealba/gaze'
 }
 
@@ -595,34 +456,52 @@ export function daemonMarker(env = process.env) {
   return path.join(dataDir(env), 'daemon.json')
 }
 
-export function daemonStatus(binary, env = process.env) {
-  const result = spawnSync(binary, ['daemon', 'status', '--json'], { env, cwd: spawnDir(binary), stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, encoding: 'utf8' })
+function parseStatus(stdout) {
   try {
-    const envelope = JSON.parse(String(result.stdout ?? '').trim())
+    const envelope = JSON.parse(String(stdout ?? '').trim())
     if (envelope?.ok === true && typeof envelope.data?.installed === 'boolean') return envelope.data
   } catch {}
   return null
 }
 
-function daemonInstalled(binary, env) {
-  const status = daemonStatus(binary, env)
+function isShim(binary, root) {
+  return typeof binary === 'string' && realpathOr(binary) === realpathOr(shimFor(root))
+}
+
+export async function daemonStatus(binary, env = process.env, { root = ROOT, port } = {}) {
+  if (isShim(binary, root)) return parseStatus((await runPort(['daemon', 'status', '--json'], { root, port })).stdout)
+  const result = spawnSync(binary, ['daemon', 'status', '--json'], { env, cwd: spawnDir(binary), stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000, encoding: 'utf8' })
+  return parseStatus(result.stdout)
+}
+
+async function daemonInstalled(binary, env, options) {
+  const status = await daemonStatus(binary, env, options)
   if (status) return status.installed
   const agent = launchAgent(env)
   return (Boolean(agent) && existsSync(agent)) || existsSync(daemonMarker(env))
 }
 
-export function needsRepair(binary, { root = ROOT, env = process.env } = {}) {
+function registeredBin(registered) {
+  const bin = registered?.bin
+  return Array.isArray(bin) && bin.length > 0 && bin.every((part) => typeof part === 'string' && part !== '') ? bin : null
+}
+
+export function needsRepair(binary, { root = ROOT, env = process.env, platform = process.platform } = {}) {
   if (env.GAZE_BINARY_PATH) return false
   const registered = readJson(registryManifest(env))
   if (!registered) return false
-  const bin = registered.bin?.[0]
-  const present = typeof bin === 'string' && existsSync(bin)
-  if (present && !npmManaged(bin)) return false
+  const bin = registeredBin(registered)
+  const entry = bin?.at(-1)
+  const present = bin !== null && bin.every((part) => !path.isAbsolute(part) || existsSync(part))
+  if (present && !npmManaged(entry)) return false
   if (!present || olderVersion(registered.version, packageVersion(root))) return true
-  if (!binary || realpathOr(bin) !== realpathOr(binary)) return false
+  const js = jsMode(platform, env)
+  if (js && bin.length === 1 && realpathOr(vendorRoot(entry) ?? '') === realpathOr(root)) return true
+  if (!binary || realpathOr(entry) !== realpathOr(binary)) return false
+  if (js && (bin.length !== 2 || realpathOr(bin[0]) !== realpathOr(process.execPath))) return true
   const marker = readJson(daemonMarker(env))
-  if (typeof marker?.bin === 'string' && (!existsSync(marker.bin) || realpathOr(marker.bin) !== realpathOr(bin))) return true
-  return plistMismatch(launchAgent(env), bin)
+  if (typeof marker?.bin === 'string' && (!existsSync(marker.bin) || realpathOr(marker.bin) !== realpathOr(entry))) return true
+  return plistMismatch(launchAgent(env), entry)
 }
 
 function xmlEscape(value) {
@@ -782,13 +661,37 @@ function otherReferences(text, prefixes, current) {
   return [...found]
 }
 
+const NODE_BEFORE = String.raw`(?<=^|["'\s\[=,])((?:[A-Za-z]:|/)[^"'\n]*?[\\/]node(?:\.exe)?)(?:["'\\\s,:=\[\]]|args)*`
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function sameNode(candidate, nodes) {
+  if (nodes.includes(candidate) || nodes.includes(realpathOr(candidate))) return true
+  return /^[A-Za-z]:/.test(candidate) && nodes.some((node) => node.toLowerCase() === candidate.toLowerCase())
+}
+
+function otherNodes(text, shims) {
+  const nodes = [...new Set([process.execPath, realpathOr(process.execPath)])]
+  const found = new Set()
+  for (const form of shims.flatMap(escapedForms)) {
+    for (const match of text.matchAll(new RegExp(NODE_BEFORE + escapeRegExp(form), 'g'))) {
+      const candidate = unescaped(match[1])
+      if (!sameNode(candidate, nodes)) found.add(candidate)
+    }
+  }
+  return [...found]
+}
+
 function configFiles(homes) {
   return Object.entries(INTEGRATION_FILES).flatMap(([agent, files]) => files(homes).map((file) => ({ agent, file })))
 }
 
 export function staleConfigs(binary, homes, root = ROOT, { strict = false } = {}) {
   const prefixes = [...new Set([root, realpathOr(root)])].map((dir) => path.join(dir, 'vendor') + path.sep)
-  const current = [...new Set([binary, realpathOr(binary)])]
+  const current = [...new Set([binary, realpathOr(binary), process.execPath])]
+  const shims = [...new Set([shimFor(root), realpathOr(shimFor(root))])]
   return configFiles(homes).flatMap(({ agent, file }) => {
     let text
     try {
@@ -797,7 +700,7 @@ export function staleConfigs(binary, homes, root = ROOT, { strict = false } = {}
       if (strict && !MISSING.has(error.code)) throw error
       return []
     }
-    const refs = otherReferences(text, prefixes, current)
+    const refs = [...otherReferences(text, prefixes, current), ...otherNodes(text, shims)]
     return refs.length > 0 ? [{ agent, file, refs }] : []
   })
 }
@@ -814,16 +717,6 @@ async function loadKit(env, install = {}) {
   } catch (error) {
     if (error.code === 'ERR_MODULE_NOT_FOUND') return null
     throw error
-  }
-}
-
-async function agentConfigs(binary, root, env, install, euid) {
-  if (euid === 0) return null
-  try {
-    const kit = await loadKit(env, install)
-    return kit ? staleConfigs(binary, kit.homes, root, { strict: true }) : []
-  } catch {
-    return null
   }
 }
 
@@ -967,20 +860,32 @@ export async function refreshIntegrations(binary, { root = ROOT, env = process.e
   return ok
 }
 
-export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, euid = process.geteuid?.(), warn = (message) => process.stderr.write(message) } = {}) {
+function spawnRefresh(binary, args, env) {
+  const result = spawnSync(binary, args, { env, cwd: spawnDir(binary), stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
+  if (result.status === 0) return null
+  return (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
+}
+
+async function portRefresh(args, options) {
+  const result = await runPort(args, options)
+  if (result.code === 0) return null
+  return result.stderr.trim() || `exit ${result.code}`
+}
+
+export async function refreshRegistration(binary, { env = process.env, root = ROOT, install, port, euid = process.geteuid?.(), warn = (message) => process.stderr.write(message) } = {}) {
   if (euid === 0) {
     warn('gaze: running as root; the kit registration, the daemon and the agent integrations were not refreshed. Run `gaze setup && gaze daemon install` as your user\n')
     return false
   }
-  const daemon = daemonInstalled(binary, env)
+  const js = isShim(binary, root)
+  const daemon = await daemonInstalled(binary, env, { root, port })
   const steps = []
   if (daemon || existsSync(registryManifest(env))) steps.push(['setup'])
   if (daemon) steps.push(['daemon', 'install'])
   let refreshed = true
   for (const args of steps) {
-    const result = spawnSync(binary, args, { env, cwd: spawnDir(binary), stdio: ['ignore', 'ignore', 'pipe'], timeout: REFRESH_TIMEOUT_MS, encoding: 'utf8', windowsHide: true })
-    if (result.status !== 0) {
-      const detail = (result.error?.message ?? result.stderr?.trim()) || `exit ${result.status ?? result.signal}`
+    const detail = js ? await portRefresh(args, { root, port }) : spawnRefresh(binary, args, env)
+    if (detail !== null) {
       warn(`gaze: could not refresh the daemon with \`gaze ${args.join(' ')}\` (${detail}); run \`gaze setup && gaze daemon install\` by hand\n`)
       refreshed = false
       break
@@ -1033,12 +938,10 @@ export async function runInstall(mode, argument, options = {}) {
   const write = options.write ?? ((text) => process.stderr.write(text))
   try {
     const binary = await ensureBinary(mode === '--proxy-child' ? { ...options, root: argument } : options)
-    if (mode === '--postinstall') await refreshRegistration(binary, { env: options.env, root: options.root, install: options.install, warn: write })
+    if (mode === '--postinstall') await refreshRegistration(binary, { env: options.env, root: options.root, install: options.install, port: options.port, warn: write })
   } catch (error) {
     if (mode === '--postinstall' && error instanceof NetworkError) {
       write(`gaze: could not download the binary during install (${error.message}); it will be downloaded the first time gaze runs\n`)
-    } else if (mode === '--postinstall' && error instanceof BusyError) {
-      write(`gaze: could not finish installing the binary (${error.message}); it will be completed the first time gaze runs\n`)
     } else {
       write(`gaze: ${error.message}\n`)
       return mode === '--proxy-child' && error instanceof NetworkError ? NETWORK_EXIT : 1

@@ -4,7 +4,7 @@ Port de gaze a JavaScript para Windows. Corre sobre `node.exe` con JS y `.wasm`,
 
 No se instala a mano: `@kikedealba/gaze` lo trae como `optionalDependency`, y npm solo lo instala en Windows (`"os": ["win32"]`). El comando que se usa es `gaze`, el lanzador `npm/gaze.js` del paquete principal. macOS y Linux siguen con el binario de Rust.
 
-Requiere Node 24.5 o más nuevo. La base es `node:sqlite` (FTS5), los vectores se comparan por fuerza bruta en JS y los embeddings usan `onnxruntime-web` (WASM) con el modelo q8 `Xenova/multilingual-e5-small`, que se descarga a `%LOCALAPPDATA%\gaze\cache`. Una base 0.6.x con `vec0` se migra al abrirla y se reindexa.
+Requiere Node 24.5 o más nuevo. La base es `node:sqlite` (FTS5), los vectores se comparan por fuerza bruta en JS y los embeddings usan `onnxruntime-web` (WASM) con el modelo q8 `Xenova/multilingual-e5-small`, que se descarga a `%LOCALAPPDATA%\gaze\cache`. Una base 0.6.x con `vec0` se migra al abrirla y sus vectores se regeneran después (ver abajo).
 
 | Módulo | Equivale a | Qué hace |
 |---|---|---|
@@ -20,12 +20,12 @@ Requiere Node 24.5 o más nuevo. La base es `node:sqlite` (FTS5), los vectores s
 
 Una base creada por el binario nativo usa la tabla virtual `vec0` de sqlite-vec, que `node:sqlite` no puede cargar.
 
-- **Windows:** al abrirla, el port copia todas las tablas normales y el índice de texto a una base nueva, marca las notas sin vectores y deja la original como `gaze.db.vec0.bak`. Después hay que correr `gaze reindex` para regenerar los vectores. No usa `writable_schema`.
+- **Windows:** al abrirla, el port copia todas las tablas normales y el índice de texto a una base nueva, marca las notas sin vectores y deja la original como `gaze.db.vec0.bak`. No usa `writable_schema`. Mientras haya notas, ningún vector y esa copia al lado, la CLI regenera los vectores en el mismo proceso y los hooks lanzan `gaze reindex` en segundo plano, como mucho una vez cada 10 minutos (marca `reindex.spawned`).
 - **macOS y Linux:** el port se niega a abrirla, para no romper la base del binario nativo. Usa `GAZE_DATA_DIR` para darle al port su propio directorio.
 
 ## Daemon e IPC
 
-El daemon escucha en `\\.\pipe\gaze-<usuario>` en Windows y en `<datos>/gaze.sock` en macOS y Linux (`GAZE_SOCKET` cambia ambos). Cada arranque rota un token de 32 bytes en `<datos>/daemon.token`. Las peticiones y las respuestas van firmadas con HMAC-SHA256 (contexto `gaze-ipc-v3`) sobre los dos nonces, el número de secuencia y el `sha256` del cuerpo, así que el token nunca viaja, ni el cliente ni el servidor aceptan a quien no lo conozca y un cuerpo alterado no pasa. Ambos sentidos usan el mismo sobre `{ auth, body }`, con `body` como JSON en texto. Los límites son los de gaze nativo: líneas de 1 MiB hacia el daemon, respuestas de hasta 64 MiB y 60 s de inactividad por conexión.
+El daemon escucha en `\\.\pipe\gaze-<usuario>` en Windows y en `<datos>/gaze.sock` en macOS y Linux (`GAZE_SOCKET` cambia ambos). Cada arranque rota un token de 32 bytes en `<datos>/daemon.token`. Las peticiones y las respuestas van firmadas con HMAC-SHA256 (contexto `gaze-ipc-v3`) sobre los dos nonces, el número de secuencia y el `sha256` del cuerpo, así que el token nunca viaja, ni el cliente ni el servidor aceptan a quien no lo conozca y un cuerpo alterado no pasa. Cada conexión empieza con un hello sin el sobre: el cliente manda `{ "op": "hello", "nonce" }` y el servidor responde `{ "ok": true, "nonce", "auth" }` en una línea JSON plana. Después, las peticiones y respuestas de ambos sentidos usan el sobre `{ auth, body }`, con `body` como JSON en texto. Los límites son los de gaze nativo: líneas de 1 MiB hacia el daemon, respuestas de hasta 64 MiB y 60 s de inactividad por conexión.
 
 Rutas, daemon bajo demanda, named pipe y qué pedirle a TI: [README de gaze](../../README.md#windows-con-antivirus-o-edr-corporativo).
 

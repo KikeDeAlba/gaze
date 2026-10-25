@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { SHIM_TARGET, commandFor, hardenEnv, killCommand, lastJsonLine, resolveProgram, runSync, shimTarget, spawnDetached, systemBinary } from '../src/proc.js'
+import { SHIM_TARGET, commandFor, hardenEnv, superviseSync, supervisorArgs, killCommand, lastJsonLine, resolveProgram, runSync, shimTarget, spawnDetached, systemBinary } from '../src/proc.js'
 
 const SHIMS = new URL('./fixtures/cmd-shims/', import.meta.url)
 const TARGETS = {
@@ -195,6 +195,53 @@ test('kill tree uses taskkill on windows', () => {
   assert.deepEqual(killCommand(1234, 'win32', { SystemRoot: 'D:\\Win' }), { file: 'D:\\Win\\System32\\taskkill.exe', args: ['/T', '/F', '/PID', '1234'] })
   assert.equal(killCommand(1, 'win32', {}).file, 'C:\\Windows\\System32\\taskkill.exe')
   assert.equal(killCommand(1234, 'linux'), null)
+})
+
+test('run sync under cmd goes through a supervisor that kills the whole tree with taskkill', () => {
+  const command = { file: 'C:\\Windows\\System32\\cmd.exe', args: ['/d', '/s', '/c', '""x" "y""'], windowsVerbatimArguments: true }
+  const args = supervisorArgs(command, { timeoutMs: 5000, platform: 'win32', env: { SystemRoot: 'D:\\Win' } })
+  assert.equal(args[0], '-e')
+  assert.deepEqual(JSON.parse(args[2]), {
+    file: command.file,
+    args: command.args,
+    verbatim: true,
+    timeoutMs: 5000,
+    kill: 'D:\\Win\\System32\\taskkill.exe',
+    killMs: 10000,
+    timedOut: 124,
+    failed: 125,
+  })
+  assert.equal(JSON.parse(supervisorArgs(command, { timeoutMs: 1, platform: 'linux' })[2]).kill, null)
+})
+
+test('the supervisor relays output and kills grandchildren on timeout', { skip: process.platform === 'win32' && 'uses process groups' }, async () => {
+  const echo = path.join(dir, 'echo.mjs')
+  fs.writeFileSync(echo, "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{console.log(JSON.stringify({got:s,arg:process.argv[2]}));process.exit(3)})")
+  const done = superviseSync({ file: process.execPath, args: [echo, 'x'] }, { timeoutMs: 20000, input: 'hola', platform: 'linux' })
+  assert.equal(done.error, null)
+  assert.equal(done.status, 3)
+  assert.deepEqual(lastJsonLine(done.stdout), { got: 'hola', arg: 'x' })
+  const missing = superviseSync({ file: path.join(dir, 'nope'), args: [] }, { timeoutMs: 20000, platform: 'linux' })
+  assert.equal(missing.error.code, 'ENOENT')
+  const pidFile = path.join(dir, 'grandchild.pid')
+  const parent = path.join(dir, 'parent.mjs')
+  fs.writeFileSync(parent, `import { spawn } from 'node:child_process'\nimport fs from 'node:fs'\nconst g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' })\nfs.writeFileSync(${JSON.stringify(pidFile)}, String(g.pid))\nsetTimeout(() => {}, 60000)\n`)
+  const started = Date.now()
+  const timed = superviseSync({ file: process.execPath, args: [parent] }, { timeoutMs: 1500, platform: 'linux' })
+  assert.equal(timed.error.code, 'ETIMEDOUT')
+  assert.ok(Date.now() - started < 15000)
+  const grandchild = Number(fs.readFileSync(pidFile, 'utf8'))
+  const deadline = Date.now() + 5000
+  let gone = false
+  while (!gone && Date.now() < deadline) {
+    try {
+      process.kill(grandchild, 0)
+      await new Promise((r) => setTimeout(r, 50))
+    } catch {
+      gone = true
+    }
+  }
+  assert.equal(gone, true)
 })
 
 test('spawn detached writes to the log file and returns the pid', async () => {

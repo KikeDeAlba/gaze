@@ -56,7 +56,7 @@ test('resolve program prefers exe and keeps explicit paths and extensions', () =
   assert.equal(resolveProgram('bita.exe', { path: search, windows: true }), path.join(other, 'bita.exe'))
   assert.throws(() => resolveProgram('recap', { path: search, windows: true }), { code: 'ENOENT' })
   assert.equal(resolveProgram('C:\\tools\\bita', { path: search, windows: true }), 'C:\\tools\\bita')
-  assert.equal(resolveProgram('./bita', { path: search, windows: true }), './bita')
+  assert.throws(() => resolveProgram('./bita', { path: search, windows: true }), { code: 'EINVAL' })
   assert.throws(() => resolveProgram('bita', { path: undefined, windows: true }), { code: 'ENOENT' })
 })
 
@@ -130,13 +130,32 @@ test('programs planted in the cwd or in relative path entries never run on windo
   fs.mkdirSync(empty)
   const marker = path.join(dir, 'ran')
   for (const name of ['bita.exe', 'bita.cmd', 'bita.bat', 'git.exe']) fs.writeFileSync(path.join(repo, name), `@echo off\r\necho x > "${marker}"\r\n`)
-  const relative = path.relative(process.cwd(), repo)
-  assert.throws(() => resolveProgram('bita', { path: ['.', relative, empty].join(path.delimiter), windows: true }), { code: 'ENOENT', message: 'bita not found in PATH' })
-  const done = runSync('bita', ['projects'], { cwd: repo, env: { PATH: empty }, platform: 'win32' })
-  assert.equal(done.error.code, 'ENOENT')
-  assert.equal(spawnDetached(['git', 'status'], { cwd: repo, env: { PATH: empty }, platform: 'win32' }), null)
+  const previous = process.cwd()
+  process.chdir(repo)
+  try {
+    const relative = ['.', path.join('..', 'repo'), path.join('..', '..', path.basename(dir), 'repo')]
+    if (process.platform === 'win32') relative.push(repo.slice(2), `${repo.slice(0, 2)}.`)
+    for (const entry of relative) assert.equal(path.win32.isAbsolute(entry) && /^[A-Za-z]:[\\/]|^[\\/]{2}/.test(entry), false, entry)
+    assert.throws(() => resolveProgram('bita', { path: [...relative, empty].join(path.delimiter), windows: true }), { code: 'ENOENT', message: 'bita not found in PATH' })
+    const done = runSync('bita', ['projects'], { cwd: repo, env: { PATH: empty }, platform: 'win32' })
+    assert.equal(done.error.code, 'ENOENT')
+    assert.equal(spawnDetached(['git', 'status'], { cwd: repo, env: { PATH: empty }, platform: 'win32' }), null)
+  } finally {
+    process.chdir(previous)
+  }
   assert.equal(fs.existsSync(marker), false)
   assert.equal(resolveProgram('bita', { path: `"${repo}"`, windows: true }), path.join(repo, 'bita.exe'))
+})
+
+test('explicit programs on windows must be absolute with a drive or unc', () => {
+  for (const bad of ['.\\bita.exe', 'C:bita.exe', 'bin\\bita.exe', './bita.exe', '\\bin\\bita.exe']) {
+    assert.throws(() => resolveProgram(bad, { path: '', windows: true }), { code: 'EINVAL', message: `${bad} is not an absolute path` }, bad)
+    assert.equal(runSync(bad, [], { env: { PATH: '' }, platform: 'win32' }).error.code, 'EINVAL')
+  }
+  for (const good of ['C:\\tools\\bita.exe', 'd:/tools/bita.exe', '\\\\server\\share\\bita.exe']) {
+    assert.equal(resolveProgram(good, { path: '', windows: true }), good)
+  }
+  assert.equal(resolveProgram('./bita', { path: '', windows: false }), './bita')
 })
 
 test('system binaries live under an absolute SystemRoot', () => {

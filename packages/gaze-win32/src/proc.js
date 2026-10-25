@@ -63,17 +63,33 @@ function notInPath(bin) {
   return error
 }
 
-function searchDirs(searchPath) {
+export function isRooted(file, windows = isWindows(process.platform)) {
+  if (!windows) return path.isAbsolute(file)
+  if (/^[A-Za-z]:[\\/]/.test(file) || /^[\\/]{2}[^\\/]/.test(file)) return true
+  return !isWindows(process.platform) && path.posix.isAbsolute(file)
+}
+
+export function searchDirs(searchPath, windows = isWindows(process.platform)) {
   return (searchPath ?? '')
     .split(path.delimiter)
     .map((dir) => dir.replace(/^"(.*)"$/, '$1'))
-    .filter((dir) => dir !== '' && path.isAbsolute(dir))
+    .filter((dir) => dir !== '' && isRooted(dir, windows))
+}
+
+function notRooted(bin) {
+  const error = new Error(`${bin} is not an absolute path`)
+  error.code = 'EINVAL'
+  return error
 }
 
 export function resolveProgram(bin, { path: searchPath = envGet(process.env, 'PATH'), windows = isWindows(process.platform) } = {}) {
-  if (!windows || hasSeparator(bin, windows)) return bin
+  if (!windows) return bin
+  if (hasSeparator(bin, windows)) {
+    if (!isRooted(bin, windows)) throw notRooted(bin)
+    return bin
+  }
   const exts = path.extname(bin) !== '' ? [''] : WINDOWS_EXTS
-  for (const dir of searchDirs(searchPath)) {
+  for (const dir of searchDirs(searchPath, windows)) {
     for (const ext of exts) {
       const full = path.join(dir, `${bin}${ext}`)
       if (isFile(full)) return full

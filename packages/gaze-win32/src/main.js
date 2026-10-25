@@ -10,6 +10,7 @@ import * as importer from './import.js'
 import * as ingest from './ingest.js'
 import { McpServer } from './mcp.js'
 import * as paths from './paths.js'
+import { currentDir, decodeStrict } from './paths.js'
 import { spawnDetached } from './proc.js'
 import * as project from './project.js'
 import * as setup from './setup.js'
@@ -281,26 +282,10 @@ export function parse(argv) {
   return leaf.help ? leaf : { route, values: leaf.values, json }
 }
 
-function currentDir() {
-  try {
-    return process.cwd()
-  } catch {
-    return '/'
-  }
-}
-
 async function readAll(stream) {
   const chunks = []
   for await (const chunk of stream) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
   return Buffer.concat(chunks)
-}
-
-function decodeStrict(bytes) {
-  try {
-    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
-  } catch {
-    throw new Error('stream did not contain valid UTF-8')
-  }
 }
 
 async function readBody(ctx, body) {

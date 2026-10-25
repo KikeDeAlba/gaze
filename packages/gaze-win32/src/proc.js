@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { isFile } from './paths.js'
 
 export const WINDOWS_EXTS = ['.exe', '.cmd', '.bat', '.com']
 export const SHIM_TARGET = /"%~?dp0%?\\([^"]+)"\s+%\*/i
@@ -24,14 +25,6 @@ const SUPERVISOR = [
 ].join('\n')
 
 const isWindows = (platform) => platform === 'win32'
-
-function isFile(file) {
-  try {
-    return fs.statSync(file).isFile()
-  } catch {
-    return false
-  }
-}
 
 function hasSeparator(bin, windows) {
   return windows ? /[\\/]/.test(bin) || /^[A-Za-z]:/.test(bin) : bin.includes('/')

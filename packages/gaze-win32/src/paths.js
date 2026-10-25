@@ -55,12 +55,40 @@ export function canonical(p) {
   }
 }
 
-export function readUtf8Strict(file) {
-  const bytes = fs.readFileSync(file)
+export function decodeStrict(bytes) {
   try {
     return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch {
     throw new Error('stream did not contain valid UTF-8')
+  }
+}
+
+export function readUtf8Strict(file) {
+  return decodeStrict(fs.readFileSync(file))
+}
+
+export function isFile(p) {
+  try {
+    return fs.statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+export function exists(p) {
+  try {
+    fs.statSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function currentDir() {
+  try {
+    return process.cwd()
+  } catch {
+    return '/'
   }
 }
 

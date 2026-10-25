@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { commandFor, envGet, envSet, hardenEnv, killTree, resolveProgram } from './proc.js'
-import { lines, trim, truncate } from './text.js'
+import { lines, str, trim, truncate } from './text.js'
 
 export const AGENTS = ['claude', 'codex', 'gemini', 'antigravity', 'opencode']
 export const HEADLESS_ENV = 'KIT_HEADLESS'
@@ -203,7 +203,6 @@ const field = (value, ...keys) => {
   }
   return current
 }
-const str = (value) => (typeof value === 'string' ? value : null)
 const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
 
 function lastString(events, pick) {

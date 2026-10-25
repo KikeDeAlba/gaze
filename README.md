@@ -65,7 +65,7 @@ El plugin de Claude Code (hooks, skill y MCP) se instala desde el marketplace de
 Requiere Rust 1.88 o más nuevo:
 
 ```sh
-cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.6.2   # o, desde el clon: cargo install --path .
+cargo install --locked --git https://github.com/KikeDeAlba/gaze --tag v0.7.1   # o, desde el clon: cargo install --path .
 gaze setup
 ```
 

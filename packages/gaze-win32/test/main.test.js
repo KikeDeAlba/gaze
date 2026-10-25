@@ -99,6 +99,8 @@ test('version and help exit with 0 on stdout', async () => {
   assert.match(help.stdout, /^El cerebro de cada proyecto/)
   assert.match(help.stdout, /remember +Guarda una nota/)
   assert.doesNotMatch(help.stdout, /harvest-run/)
+  assert.match(help.stdout, /daemon +Activa o quita el daemon bajo demanda/)
+  assert.doesNotMatch(help.stdout, /launchd|systemd|schtasks/)
   const sub = await gaze(['search', '-h'])
   assert.equal(sub.code, 0)
   assert.match(sub.stdout, /Usage: gaze search \[OPTIONS\] <QUERY>/)

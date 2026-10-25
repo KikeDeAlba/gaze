@@ -80,7 +80,7 @@ const COMMANDS = {
     },
   },
   daemon: {
-    about: 'Instala o quita el daemon (launchd, systemd --user o schtasks)',
+    about: 'Activa o quita el daemon bajo demanda (arranca con el primer hook o búsqueda y se apaga solo al quedar inactivo)',
     sub: { install: {}, uninstall: {}, status: {} },
   },
   hook: {

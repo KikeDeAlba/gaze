@@ -60,8 +60,14 @@ jobs:
           cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
           npm_version="$(jq -r .version package.json)"
           plugin_version="$(jq -r .version .claude-plugin/plugin.json)"
-          if [ "$cargo_version" != "$npm_version" ] || [ "$cargo_version" != "$plugin_version" ]; then
-            echo "Cargo.toml is $cargo_version, package.json is $npm_version, plugin.json is $plugin_version" >&2
+          if [ ! -f packages/gaze-win32/package.json ]; then
+            echo "packages/gaze-win32/package.json is missing: the windows port is not in this branch" >&2
+            exit 1
+          fi
+          port_version="$(jq -r .version packages/gaze-win32/package.json)"
+          port_pin="$(jq -r '.optionalDependencies["@kikedealba/gaze-win32"]' package.json)"
+          if [ "$cargo_version" != "$npm_version" ] || [ "$cargo_version" != "$plugin_version" ] || [ "$cargo_version" != "$port_version" ] || [ "$cargo_version" != "$port_pin" ]; then
+            echo "Cargo.toml is $cargo_version, package.json is $npm_version, plugin.json is $plugin_version, packages/gaze-win32 is $port_version, optionalDependencies pins $port_pin" >&2
             exit 1
           fi
 
@@ -70,3 +76,117 @@ jobs:
 
       - name: npm tests
         run: npm run test:npm
+
+  port:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: the port has to exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f packages/gaze-win32/package.json ]; then
+            echo "packages/gaze-win32/package.json is missing: the windows port is not in this branch" >&2
+            exit 1
+          fi
+
+      - name: port dependencies
+        shell: bash
+        working-directory: packages/gaze-win32
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --force --no-audit --no-fund
+          else
+            npm install --force --no-audit --no-fund
+          fi
+
+      - name: port tests
+        working-directory: packages/gaze-win32
+        env:
+          GAZE_EMBEDDER: fake
+        run: npm test
+
+  parity:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: the port has to exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          for required in packages/gaze-win32/package.json packages/gaze-win32/bin/gaze.js packages/gaze-win32/test/parity.test.js; do
+            if [ ! -f "$required" ]; then
+              echo "$required is missing: the windows port is not complete in this branch" >&2
+              exit 1
+            fi
+          done
+
+      - name: build dependencies for onnxruntime and native-tls
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
+
+      - run: cargo build --locked
+
+      - name: port dependencies
+        shell: bash
+        working-directory: packages/gaze-win32
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --force --no-audit --no-fund
+          else
+            npm install --force --no-audit --no-fund
+          fi
+
+      - name: parity between the rust binary and the port
+        shell: bash
+        env:
+          GAZE_EMBEDDER: fake
+        run: |
+          set -euo pipefail
+          rust_bin="$PWD/target/debug/gaze"
+          if [ "$RUNNER_OS" = "Windows" ]; then rust_bin="$rust_bin.exe"; fi
+          GAZE_PARITY_RUST="$rust_bin" GAZE_PARITY_JS="$PWD/packages/gaze-win32/bin/gaze.js" node --test packages/gaze-win32/test/parity.test.js
+
+      - name: rust cli tests against the port
+        shell: bash
+        env:
+          GAZE_EMBEDDER: fake
+        run: |
+          set -euo pipefail
+          GAZE_TEST_CMD='["node","packages/gaze-win32/bin/gaze.js"]' cargo test --locked --test cli

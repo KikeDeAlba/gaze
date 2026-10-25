@@ -23,9 +23,11 @@ jobs:
           cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
           npm_version="$(jq -r .version package.json)"
           plugin_version="$(jq -r .version .claude-plugin/plugin.json)"
-          for found in "$cargo_version" "$npm_version" "$plugin_version"; do
+          port_version="$(jq -r .version packages/gaze-win32/package.json)"
+          port_pin="$(jq -r '.optionalDependencies["@kikedealba/gaze-win32"]' package.json)"
+          for found in "$cargo_version" "$npm_version" "$plugin_version" "$port_version" "$port_pin"; do
             if [ "$tag" != "$found" ]; then
-              echo "the release is $tag and the manifests say $cargo_version (Cargo.toml), $npm_version (package.json), $plugin_version (plugin.json)" >&2
+              echo "the release is $tag and the manifests say $cargo_version (Cargo.toml), $npm_version (package.json), $plugin_version (plugin.json), $port_version (packages/gaze-win32/package.json), $port_pin (optionalDependencies)" >&2
               exit 1
             fi
           done
@@ -45,8 +47,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -68,22 +68,15 @@ jobs:
       - name: smoke test the binary
         shell: bash
         run: |
-          bin=gaze
-          if [ "$RUNNER_OS" = "Windows" ]; then bin=gaze.exe; fi
-          "./target/${{ matrix.target }}/release/$bin" capabilities --json | jq -e .ok
+          "./target/${{ matrix.target }}/release/gaze" capabilities --json | jq -e .ok
 
       - name: package the binary
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           release_dir="target/${{ matrix.target }}/release"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            archive="gaze-${version}-${{ matrix.target }}.exe"
-            cp "$release_dir/gaze.exe" "$archive"
-          else
-            archive="gaze-${version}-${{ matrix.target }}.tar.gz"
-            tar -czf "$archive" -C "$release_dir" gaze
-          fi
+          archive="gaze-${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "$release_dir" gaze
           echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
@@ -142,17 +135,15 @@ jobs:
           set -euo pipefail
           version="$(jq -r .version package.json)"
           assets='{}'
-          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc; do
-            ext=tar.gz
-            if [ "$target" = "x86_64-pc-windows-msvc" ]; then ext=exe; fi
-            file="gaze-${version}-${target}.${ext}"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            file="gaze-${version}-${target}.tar.gz"
             sum="$(sha256sum "$ARCHIVES/$file" | cut -d ' ' -f 1)"
             assets="$(jq -c --arg target "$target" --arg file "$file" --arg sum "$sum" '.[$target] = {file: $file, sha256: $sum}' <<< "$assets")"
           done
           jq -n --arg version "$version" --argjson assets "$assets" '{version: $version, assets: $assets}' > npm/checksums.json
-          jq -e '.assets | length == 4' npm/checksums.json
+          jq -e '.assets | length == 3' npm/checksums.json
           jq -e 'all(.assets[]; .sha256 | test("^[0-9a-f]{64}$"))' npm/checksums.json
-          jq -e '.assets["x86_64-pc-windows-msvc"].file | endswith(".exe")' npm/checksums.json
+          jq -e '.assets | has("x86_64-pc-windows-msvc") | not' npm/checksums.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -161,7 +152,7 @@ jobs:
           if-no-files-found: error
 
   windows-smoke:
-    needs: checksums
+    needs: [check, checksums]
     runs-on: windows-latest
     permissions:
       contents: read
@@ -177,82 +168,107 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: archive-*
-          path: ${{ runner.temp }}/archives
-          merge-multiple: true
-
-      - uses: actions/download-artifact@v4
-        with:
           name: npm-checksums
           path: npm
 
-      - name: install the tarball from a local server the way a person would, and run it
+      - name: install both tarballs the way a person would
         shell: bash
         run: |
-          version="$(jq -r .version package.json)"
-          serve_root="$RUNNER_TEMP/serve"
-          mkdir -p "$serve_root/v$version"
-          cp "$RUNNER_TEMP"/archives/* "$serve_root/v$version/"
-          cat > "$RUNNER_TEMP/serve.mjs" <<'JS'
-          import { createServer } from 'node:http'
-          import { createReadStream, statSync } from 'node:fs'
-          import path from 'node:path'
-          const root = path.resolve(process.argv[2])
-          createServer((req, res) => {
-            let file
-            try {
-              file = path.join(root, decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname))
-            } catch {
-              res.writeHead(400).end()
-              return
-            }
-            if (!file.startsWith(root + path.sep)) { res.writeHead(403).end(); return }
-            try {
-              const stats = statSync(file)
-              if (!stats.isFile()) { res.writeHead(404).end(); return }
-              res.writeHead(200, { 'content-length': stats.size })
-              createReadStream(file).on('error', () => res.destroy()).pipe(res)
-            } catch {
-              res.writeHead(404).end()
-            }
-          }).listen(38417, '127.0.0.1')
-          JS
-          node "$(cygpath -m "$RUNNER_TEMP/serve.mjs")" "$(cygpath -m "$serve_root")" &
-          server=$!
-          trap 'kill $server' EXIT
-          ready=0
-          for _ in $(seq 1 20); do
-            if curl -fsS -o /dev/null "http://127.0.0.1:38417/v$version/gaze-$version-x86_64-pc-windows-msvc.exe"; then ready=1; break; fi
-            sleep 0.5
-          done
-          if [ "$ready" != "1" ]; then
-            echo "the local server never served the windows asset" >&2
-            exit 1
-          fi
-          tarball="$(npm pack --pack-destination "$(cygpath -m "$RUNNER_TEMP")" --silent | tail -1)"
-          prefix="$RUNNER_TEMP/prefix"
+          set -euo pipefail
           npm --version
-          GAZE_DOWNLOAD_BASE="http://127.0.0.1:38417" npm install -g --allow-scripts=@kikedealba/gaze --prefix "$(cygpath -m "$prefix")" "$(cygpath -m "$RUNNER_TEMP/$tarball")"
-          vendor="$prefix/node_modules/@kikedealba/gaze/vendor"
-          expected="$(jq -r '.assets["x86_64-pc-windows-msvc"].sha256' npm/checksums.json)"
-          test -f "$vendor/$version/gaze.exe"
-          test -f "$vendor/$version/.verified"
-          marker="$vendor/$version/.verified"
-          actual_size="$(wc -c < "$vendor/$version/gaze.exe" | tr -d ' ')"
-          if [ "$(jq -r .sha256 "$marker")" != "$expected" ] || [ "$(jq -r .size "$marker")" != "$actual_size" ]; then
-            echo "the .verified marker does not match sha256 $expected and size $actual_size" >&2
-            cat "$marker" >&2
+          node --version
+          dest="$(cygpath -m "$RUNNER_TEMP")/tarballs"
+          mkdir -p "$dest"
+          port_tarball="$(cd packages/gaze-win32 && npm pack --pack-destination "$dest" --silent | tail -1)"
+          gaze_tarball="$(npm pack --pack-destination "$dest" --silent | tail -1)"
+          prefix="$(cygpath -m "$RUNNER_TEMP")/prefix"
+          npm install -g --allow-scripts=@kikedealba/gaze --prefix "$prefix" "$dest/$port_tarball" "$dest/$gaze_tarball"
+          test -f "$prefix/node_modules/@kikedealba/gaze-win32/package.json"
+          test -f "$prefix/node_modules/@kikedealba/gaze/package.json"
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      - name: no native files anywhere in the installed tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          modules="$PREFIX/node_modules"
+          found=""
+          for root in "$modules/@kikedealba" "$modules/onnxruntime-web" "$modules/@huggingface/tokenizers" "$modules/smol-toml"; do
+            if [ ! -d "$root" ]; then
+              echo "missing $root" >&2
+              exit 1
+            fi
+            hits="$(find "$root" \( -name '*.exe' -o -name '*.node' -o -name '*.dll' \))"
+            found="$found$hits"
+          done
+          if [ -n "$found" ]; then
+            echo "native files in the install:" >&2
+            echo "$found" >&2
             exit 1
           fi
-          prefix_unix="$(cygpath -u "$prefix")"
-          GAZE_DOWNLOAD_BASE="http://127.0.0.1:1" PATH="$prefix_unix:$PATH" gaze capabilities --json | jq -e .ok
-          ls -la "$vendor"
-          leftovers="$(find "$vendor" \( -name '*.old-*' -o -name '.install-*' -o -name '*.zip' -o -name '*.tar.gz' \) )"
-          if [ -n "$leftovers" ]; then
-            echo "the installer left files behind in vendor:" >&2
-            echo "$leftovers" >&2
-            exit 1
-          fi
+
+      - name: run the port with the fake embedder
+        shell: bash
+        env:
+          GAZE_EMBEDDER: fake
+          GAZE_PROJECT: smoke
+          GAZE_BITA_BIN: C:\nonexistent\bita
+          INKWELL_DOCS_DIR: ${{ runner.temp }}\smoke\docs
+          INKWELL_DB_PATH: ${{ runner.temp }}\smoke\inkwell.db
+          GAZE_DATA_DIR: ${{ runner.temp }}\smoke\data
+          GAZE_CONFIG: ${{ runner.temp }}\smoke\data\config.toml
+          KIT_REGISTRY_DIR: ${{ runner.temp }}\smoke\tools.d
+        run: |
+          set -euo pipefail
+          mkdir -p "$GAZE_DATA_DIR"
+          export PATH="$(cygpath -u "$PREFIX"):$PATH"
+          version="$(jq -r .version package.json)"
+          test "$(gaze --version)" = "gaze $version"
+          gaze capabilities --json | jq -e .ok
+          gaze remember "the smoke test remembers the deploy window" --title smoke --json | jq -e .ok
+          gaze search "deploy window" --json | jq -e '.ok and (.data | tostring | contains("smoke"))'
+          printf '%s' '{"session_id":"smoke-1","cwd":"C:\\","prompt":"what is the deploy window for the smoke test project"}' | gaze hook prompt
+          printf '%s\n%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | gaze mcp > "$RUNNER_TEMP/mcp.out"
+          jq -e -s 'any(.[]; .id == 1 and .result.serverInfo) and any(.[]; .id == 2 and (.result.tools | length > 0))' "$RUNNER_TEMP/mcp.out"
+          gaze daemon install
+          gaze daemon status
+          gaze daemon uninstall
+
+  windows-model:
+    needs: [check, checksums]
+    runs-on: windows-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\gaze-model
+          key: gaze-model-${{ hashFiles('packages/gaze-win32/src/embed.js') }}
+
+      - name: tests against the real model
+        shell: bash
+        working-directory: packages/gaze-win32
+        env:
+          GAZE_TEST_MODEL: "1"
+          GAZE_MODEL_DIR: ${{ runner.temp }}\gaze-model
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund || npm install --force --no-audit --no-fund
+          npm test
 
   linux-smoke:
     needs: [checksums, upload]
@@ -283,7 +299,7 @@ jobs:
           "$RUNNER_TEMP/prefix/bin/gaze" capabilities --json | jq -e .ok
 
   npm:
-    needs: [checksums, upload, windows-smoke, linux-smoke]
+    needs: [check, checksums, upload, windows-smoke, linux-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -304,11 +320,25 @@ jobs:
           name: npm-checksums
           path: npm
 
-      - name: publish to npm
+      - name: publish the windows port first
+        working-directory: packages/gaze-win32
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = "true" ]; then
+            npm publish --provenance --access public --tag next
+          else
+            npm publish --provenance --access public
+          fi
+
+      - name: publish the launcher
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
           if [ "$PRERELEASE" = "true" ]; then
             npm publish --provenance --access public --tag next
           else

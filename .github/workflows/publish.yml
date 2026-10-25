@@ -192,15 +192,22 @@ jobs:
         run: |
           set -euo pipefail
           modules="$PREFIX/node_modules"
-          found=""
-          for root in "$modules/@kikedealba" "$modules/onnxruntime-web" "$modules/@huggingface/tokenizers" "$modules/smol-toml"; do
-            if [ ! -d "$root" ]; then
-              echo "missing $root" >&2
+          root="$modules/@kikedealba"
+          dirs=()
+          if [ ! -d "$root/gaze" ]; then
+            echo "missing $root/gaze" >&2
+            exit 1
+          fi
+          for dep in @kikedealba/gaze-win32 onnxruntime-web @huggingface/tokenizers smol-toml; do
+            hit="$(find "$root" "$modules" -maxdepth 6 -type d -path "*/node_modules/$dep" -print -quit)"
+            if [ -z "$hit" ]; then
+              echo "missing $dep under $modules" >&2
               exit 1
             fi
-            hits="$(find "$root" \( -name '*.exe' -o -name '*.node' -o -name '*.dll' \))"
-            found="$found$hits"
+            echo "$dep -> $hit"
+            dirs+=("$hit")
           done
+          found="$(find "$root" "${dirs[@]}" \( -name '*.exe' -o -name '*.node' -o -name '*.dll' \))"
           if [ -n "$found" ]; then
             echo "native files in the install:" >&2
             echo "$found" >&2

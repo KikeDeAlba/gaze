@@ -2,8 +2,25 @@ use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+fn gaze_cmd() -> Command {
+    match std::env::var("GAZE_TEST_CMD") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let argv: Vec<String> = serde_json::from_str(&raw).expect("GAZE_TEST_CMD must be a JSON array of strings");
+            assert!(!argv.is_empty(), "GAZE_TEST_CMD is empty");
+            let mut command = Command::new(&argv[0]);
+            command.args(&argv[1..]);
+            command
+        }
+        _ => Command::new(env!("CARGO_BIN_EXE_gaze")),
+    }
+}
+
+fn js_mode() -> bool {
+    std::env::var("GAZE_TEST_CMD").is_ok_and(|v| !v.trim().is_empty())
+}
+
 fn gaze(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gaze"))
+    let mut child = gaze_cmd()
         .args(args)
         .env("GAZE_DATA_DIR", dir)
         .env("GAZE_CONFIG", dir.join("config.toml"))
@@ -86,12 +103,24 @@ fn cli_contracts() {
     assert_eq!(manifest["subscribes"][0]["tool"], "bita");
     assert_eq!(manifest["subscribes"][1]["tool"], "inkwell");
     assert_eq!(manifest["subscribes"][1]["events"][0], "docs.changed");
-    assert_eq!(manifest["subscribes"][1]["command"][1], "inkwell-hook");
     assert_eq!(manifest["manifestVersion"], 1);
     assert_eq!(manifest["install"], "npm install -g @kikedealba/gaze && gaze setup");
-    let native = gaze::paths::simplify(std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap());
-    assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
-    assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
+    if js_mode() {
+        let command = manifest["subscribes"][1]["command"].as_array().unwrap();
+        assert_eq!(command.last().unwrap(), "inkwell-hook");
+        let bin = manifest["bin"].as_array().unwrap();
+        assert_eq!(bin.len(), 2);
+        assert!(std::path::Path::new(bin[0].as_str().unwrap()).is_absolute());
+        assert!(bin[1].as_str().unwrap().ends_with("gaze.js"));
+        let mut stdio = bin.clone();
+        stdio.push(Value::String("mcp".into()));
+        assert_eq!(manifest["mcp"]["stdio"].as_array().unwrap(), &stdio);
+    } else {
+        assert_eq!(manifest["subscribes"][1]["command"][1], "inkwell-hook");
+        let native = gaze::paths::simplify(std::fs::canonicalize(env!("CARGO_BIN_EXE_gaze")).unwrap());
+        assert_eq!(manifest["bin"][0], native.to_string_lossy().as_ref());
+        assert_eq!(manifest["mcp"]["stdio"][0], manifest["bin"][0]);
+    }
 }
 
 #[test]
@@ -117,7 +146,7 @@ fn inkwell_hook_ingests_docs_changed_events() {
 #[test]
 fn hooks_are_silent_during_harvest() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+    let out = gaze_cmd()
         .args(["hook", "session-start"])
         .env("GAZE_DATA_DIR", dir.path())
         .env("GAZE_HARVEST", "1")
@@ -130,7 +159,7 @@ fn hooks_are_silent_during_harvest() {
 #[test]
 fn hooks_are_silent_inside_a_kit_headless_run() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+    let out = gaze_cmd()
         .args(["hook", "prompt", "--harness", "codex"])
         .env("GAZE_DATA_DIR", dir.path())
         .env("GAZE_EMBEDDER", "fake")
@@ -176,7 +205,7 @@ fn inkwell_hook_exits_non_zero_when_a_change_fails() {
     let run = |relpaths: &[&str]| {
         let changes: Vec<Value> = relpaths.iter().map(|rel| serde_json::json!({"action": "written", "relPath": rel})).collect();
         let event = serde_json::json!({"event": "docs.changed", "docsRoot": docs, "changes": changes});
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gaze"))
+        let mut child = gaze_cmd()
             .arg("inkwell-hook")
             .env("GAZE_DATA_DIR", d)
             .env("GAZE_CONFIG", d.join("config.toml"))
@@ -206,10 +235,13 @@ fn inkwell_hook_exits_non_zero_when_a_change_fails() {
 #[cfg(unix)]
 #[test]
 fn serve_detach_logs_to_the_file_and_stops_on_shutdown() {
+    if js_mode() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let log = dir.path().join("logs/serve.log");
-    let out = Command::new(env!("CARGO_BIN_EXE_gaze"))
+    let out = gaze_cmd()
         .args(["serve", "--detach", "--log"])
         .arg(&log)
         .env("GAZE_DATA_DIR", dir.path())

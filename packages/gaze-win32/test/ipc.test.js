@@ -107,6 +107,8 @@ async function greet(conn) {
   return { clientNonce, serverNonce: hello.nonce, hello }
 }
 
+const opened = (reply) => JSON.parse(reply.body)
+
 function signed(token, { clientNonce, serverNonce }, seq, message) {
   const body = JSON.stringify(message)
   return { auth: requestAuth(token, clientNonce, serverNonce, seq, body), body }
@@ -134,16 +136,18 @@ test('pipe names are stable and prefixed, like ipc.rs', () => {
   assert.equal(endpointFor('/tmp/x.sock'), unix ? '/tmp/x.sock' : '\\\\.\\pipe\\gaze-tmp-x-sock')
 })
 
-test('auth is HMAC-SHA256 over the role, both nonces, the sequence and the body digest', () => {
+test('auth is HMAC-SHA256 over the role, both nonces, the sequence and the body digest in both directions', () => {
   const token = Buffer.alloc(32, 1)
   const cn = '00112233445566778899aabbccddeeff'
   const sn = 'ffeeddccbbaa99887766554433221100'
   const body = '{"op":"ping"}'
   const hmac = (text) => crypto.createHmac('sha256', token).update(text).digest('hex')
   assert.equal(digest(body), crypto.createHash('sha256').update(body).digest('hex'))
-  assert.equal(helloAuth(token, cn, sn), hmac(`gaze-ipc-v2\nhello\n${cn}\n${sn}`))
-  assert.equal(requestAuth(token, cn, sn, 0, body), hmac(`gaze-ipc-v2\nclient\n${cn}\n${sn}\n0\n${digest(body)}`))
-  assert.equal(replyAuth(token, cn, sn, 3), hmac(`gaze-ipc-v2\nserver\n${cn}\n${sn}\n3`))
+  assert.equal(helloAuth(token, cn, sn), hmac(`gaze-ipc-v3\nhello\n${cn}\n${sn}`))
+  assert.equal(requestAuth(token, cn, sn, 0, body), hmac(`gaze-ipc-v3\nclient\n${cn}\n${sn}\n0\n${digest(body)}`))
+  const reply = '{"ok":true,"pid":1}'
+  assert.equal(replyAuth(token, cn, sn, 3, reply), hmac(`gaze-ipc-v3\nserver\n${cn}\n${sn}\n3\n${digest(reply)}`))
+  assert.equal(verifyAuth(token, replyAuth(token, cn, sn, 3, reply), 'server', cn, sn, '3', digest('{"ok":true,"pid":2}')), false)
   assert.equal(verifyAuth(token, requestAuth(token, cn, sn, 0, body), 'client', cn, sn, '0', digest(body)), true)
   assert.equal(verifyAuth(token, requestAuth(token, cn, sn, 0, body), 'client', cn, sn, '1', digest(body)), false)
   assert.equal(verifyAuth(token, requestAuth(token, cn, sn, 0, body), 'client', cn, sn, '0', digest('{"op":"shutdown"}')), false)
@@ -244,7 +248,7 @@ test('a request cannot be replayed on the same connection', async () => {
   const session = await greet(conn)
   const first = signed(token, session, 0, { op: 'ping' })
   conn.send(first)
-  assert.equal((await conn.next()).n, 1)
+  assert.equal(opened(await conn.next()).n, 1)
   conn.send(first)
   assert.deepEqual(await conn.next(), { ok: false, error: 'unauthorized' })
   assert.equal(calls, 1)
@@ -259,13 +263,14 @@ test('one connection serves several lines in order and reports bad json', async 
   conn.send('not json\n')
   conn.send(signed(token, session, 1, { op: 'x', n: 2 }))
   const replies = [await conn.next(), await conn.next(), await conn.next()]
-  assert.equal(replies[0].echo, 1)
-  assert.equal(replies[0].auth, replyAuth(token, session.clientNonce, session.serverNonce, 0))
+  assert.deepEqual(Object.keys(replies[0]), ['auth', 'body'])
+  assert.equal(opened(replies[0]).echo, 1)
+  assert.equal(replies[0].auth, replyAuth(token, session.clientNonce, session.serverNonce, 0, replies[0].body))
   assert.match(replies[1].error, /^bad request: /)
   assert.equal(replies[1].ok, false)
   assert.equal(replies[1].auth, undefined)
-  assert.equal(replies[2].echo, 2)
-  assert.equal(replies[2].auth, replyAuth(token, session.clientNonce, session.serverNonce, 1))
+  assert.equal(opened(replies[2]).echo, 2)
+  assert.equal(replies[2].auth, replyAuth(token, session.clientNonce, session.serverNonce, 1, replies[2].body))
   conn.socket.destroy()
 })
 
@@ -311,6 +316,46 @@ test('the client never sends the payload to an impostor that does not know the t
   assert.equal(received.length, 1)
   assert.deepEqual(Object.keys(JSON.parse(received[0])), ['op', 'nonce'])
   assert.equal(received.join('').includes('secret note'), false)
+})
+
+test('the client rejects replies whose body the auth does not cover', async () => {
+  const token = rotateToken()
+  const daemon = (reply) => {
+    const server = net.createServer((socket) => {
+      socket.on('error', () => {})
+      let clientNonce = null
+      let serverNonce = null
+      socket.on('data', (data) => {
+        const msg = JSON.parse(data.toString('utf8'))
+        if (clientNonce === null) {
+          clientNonce = msg.nonce
+          serverNonce = crypto.randomBytes(16).toString('hex')
+          socket.write(`${JSON.stringify({ ok: true, nonce: serverNonce, auth: helloAuth(token, clientNonce, serverNonce) })}\n`)
+        } else socket.write(`${JSON.stringify(reply(clientNonce, serverNonce))}\n`)
+      })
+    })
+    return server
+  }
+  const genuine = '{"ok":true,"vectors":[[0.5]]}'
+  const cases = [
+    ['tampered.sock', (cn, sn) => ({ auth: replyAuth(token, cn, sn, 0, genuine), body: '{"ok":true,"vectors":[[0.9]]}' }), 'AUTH'],
+    ['flat.sock', (cn, sn) => ({ ok: true, vectors: [[0.5]], auth: authFor(token, 'server', cn, sn, '0') }), 'AUTH'],
+    ['replayed.sock', (cn, sn) => ({ auth: replyAuth(token, cn, sn, 1, genuine), body: genuine }), 'AUTH'],
+    ['array.sock', (cn, sn) => ({ auth: replyAuth(token, cn, sn, 0, '[1]'), body: '[1]' }), 'DAEMON'],
+  ]
+  fs.mkdirSync(path.join(dir, 'run'), { recursive: true })
+  for (const [name, reply, code] of cases) {
+    const server = daemon(reply)
+    const ep = endpoint(name)
+    await new Promise((resolve) => server.listen(ep, resolve))
+    track(server)
+    await assert.rejects(request(ep, { op: 'embed', mode: 'query', texts: ['a'] }, { timeoutMs: 2000 }), { code }, name)
+  }
+  const honest = daemon((cn, sn) => ({ auth: replyAuth(token, cn, sn, 0, genuine), body: genuine }))
+  const ep = endpoint('honest.sock')
+  await new Promise((resolve) => honest.listen(ep, resolve))
+  track(honest)
+  assert.deepEqual(await request(ep, { op: 'embed', mode: 'query', texts: ['a'] }, { timeoutMs: 2000 }), { ok: true, vectors: [[0.5]] })
 })
 
 test('client errors: no token, nothing listening, timeout and oversized replies', async () => {

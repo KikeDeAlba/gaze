@@ -25,7 +25,7 @@ Una base creada por el binario nativo usa la tabla virtual `vec0` de sqlite-vec,
 
 ## Daemon e IPC
 
-El daemon escucha en `\\.\pipe\gaze-<usuario>` en Windows y en `<datos>/gaze.sock` en macOS y Linux (`GAZE_SOCKET` cambia ambos). Cada arranque rota un token de 32 bytes en `<datos>/daemon.token`. Las peticiones y las respuestas van firmadas con HMAC-SHA256 sobre un nonce, así que el token nunca viaja y ni el cliente ni el servidor aceptan a quien no lo conozca. Los límites son los de gaze nativo: líneas de 1 MiB hacia el daemon, respuestas de hasta 64 MiB y 60 s de inactividad por conexión.
+El daemon escucha en `\\.\pipe\gaze-<usuario>` en Windows y en `<datos>/gaze.sock` en macOS y Linux (`GAZE_SOCKET` cambia ambos). Cada arranque rota un token de 32 bytes en `<datos>/daemon.token`. Las peticiones y las respuestas van firmadas con HMAC-SHA256 (contexto `gaze-ipc-v3`) sobre los dos nonces, el número de secuencia y el `sha256` del cuerpo, así que el token nunca viaja, ni el cliente ni el servidor aceptan a quien no lo conozca y un cuerpo alterado no pasa. Ambos sentidos usan el mismo sobre `{ auth, body }`, con `body` como JSON en texto. Los límites son los de gaze nativo: líneas de 1 MiB hacia el daemon, respuestas de hasta 64 MiB y 60 s de inactividad por conexión.
 
 ## Cómo se verifica
 

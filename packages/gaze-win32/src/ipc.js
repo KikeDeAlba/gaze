@@ -10,7 +10,7 @@ export const SERVER_READ_TIMEOUT_MS = 60000
 export const MAX_LINE = 1048576
 export const MAX_RESPONSE = 67108864
 
-const AUTH_CONTEXT = 'gaze-ipc-v2'
+const AUTH_CONTEXT = 'gaze-ipc-v3'
 const HEX64 = /^[0-9a-f]{64}$/
 const NONCE = /^[0-9a-f]{32}$/
 const PIPE_PREFIX = '\\\\.\\pipe\\'
@@ -93,8 +93,8 @@ export function requestAuth(token, clientNonce, serverNonce, seq, body) {
   return authFor(token, 'client', clientNonce, serverNonce, String(seq), digest(body))
 }
 
-export function replyAuth(token, clientNonce, serverNonce, seq) {
-  return authFor(token, 'server', clientNonce, serverNonce, String(seq))
+export function replyAuth(token, clientNonce, serverNonce, seq, body) {
+  return authFor(token, 'server', clientNonce, serverNonce, String(seq), digest(body))
 }
 
 function connect(endpoint, timeoutMs) {
@@ -221,13 +221,14 @@ export async function request(endpoint, message, { timeoutMs = 120000 } = {}) {
     const serverNonce = hello.nonce
     const body = JSON.stringify(message)
     socket.write(`${JSON.stringify({ auth: requestAuth(token, clientNonce, serverNonce, 0, body), body })}\n`)
-    const response = parseReply(await next(MAX_RESPONSE, left()))
-    if (!isObject(response) || !verifyAuth(token, response.auth, 'server', clientNonce, serverNonce, '0')) {
+    const envelope = parseReply(await next(MAX_RESPONSE, left()))
+    if (!isObject(envelope) || typeof envelope.body !== 'string' || !verifyAuth(token, envelope.auth, 'server', clientNonce, serverNonce, '0', digest(envelope.body))) {
       throw new IpcError('AUTH', 'daemon auth failed')
     }
+    const response = parseReply(envelope.body)
+    if (!isObject(response)) throw new IpcError('DAEMON', 'daemon sent an invalid response: not an object')
     if (response.ok !== true) throw new IpcError('DAEMON', `daemon error: ${response.error}`)
-    const { auth, ...rest } = response
-    return rest
+    return response
   } finally {
     socket.destroy()
   }
@@ -334,8 +335,9 @@ async function respond(state, tokenOf, onMessage, raw) {
   } catch (error) {
     result = { ok: false, error: errorChain(error) }
   }
-  const body = isObject(result) ? result : { ok: false, error: 'empty response' }
-  return { reply: { ...body, auth: replyAuth(state.token, state.clientNonce, state.serverNonce, seq) }, close: false, message }
+  const value = isObject(result) ? result : { ok: false, error: 'empty response' }
+  const body = JSON.stringify(value)
+  return { reply: { auth: replyAuth(state.token, state.clientNonce, state.serverNonce, seq, body), body }, value, close: false, message }
 }
 
 function write(socket, value) {
@@ -357,14 +359,14 @@ function serveConnection(socket, tokenOf, onMessage, { onLine, afterReply }) {
     chain = chain.then(async () => {
       if (closed) return
       onLine?.()
-      const { reply, close, message } = await respond(state, tokenOf, onMessage, raw)
+      const { reply, value, close, message } = await respond(state, tokenOf, onMessage, raw)
       const written = await write(socket, reply)
       if (close) {
         closed = true
         socket.end()
         return
       }
-      if (written && message !== undefined) await afterReply?.(message, reply)
+      if (written && message !== undefined) await afterReply?.(message, value)
     })
   }
   socket.on('data', (data) => {

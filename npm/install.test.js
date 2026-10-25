@@ -787,11 +787,21 @@ describe('install.js', () => {
     return node(path.join(root, 'npm', 'install.js'), args, env)
   }
 
-  test('exits non-zero with a message when run directly and the download fails', async () => {
+  test('exits non-zero with a message when run directly and the download fails', { skip: process.platform === 'win32' }, async () => {
     const root = packageRoot()
     const result = await installScript(root, [], { GAZE_DOWNLOAD_BASE: `${base}/missing` })
     assert.equal(result.code, 1)
     assert.match(result.stderr, HOST ? /^gaze: Cannot download .*HTTP 404/m : /^gaze: gaze has no prebuilt binary/m)
+  })
+
+  test('on win32 run directly downloads nothing and exits zero', { skip: process.platform !== 'win32' }, async () => {
+    const root = packageRoot()
+    const before = requests.length
+    const result = await installScript(root, [], { GAZE_DOWNLOAD_BASE: `${base}/missing` })
+    assert.equal(result.code, 0, result.stderr)
+    assert.equal(result.stderr, '')
+    assert.equal(requests.length, before)
+    assert.deepEqual(vendorEntries(root), [])
   })
 
   test('--postinstall tolerates a network failure and defers the download', { skip: !HOST }, async () => {
@@ -848,11 +858,21 @@ describe('install.js', () => {
     assert.equal(existsSync(log), false)
   })
 
-  test('--postinstall fails without checksums.json', async () => {
+  test('--postinstall fails without checksums.json', { skip: process.platform === 'win32' }, async () => {
     const root = packageRoot(null)
     const result = await installScript(root, ['--postinstall'])
     assert.notEqual(result.code, 0)
     assert.match(result.stderr, HOST ? /checksums\.json is missing/ : /no prebuilt binary/)
+  })
+
+  test('on win32 --postinstall needs no checksums.json and downloads nothing', { skip: process.platform !== 'win32' }, async () => {
+    const root = packageRoot(null)
+    const before = requests.length
+    const result = await installScript(root, ['--postinstall'], isolatedEnv())
+    assert.equal(result.code, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /checksums\.json|no prebuilt binary|Cannot download/)
+    assert.equal(requests.length, before)
+    assert.deepEqual(vendorEntries(root), [])
   })
 })
 

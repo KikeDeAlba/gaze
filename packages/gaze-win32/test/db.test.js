@@ -69,7 +69,7 @@ test('constants are copied from db.rs', () => {
 })
 
 test('the DDL is the one in db.rs except for the vector table', { skip: !fs.existsSync(RUST_DB) && 'db.rs is not in this checkout' }, () => {
-  const rust = fs.readFileSync(RUST_DB, 'utf8')
+  const rust = fs.readFileSync(RUST_DB, 'utf8').replace(/\r\n/g, '\n')
   const start = rust.indexOf('const SCHEMA: &str = r#"') + 'const SCHEMA: &str = r#"'.length
   const ddl = rust.slice(start, rust.indexOf('"#;', start))
   assert.ok(ddl.includes(RUST_VECTORS))

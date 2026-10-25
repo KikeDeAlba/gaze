@@ -135,6 +135,7 @@ test('request and listen round trip with mutual auth', async () => {
   assert.equal(seen[0].op, 'ping')
   assert.match(seen[0].nonce, /^[0-9a-f]{32}$/)
   assert.match(seen[0].auth, /^[0-9a-f]{64}$/)
+  for (let waited = 0; replied.length < 2 && waited < 2000; waited += 10) await new Promise((resolve) => setTimeout(resolve, 10))
   assert.deepEqual(replied, [['ping', true], ['embed', true]])
 })
 

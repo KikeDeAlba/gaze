@@ -79,6 +79,8 @@ class Session {
   subst(text) {
     let out = text;
     for (const [name, id] of this.ids) out = out.split(id).join(`<${name}>`);
+    const escaped = JSON.stringify(this.dir).slice(1, -1);
+    if (escaped !== this.dir) out = out.split(escaped).join('<dir>');
     return out.split(this.dir).join('<dir>');
   }
 

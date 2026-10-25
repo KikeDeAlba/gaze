@@ -443,7 +443,11 @@ const JS_VECTORS = 'CREATE TABLE IF NOT EXISTS chunk_vectors (\n  chunk_id INTEG
 
 test('reindex restores vectors after migrating a vec0 database', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gaze-store-'))
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  let db
+  t.after(() => {
+    if (db?.isOpen) db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
   const file = path.join(dir, 'gaze.db')
   const native = new DatabaseSync(file)
   if (typeof native.enableDefensive !== 'function') {
@@ -462,8 +466,7 @@ test('reindex restores vectors after migrating a vec0 database', async (t) => {
   native.exec('PRAGMA writable_schema = OFF')
   native.close()
 
-  const db = openDb(file, { migrate: true, log: () => {} })
-  t.after(() => db.close())
+  db = openDb(file, { migrate: true, log: () => {} })
   const store = new Store(db, Store.inMemory().cfg)
   assert.equal(store.stats().unembedded, 1)
   assert.equal(await store.reindex(fake, false), 1)

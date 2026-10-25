@@ -106,7 +106,7 @@ test('command for falls back to cmd with strict quoting', () => {
     args: ['/d', '/s', '/c', `""${custom}" "projects" "--all" "" "C:\\x/y" "a=b,c@d+e:f_g-h.i""`],
     windowsVerbatimArguments: true,
   })
-  assert.equal(commandFor(custom, [], { ...WIN, comSpec: undefined }).file, 'cmd.exe')
+  assert.equal(commandFor(custom, [], { ...WIN, comSpec: '' }).file, 'cmd.exe')
   const { shim } = install('npm11', 'codex')
   fs.rmSync(path.join(dir, 'node_modules'), { recursive: true })
   assert.equal(commandFor(shim, ['exec'], WIN).file, WIN.comSpec)

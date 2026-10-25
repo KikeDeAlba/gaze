@@ -1,10 +1,11 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { EDGE_KINDS, GLOBAL, KINDS, NOTE_KINDS, SCHEMA, SOURCES, isNativeVec0, migrateVec0, openDb, openMemory } from '../src/db.js'
+import { EDGE_KINDS, GLOBAL, KINDS, NOTE_KINDS, SCHEMA, SOURCES, isNativeVec0, migrateVec0, migrationLock, openDb, openMemory } from '../src/db.js'
 import { GazeError } from '../src/envelope.js'
 
 const RUST_DB = new URL('../../../src/db.rs', import.meta.url)
@@ -164,7 +165,7 @@ test('native vec0 databases are migrated by copying every table to a new file', 
   db.close()
   const backups = fs.readdirSync(dir).filter((name) => name.startsWith('gaze.db.vec0.bak'))
   assert.deepEqual(backups.filter((name) => !name.endsWith('-wal') && !name.endsWith('-shm')), ['gaze.db.vec0.bak'])
-  assert.equal(fs.existsSync(`${file}.migrating`), false)
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes('.migrat')), [])
   const backup = new DatabaseSync(path.join(dir, 'gaze.db.vec0.bak'))
   assert.equal(isNativeVec0(backup), true)
   assert.equal(backup.prepare('SELECT COUNT(*) AS n FROM nodes').get().n, 2)
@@ -191,5 +192,71 @@ test('a failed migration leaves the original untouched', () => {
   const before = fs.readFileSync(file)
   assert.throws(() => migrateVec0(file), /migrate/)
   assert.deepEqual(fs.readFileSync(file), before)
-  assert.equal(fs.existsSync(`${file}.migrating`), false)
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes('.migrat')), [])
+})
+
+const DB_URL = new URL('../src/db.js', import.meta.url).href
+
+function openInChild(file) {
+  const code = `import { openDb } from ${JSON.stringify(DB_URL)}
+const db = openDb(${JSON.stringify(file)}, { migrate: true, log: (m) => process.stderr.write(m + '\\n') })
+const nodes = db.prepare('SELECT COUNT(*) AS n FROM nodes').get().n
+const chunks = db.prepare('SELECT COUNT(*) AS n FROM chunks').get().n
+db.close()
+process.stdout.write(JSON.stringify({ nodes, chunks }))`
+  const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d) => (stdout += d))
+  child.stderr.on('data', (d) => (stderr += d))
+  return new Promise((resolve) => child.on('exit', (code) => resolve({ code, stdout, stderr })))
+}
+
+test('two concurrent openDb calls on a vec0 database migrate it once and keep the data', async (t) => {
+  for (let round = 0; round < 3; round += 1) {
+    const file = path.join(dir, `race${round}.db`)
+    if (!nativeFixture(file)) return t.skip('enableDefensive is not available')
+    const results = await Promise.all([openInChild(file), openInChild(file)])
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stderr)
+      assert.deepEqual(JSON.parse(result.stdout), { nodes: 2, chunks: 2 })
+    }
+    assert.equal(results.filter((result) => /gaze reindex/.test(result.stderr)).length, 1)
+    const names = fs.readdirSync(dir).filter((name) => name.startsWith(`race${round}.db`))
+    assert.deepEqual(names.filter((name) => name.includes('.vec0.bak') && !name.endsWith('-wal') && !name.endsWith('-shm')), [`race${round}.db.vec0.bak`])
+    assert.deepEqual(names.filter((name) => name.includes('.migrat')), [])
+  }
+})
+
+test('openDb never creates an empty database next to a vec0 backup', () => {
+  const file = path.join(dir, 'gaze.db')
+  fs.writeFileSync(`${file}.vec0.bak`, 'native copy')
+  assert.throws(() => openDb(file, { migrate: true, log: quiet }), (error) => {
+    assert.ok(error instanceof GazeError)
+    assert.equal(error.message, `Falta ${file} pero existe la copia de gaze nativo ${file}.vec0.bak`)
+    return true
+  })
+  assert.equal(fs.existsSync(file), false)
+})
+
+test('openDb waits for a live migration lock and gives up without creating the file', () => {
+  const file = path.join(dir, 'gaze.db')
+  fs.writeFileSync(migrationLock(file), `${process.pid}\n`)
+  const started = Date.now()
+  assert.throws(() => openDb(file, { migrate: true, log: quiet, waitMs: 300 }), { message: `Otro proceso está migrando ${file}` })
+  assert.ok(Date.now() - started >= 300)
+  assert.equal(fs.existsSync(file), false)
+})
+
+test('a migration lock left by a dead process does not block the migration', async (t) => {
+  const file = path.join(dir, 'gaze.db')
+  if (!nativeFixture(file)) return t.skip('enableDefensive is not available')
+  const dead = spawn(process.execPath, ['-e', ''])
+  await new Promise((resolve) => dead.on('exit', resolve))
+  fs.writeFileSync(migrationLock(file), `${dead.pid}\n`)
+  const db = openDb(file, { migrate: true, log: quiet, waitMs: 2000 })
+  assert.equal(isNativeVec0(db), false)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nodes').get().n, 2)
+  db.close()
+  assert.equal(fs.existsSync(migrationLock(file)), false)
 })

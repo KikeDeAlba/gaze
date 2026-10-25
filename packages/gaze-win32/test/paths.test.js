@@ -152,3 +152,53 @@ test('version and self command point at this package', () => {
   assert.ok(paths.PORT_BIN.endsWith(path.join('bin', 'gaze.js')))
   assert.deepEqual(paths.selfCommand(), [process.execPath, paths.PORT_BIN])
 })
+
+function liveOtherPid() {
+  return process.ppid > 0 && paths.pidAlive(process.ppid) ? process.ppid : null
+}
+
+test('try lock takes over a dead or very old lock but never a fresh live one', () => {
+  const lock = path.join(dir, 'serve.lock')
+  const other = liveOtherPid()
+  assert.ok(other !== null)
+  fs.writeFileSync(lock, '999999999\n')
+  assert.equal(paths.tryLock(lock), true)
+  assert.equal(fs.readFileSync(lock, 'utf8'), `${process.pid}\n`)
+  paths.releaseLock(lock)
+  fs.writeFileSync(lock, `${other}\n`)
+  assert.equal(paths.lockHeld(lock), true)
+  assert.equal(paths.tryLock(lock), false)
+  const old = (Date.now() - paths.MAX_LOCK_AGE_MS - 60000) / 1000
+  fs.utimesSync(lock, old, old)
+  assert.equal(paths.lockHeld(lock), false)
+  assert.equal(paths.tryLock(lock), true)
+  assert.equal(fs.readFileSync(lock, 'utf8'), `${process.pid}\n`)
+  fs.utimesSync(lock, old, old)
+  assert.equal(paths.lockHeld(lock), true)
+  paths.releaseLock(lock)
+  assert.equal(fs.existsSync(lock), false)
+})
+
+test('try lock gives back a lock that another process took between the check and the rename', () => {
+  const lock = path.join(dir, 'serve.lock')
+  const other = liveOtherPid()
+  fs.writeFileSync(lock, '999999999\n')
+  const rename = fs.renameSync
+  let raced = false
+  fs.renameSync = (from, to) => {
+    if (!raced && from === lock) {
+      raced = true
+      fs.rmSync(lock)
+      fs.writeFileSync(lock, `${other}\n`)
+    }
+    return rename(from, to)
+  }
+  try {
+    assert.equal(paths.tryLock(lock), false)
+  } finally {
+    fs.renameSync = rename
+  }
+  assert.equal(raced, true)
+  assert.equal(fs.readFileSync(lock, 'utf8'), `${other}\n`)
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.stale')), [])
+})

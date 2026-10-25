@@ -168,6 +168,7 @@ export function serveLock() {
 }
 
 const EMPTY_LOCK_GRACE_MS = 10000
+export const MAX_LOCK_AGE_MS = 60 * 60 * 1000
 
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
@@ -181,27 +182,37 @@ export function pidAlive(pid) {
 
 function lockOwner(file) {
   let raw
+  let mtimeMs
   try {
     raw = fs.readFileSync(file, 'utf8')
+    mtimeMs = fs.statSync(file).mtimeMs
   } catch {
-    return { missing: true, pid: null }
+    return { missing: true, pid: null, mtimeMs: null }
   }
   const pid = Number.parseInt(raw.trim(), 10)
-  return { missing: false, pid: Number.isInteger(pid) ? pid : null }
+  return { missing: false, pid: Number.isInteger(pid) ? pid : null, mtimeMs }
 }
 
-function stale(file, owner) {
-  if (owner.pid !== null) return !pidAlive(owner.pid)
+function stale(owner) {
+  const age = Date.now() - owner.mtimeMs
+  if (owner.pid === null) return age > EMPTY_LOCK_GRACE_MS
+  return !pidAlive(owner.pid) || (owner.pid !== process.pid && age > MAX_LOCK_AGE_MS)
+}
+
+function sameOwner(a, b) {
+  return !b.missing && a.pid === b.pid && a.mtimeMs === b.mtimeMs
+}
+
+function putBack(aside, file) {
   try {
-    return Date.now() - fs.statSync(file).mtimeMs > EMPTY_LOCK_GRACE_MS
-  } catch {
-    return false
-  }
+    fs.linkSync(aside, file)
+  } catch {}
+  fs.rmSync(aside, { force: true })
 }
 
 export function lockHeld(file) {
   const owner = lockOwner(file)
-  return !owner.missing && !stale(file, owner)
+  return !owner.missing && !stale(owner)
 }
 
 export function tryLock(file) {
@@ -214,12 +225,18 @@ export function tryLock(file) {
     }
     const owner = lockOwner(file)
     if (owner.missing) continue
-    if (!stale(file, owner)) return false
+    if (!stale(owner)) return false
     const aside = `${file}.${process.pid}.${Date.now()}.stale`
     try {
       fs.renameSync(file, aside)
-      fs.rmSync(aside, { force: true })
-    } catch {}
+    } catch {
+      continue
+    }
+    if (!sameOwner(owner, lockOwner(aside))) {
+      putBack(aside, file)
+      return false
+    }
+    fs.rmSync(aside, { force: true })
   }
   return false
 }

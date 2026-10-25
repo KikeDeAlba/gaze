@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { SHIM_TARGET, commandFor, killCommand, lastJsonLine, resolveProgram, runSync, shimTarget, spawnDetached } from '../src/proc.js'
+import { SHIM_TARGET, commandFor, hardenEnv, killCommand, lastJsonLine, resolveProgram, runSync, shimTarget, spawnDetached, systemBinary } from '../src/proc.js'
 
 const SHIMS = new URL('./fixtures/cmd-shims/', import.meta.url)
 const TARGETS = {
@@ -39,7 +39,7 @@ test('resolves windows shims through pathext', () => {
   fs.writeFileSync(path.join(dir, 'claude.cmd'), '')
   assert.equal(resolveProgram('claude', { path: dir, windows: true }), path.join(dir, 'claude.cmd'))
   assert.equal(resolveProgram('claude', { path: dir, windows: false }), 'claude')
-  assert.equal(resolveProgram('codex', { path: dir, windows: true }), 'codex')
+  assert.throws(() => resolveProgram('codex', { path: dir, windows: true }), { code: 'ENOENT' })
 })
 
 test('resolve program prefers exe and keeps explicit paths and extensions', () => {
@@ -54,10 +54,10 @@ test('resolve program prefers exe and keeps explicit paths and extensions', () =
   assert.equal(resolveProgram('git', { path: search, windows: true }), path.join(dir, 'git.exe'))
   assert.equal(resolveProgram('bita', { path: search, windows: true }), path.join(dir, 'bita.cmd'))
   assert.equal(resolveProgram('bita.exe', { path: search, windows: true }), path.join(other, 'bita.exe'))
-  assert.equal(resolveProgram('recap', { path: search, windows: true }), 'recap')
+  assert.throws(() => resolveProgram('recap', { path: search, windows: true }), { code: 'ENOENT' })
   assert.equal(resolveProgram('C:\\tools\\bita', { path: search, windows: true }), 'C:\\tools\\bita')
   assert.equal(resolveProgram('./bita', { path: search, windows: true }), './bita')
-  assert.equal(resolveProgram('bita', { path: undefined, windows: true }), 'bita')
+  assert.throws(() => resolveProgram('bita', { path: undefined, windows: true }), { code: 'ENOENT' })
 })
 
 test('npm 10 and npm 11 shims carry the target the regex extracts', () => {
@@ -106,7 +106,8 @@ test('command for falls back to cmd with strict quoting', () => {
     args: ['/d', '/s', '/c', `""${custom}" "projects" "--all" "" "C:\\x/y" "a=b,c@d+e:f_g-h.i""`],
     windowsVerbatimArguments: true,
   })
-  assert.equal(commandFor(custom, [], { ...WIN, comSpec: '' }).file, 'cmd.exe')
+  assert.equal(commandFor(custom, [], { ...WIN, comSpec: '', env: { SystemRoot: 'D:\\Win' } }).file, 'D:\\Win\\System32\\cmd.exe')
+  assert.equal(commandFor(custom, [], { ...WIN, comSpec: 'cmd.exe', env: {} }).file, 'C:\\Windows\\System32\\cmd.exe')
   const { shim } = install('npm11', 'codex')
   fs.rmSync(path.join(dir, 'node_modules'), { recursive: true })
   assert.equal(commandFor(shim, ['exec'], WIN).file, WIN.comSpec)
@@ -119,6 +120,40 @@ test('command for refuses unsafe arguments for cmd', () => {
     assert.throws(() => commandFor(custom, ['ok', bad], WIN), { message: `no se puede ejecutar ${custom} sin shell: argumento no seguro` })
   }
   assert.throws(() => commandFor(path.join(dir, '100%', 'tool.cmd'), [], WIN), /argumento no seguro/)
+})
+
+test('programs planted in the cwd or in relative path entries never run on windows', () => {
+  const repo = path.join(dir, 'repo')
+  const empty = path.join(dir, 'empty')
+  fs.mkdirSync(repo)
+  fs.mkdirSync(empty)
+  const marker = path.join(dir, 'ran')
+  for (const name of ['bita.exe', 'bita.cmd', 'bita.bat', 'git.exe']) fs.writeFileSync(path.join(repo, name), `@echo off\r\necho x > "${marker}"\r\n`)
+  const relative = path.relative(process.cwd(), repo)
+  assert.throws(() => resolveProgram('bita', { path: ['.', relative, empty].join(path.delimiter), windows: true }), { code: 'ENOENT', message: 'bita not found in PATH' })
+  const done = runSync('bita', ['projects'], { cwd: repo, env: { PATH: empty }, platform: 'win32' })
+  assert.equal(done.error.code, 'ENOENT')
+  assert.equal(spawnDetached(['git', 'status'], { cwd: repo, env: { PATH: empty }, platform: 'win32' }), null)
+  assert.equal(fs.existsSync(marker), false)
+  assert.equal(resolveProgram('bita', { path: `"${repo}"`, windows: true }), path.join(repo, 'bita.exe'))
+})
+
+test('system binaries live under an absolute SystemRoot', () => {
+  assert.equal(systemBinary('cmd.exe', { SystemRoot: 'E:\\Windows' }), 'E:\\Windows\\System32\\cmd.exe')
+  assert.equal(systemBinary('cmd.exe', { SYSTEMROOT: 'E:\\W' }), 'E:\\W\\System32\\cmd.exe')
+  assert.equal(systemBinary('cmd.exe', { SystemRoot: 'Windows' }), 'C:\\Windows\\System32\\cmd.exe')
+  assert.equal(systemBinary('cmd.exe', {}), 'C:\\Windows\\System32\\cmd.exe')
+})
+
+test('children on windows never search the current directory for programs', () => {
+  assert.equal(hardenEnv({ PATH: 'x' }, 'win32').NoDefaultCurrentDirectoryInExePath, '1')
+  assert.equal(hardenEnv({ nodefaultcurrentdirectoryinexepath: '0' }, 'win32').nodefaultcurrentdirectoryinexepath, undefined)
+  assert.equal(hardenEnv({ PATH: 'x' }, 'linux').NoDefaultCurrentDirectoryInExePath, undefined)
+  const script = path.join(dir, 'env.mjs')
+  fs.writeFileSync(script, 'console.log(JSON.stringify({ v: process.env.NoDefaultCurrentDirectoryInExePath ?? null }))')
+  const done = runSync(process.execPath, [script], { env: { PATH: process.env.PATH }, platform: 'win32', timeoutMs: 20000 })
+  assert.equal(done.error, null)
+  assert.deepEqual(lastJsonLine(done.stdout), { v: '1' })
 })
 
 test('last json line returns the last parseable line', () => {
@@ -156,7 +191,8 @@ test('run sync executes npm shims without a shell on windows', { skip: process.p
 })
 
 test('kill tree uses taskkill on windows', () => {
-  assert.deepEqual(killCommand(1234, 'win32'), { file: 'taskkill', args: ['/T', '/F', '/PID', '1234'] })
+  assert.deepEqual(killCommand(1234, 'win32', { SystemRoot: 'D:\\Win' }), { file: 'D:\\Win\\System32\\taskkill.exe', args: ['/T', '/F', '/PID', '1234'] })
+  assert.equal(killCommand(1, 'win32', {}).file, 'C:\\Windows\\System32\\taskkill.exe')
   assert.equal(killCommand(1234, 'linux'), null)
 })
 

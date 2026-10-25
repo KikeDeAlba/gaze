@@ -7,6 +7,8 @@ export const SHIM_TARGET = /"%~?dp0%?\\([^"]+)"\s+%\*/i
 export const SAFE_ARG = /^[A-Za-z0-9_@+=:,./\\-]*$/
 const UNSAFE_PROGRAM = /["%!\r\n]/
 const NODE_SCRIPT = ['.js', '.cjs', '.mjs']
+const NO_CWD_EXE = 'NoDefaultCurrentDirectoryInExePath'
+const DEFAULT_SYSTEM_ROOT = 'C:\\Windows'
 const MAX_BUFFER = 256 * 1024 * 1024
 
 const isWindows = (platform) => platform === 'win32'
@@ -39,17 +41,40 @@ export function envSet(env, name, value, windows = isWindows(process.platform)) 
   return env
 }
 
+export function systemBinary(name, env = process.env) {
+  const root = envGet(env, 'SystemRoot', true)
+  const base = typeof root === 'string' && path.win32.isAbsolute(root) && /^[A-Za-z]:/.test(root) ? root : DEFAULT_SYSTEM_ROOT
+  return path.win32.join(base, 'System32', name)
+}
+
+export function hardenEnv(env = process.env, platform = process.platform) {
+  const copy = { ...env }
+  return isWindows(platform) ? envSet(copy, NO_CWD_EXE, '1', true) : copy
+}
+
+function notInPath(bin) {
+  const error = new Error(`${bin} not found in PATH`)
+  error.code = 'ENOENT'
+  return error
+}
+
+function searchDirs(searchPath) {
+  return (searchPath ?? '')
+    .split(path.delimiter)
+    .map((dir) => dir.replace(/^"(.*)"$/, '$1'))
+    .filter((dir) => dir !== '' && path.isAbsolute(dir))
+}
+
 export function resolveProgram(bin, { path: searchPath = envGet(process.env, 'PATH'), windows = isWindows(process.platform) } = {}) {
-  if (hasSeparator(bin, windows) || !windows) return bin
+  if (!windows || hasSeparator(bin, windows)) return bin
   const exts = path.extname(bin) !== '' ? [''] : WINDOWS_EXTS
-  const dirs = (searchPath ?? '').split(path.delimiter).filter((dir) => dir !== '')
-  for (const dir of dirs) {
+  for (const dir of searchDirs(searchPath)) {
     for (const ext of exts) {
       const full = path.join(dir, `${bin}${ext}`)
       if (isFile(full)) return full
     }
   }
-  return bin
+  throw notInPath(bin)
 }
 
 export function shimTarget(program) {
@@ -74,7 +99,11 @@ export function quoteCmdLine(program, args) {
   return [program, ...args].map((part) => `"${part}"`).join(' ')
 }
 
-export function commandFor(program, args, { platform = process.platform, execPath = process.execPath, comSpec = process.env.ComSpec } = {}) {
+function shellFor(comSpec, env) {
+  return typeof comSpec === 'string' && path.win32.isAbsolute(comSpec) && /^[A-Za-z]:/.test(comSpec) ? comSpec : systemBinary('cmd.exe', env)
+}
+
+export function commandFor(program, args, { platform = process.platform, execPath = process.execPath, env = process.env, comSpec = envGet(env, 'ComSpec', true) } = {}) {
   const ext = path.extname(program).toLowerCase()
   if (!isWindows(platform) || (ext !== '.cmd' && ext !== '.bat')) return { file: program, args: [...args] }
   const target = shimTarget(program)
@@ -84,25 +113,25 @@ export function commandFor(program, args, { platform = process.platform, execPat
     if (targetExt === '.exe') return { file: target, args: [...args] }
   }
   const line = quoteCmdLine(program, args)
-  return { file: comSpec || 'cmd.exe', args: ['/d', '/s', '/c', `"${line}"`], windowsVerbatimArguments: true }
+  return { file: shellFor(comSpec, env), args: ['/d', '/s', '/c', `"${line}"`], windowsVerbatimArguments: true }
 }
 
 export function prepare(bin, args, { env = process.env, platform = process.platform } = {}) {
   const windows = isWindows(platform)
   const program = resolveProgram(bin, { path: envGet(env, 'PATH', windows), windows })
-  return { program, ...commandFor(program, args, { platform }) }
+  return { program, ...commandFor(program, args, { platform, env }) }
 }
 
-export function runSync(bin, args, { cwd, env = process.env, timeoutMs, input } = {}) {
+export function runSync(bin, args, { cwd, env = process.env, timeoutMs, input, platform = process.platform } = {}) {
   let command
   try {
-    command = prepare(bin, args, { env })
+    command = prepare(bin, args, { env, platform })
   } catch (error) {
     return { status: null, stdout: '', stderr: '', error }
   }
   const result = spawnSync(command.file, command.args, {
     cwd,
-    env,
+    env: hardenEnv(env, platform),
     input,
     stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     encoding: 'utf8',
@@ -128,7 +157,7 @@ export function lastJsonLine(stdout) {
   return null
 }
 
-export function spawnDetached(argv, { cwd, env = process.env, logFile } = {}) {
+export function spawnDetached(argv, { cwd, env = process.env, logFile, platform = process.platform } = {}) {
   let fd = null
   if (logFile !== undefined && logFile !== null) {
     try {
@@ -139,10 +168,10 @@ export function spawnDetached(argv, { cwd, env = process.env, logFile } = {}) {
   }
   const out = fd === null ? 'ignore' : fd
   try {
-    const command = prepare(argv[0], argv.slice(1), { env })
+    const command = prepare(argv[0], argv.slice(1), { env, platform })
     const child = spawn(command.file, command.args, {
       cwd,
-      env,
+      env: hardenEnv(env, platform),
       detached: true,
       windowsHide: true,
       shell: false,
@@ -160,13 +189,13 @@ export function spawnDetached(argv, { cwd, env = process.env, logFile } = {}) {
   }
 }
 
-export function killCommand(pid, platform = process.platform) {
-  return isWindows(platform) ? { file: 'taskkill', args: ['/T', '/F', '/PID', String(pid)] } : null
+export function killCommand(pid, platform = process.platform, env = process.env) {
+  return isWindows(platform) ? { file: systemBinary('taskkill.exe', env), args: ['/T', '/F', '/PID', String(pid)] } : null
 }
 
-export function killTree(pid, { platform = process.platform } = {}) {
+export function killTree(pid, { platform = process.platform, env = process.env } = {}) {
   if (pid === undefined || pid === null) return
-  const command = killCommand(pid, platform)
+  const command = killCommand(pid, platform, env)
   if (command !== null) {
     spawnSync(command.file, command.args, { stdio: 'ignore', windowsHide: true, shell: false })
     return

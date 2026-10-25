@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-import { commandFor, envGet, envSet, killTree, resolveProgram } from './proc.js'
+import { commandFor, envGet, envSet, hardenEnv, killTree, resolveProgram } from './proc.js'
 import { lines, trim, truncate } from './text.js'
 
 export const AGENTS = ['claude', 'codex', 'gemini', 'antigravity', 'opencode']
@@ -306,7 +306,7 @@ export async function run(agent, prompt, model, cwd, timeoutMs, extraEnv = [], {
     try {
       started = spawn(command.file, command.args, {
         cwd,
-        env,
+        env: hardenEnv(env, platform),
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         shell: false,

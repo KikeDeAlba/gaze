@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { errorChain } from './envelope.js'
 import { cleanup, endpointFor, listen, request, rotateToken } from './ipc.js'
+import { hardenEnv, systemBinary } from './proc.js'
 import { VERSION, daemonMarker, dataDir, selfCommand, serveLog, socketPath, spawnedMarker } from './paths.js'
 import { nowIso } from './text.js'
 
@@ -131,7 +132,7 @@ export async function serve({ idleMinutes, log = new ServeLog(), embedder, idleC
 
 function childEnv(env = process.env) {
   const proxy = PROXY_VARS.some((name) => typeof env[name] === 'string' && env[name] !== '')
-  return proxy ? { ...env, NODE_USE_ENV_PROXY: '1' } : { ...env }
+  return hardenEnv(proxy ? { ...env, NODE_USE_ENV_PROXY: '1' } : env)
 }
 
 function openLog(file) {
@@ -204,7 +205,7 @@ export function spawnOnDemand({ command = selfCommand() } = {}) {
 }
 
 export function schtasksPath(env = process.env) {
-  return path.win32.join(env.SystemRoot ?? env.SYSTEMROOT ?? 'C:\\Windows', 'System32', 'schtasks.exe')
+  return systemBinary('schtasks.exe', env)
 }
 
 function systemExec(program, args) {

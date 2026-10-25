@@ -106,7 +106,7 @@ export function shimTarget(program) {
 
 export function quoteCmdLine(program, args) {
   if (UNSAFE_PROGRAM.test(program) || args.some((arg) => !SAFE_ARG.test(arg))) {
-    throw new Error(`no se puede ejecutar ${program} sin shell: argumento no seguro`)
+    throw new Error(`cannot run ${program} without a shell: unsafe argument`)
   }
   return [program, ...args].map((part) => `"${part}"`).join(' ')
 }

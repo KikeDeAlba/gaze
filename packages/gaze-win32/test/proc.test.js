@@ -117,9 +117,9 @@ test('command for refuses unsafe arguments for cmd', () => {
   const custom = path.join(dir, 'tool.cmd')
   fs.writeFileSync(custom, '@echo off\r\n')
   for (const bad of ['a b', 'a&b', 'x|y', '%PATH%', '"q"', '^', '!v!', 'a\nb', '(x)', 'ñ', 'C:\\dir\\', '\\', 'x\\\\']) {
-    assert.throws(() => commandFor(custom, ['ok', bad], WIN), { message: `no se puede ejecutar ${custom} sin shell: argumento no seguro` })
+    assert.throws(() => commandFor(custom, ['ok', bad], WIN), { message: `cannot run ${custom} without a shell: unsafe argument` })
   }
-  assert.throws(() => commandFor(path.join(dir, '100%', 'tool.cmd'), [], WIN), /argumento no seguro/)
+  assert.throws(() => commandFor(path.join(dir, '100%', 'tool.cmd'), [], WIN), /unsafe argument/)
   assert.match(commandFor(custom, ['C:\\dir\\x', 'a\\b'], WIN).args[3], /"C:\\dir\\x" "a\\b""$/)
 })
 

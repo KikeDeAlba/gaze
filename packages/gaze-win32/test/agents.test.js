@@ -246,7 +246,7 @@ test('run reports programs it cannot prepare as spawn errors', async () => {
   process.env.GAZE_HARVEST_BIN = bat
   await assert.rejects(run('claude', 'p', null, dir, 20000, [], { platform: 'win32' }), (error) => {
     assert.equal(error.message, `spawn ${bat}`)
-    assert.match(error.cause.message, /argumento no seguro/)
+    assert.match(error.cause.message, /unsafe argument/)
     return true
   })
 })

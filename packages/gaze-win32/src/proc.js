@@ -4,7 +4,7 @@ import path from 'node:path'
 
 export const WINDOWS_EXTS = ['.exe', '.cmd', '.bat', '.com']
 export const SHIM_TARGET = /"%~?dp0%?\\([^"]+)"\s+%\*/i
-export const SAFE_ARG = /^[A-Za-z0-9_@+=:,./\\-]*$/
+export const SAFE_ARG = /^(?:[A-Za-z0-9_@+=:,./\\-]*[A-Za-z0-9_@+=:,./-])?$/
 const UNSAFE_PROGRAM = /["%!\r\n]/
 const NODE_SCRIPT = ['.js', '.cjs', '.mjs']
 const NO_CWD_EXE = 'NoDefaultCurrentDirectoryInExePath'

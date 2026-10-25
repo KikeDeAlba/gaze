@@ -68,6 +68,11 @@ export function selection(names, known, fallback) {
 
 const WINDOWS_PLAIN = /^[A-Za-z0-9_@+=:./\\-]+$/
 
+export function windowsRooted(file) {
+  if (/^[A-Za-z]:[\\/]/.test(file) || /^[\\/]{2}[^\\/]/.test(file)) return true
+  return process.platform !== 'win32' && path.posix.isAbsolute(file)
+}
+
 export function shellCommand(parts, platform = process.platform) {
   if (platform === 'win32') return parts.map((part) => (WINDOWS_PLAIN.test(part) ? part : `"${part}"`)).join(' ')
   return parts.map((part) => (/^[A-Za-z0-9_@%+=:,./-]+$/.test(part) ? part : `'${part.replace(/'/g, `'\\''`)}'`)).join(' ')
@@ -85,7 +90,10 @@ export async function launcher(binary, { ctx, shim = SHIM } = {}) {
   const { platformContext, which } = await import('@kikedealba/kit/platform')
   const context = ctx ?? platformContext()
   const js = pointsToShim(binary, shim)
-  if (context.platform === 'win32') return js ? [process.execPath, binary] : [binary]
+  if (context.platform === 'win32') {
+    const absolute = windowsRooted(binary) ? binary : path.resolve(binary)
+    return js ? [process.execPath, absolute] : [absolute]
+  }
   const found = await which(TOOL, context)
   if (found && pointsToShim(found, shim)) return [TOOL]
   return js ? [process.execPath, binary] : [binary]
@@ -106,7 +114,7 @@ function pathCmdShim(ctx) {
   const key = Object.keys(ctx.env).find((name) => name.toUpperCase() === 'PATH') ?? 'PATH'
   for (const dir of String(ctx.env[key] ?? '').split(';')) {
     const clean = dir.trim().replace(/^"(.*)"$/, '$1')
-    if (!clean) continue
+    if (!clean || !windowsRooted(clean)) continue
     const file = path.join(clean, `${TOOL}.cmd`)
     if (existsSync(file)) return file
   }
@@ -116,11 +124,13 @@ function pathCmdShim(ctx) {
 export async function hookLauncher(command, { ctx, shim = SHIM } = {}) {
   const context = ctx ?? (await import('@kikedealba/kit/platform')).platformContext()
   const prefix = shellCommand(command, context.platform)
-  if (context.platform !== 'win32' || command.every((part) => WINDOWS_PLAIN.test(part))) return { prefix }
+  if (context.platform !== 'win32') return { prefix }
+  if (!windowsRooted(command[0] ?? '')) throw new Error(`${TOOL} hooks on Windows need an absolute launcher, not ${command[0]}`)
+  if (command.every((part) => WINDOWS_PLAIN.test(part))) return { prefix }
   if (command.length === 2 && pointsToShim(command[1], shim)) {
     const cmd = pathCmdShim(context)
     const target = cmd && cmdShimTarget(cmd)
-    if (target && pointsToShim(target, shim)) return { prefix: `${TOOL}.cmd` }
+    if (target && pointsToShim(target, shim) && WINDOWS_PLAIN.test(cmd)) return { prefix: cmd }
   }
   return { prefix, warning: `la ruta de node o de gaze tiene espacios o caracteres especiales y ${TOOL}.cmd de npm no está en el PATH; los hooks quedan como ${prefix}, que cmd ejecuta pero PowerShell no. Agrega la carpeta de npm (npm config get prefix) al PATH y vuelve a correr gaze setup` }
 }

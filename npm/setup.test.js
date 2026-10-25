@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 import { platformContext } from '@kikedealba/kit/platform'
-import { ANTIGRAVITY_RULES, SHIM, SKILL_DIR, formatSteps, hookLauncher, installAgents, integration, launcher, ownHook, parseArgs, pointsToShim, purgeHooks, runSetup, selection, shellCommand, uninstallAgents, UsageError } from './setup.js'
+import { ANTIGRAVITY_RULES, SHIM, SKILL_DIR, formatSteps, hookLauncher, installAgents, integration, launcher, ownHook, parseArgs, pointsToShim, purgeHooks, runSetup, selection, shellCommand, uninstallAgents, UsageError, windowsRooted } from './setup.js'
 
 const KNOWN = ['claude', 'opencode', 'codex', 'gemini', 'antigravity', 'claude-desktop']
 const BINARY = '/opt/gaze pkg/vendor/gaze'
@@ -157,6 +157,21 @@ describe('launcher and old installs', () => {
     const { home } = sandbox()
     const ctx = platformContext({ platform: 'win32', home, env: { USERPROFILE: home, PATH: '' } })
     assert.deepEqual(await launcher('C:\\pkg\\vendor\\gaze.exe', { ctx }), ['C:\\pkg\\vendor\\gaze.exe'])
+    assert.deepEqual(await launcher(path.join('vendor', 'gaze.exe'), { ctx }), [path.resolve('vendor', 'gaze.exe')])
+  })
+
+  test('every Windows hook prefix carries a path, never a bare name', async () => {
+    const { home } = sandbox()
+    const ctx = platformContext({ platform: 'win32', home, env: { USERPROFILE: home, PATH: '' } })
+    for (const bare of [['gaze'], ['gaze.cmd'], ['node', SHIM], ['.\\gaze.exe'], ['C:gaze.exe']]) {
+      await assert.rejects(hookLauncher(bare, { ctx }), /absolute launcher/)
+    }
+    for (const binary of [SHIM, 'C:\\pkg\\vendor\\gaze.exe', path.join('vendor', 'gaze.exe')]) {
+      const { prefix } = await hookLauncher(await launcher(binary, { ctx }), { ctx })
+      const first = prefix.startsWith('"') ? prefix.slice(1, prefix.indexOf('"', 1)) : prefix.split(' ')[0]
+      assert.notEqual(path.win32.basename(first), first, prefix)
+      assert.ok(windowsRooted(first), prefix)
+    }
   })
 
   test('runs the port with node and npm/gaze.js on Windows', async () => {
@@ -200,13 +215,17 @@ describe('launcher and old installs', () => {
   })
 
   test('picks the hook prefix for Windows: plain paths, then the npm gaze.cmd shim, then quotes with a warning', async () => {
-    const { home } = sandbox()
-    const npmDir = path.join(home, 'npm prefix')
-    const pkg = path.join(npmDir, 'node_modules', '@kikedealba', 'gaze')
-    mkdirSync(path.dirname(pkg), { recursive: true })
-    symlinkSync(path.dirname(path.dirname(SHIM)), pkg, 'junction')
+    const { home: tmp } = sandbox()
+    const home = process.platform === 'win32' ? realpathSync.native(tmp) : tmp
+    const npmDir = path.join(home, 'npm')
+    const spacedNpm = path.join(home, 'npm prefix')
+    for (const prefixDir of [npmDir, spacedNpm]) {
+      const pkg = path.join(prefixDir, 'node_modules', '@kikedealba', 'gaze')
+      mkdirSync(path.dirname(pkg), { recursive: true })
+      symlinkSync(path.dirname(path.dirname(SHIM)), pkg, 'junction')
+    }
     const cmdShim = (target) => `@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\${target}" %*\r\n`
-    writeFileSync(path.join(npmDir, 'gaze.cmd'), cmdShim('node_modules\\@kikedealba\\gaze\\npm\\gaze.js'))
+    for (const prefixDir of [npmDir, spacedNpm]) writeFileSync(path.join(prefixDir, 'gaze.cmd'), cmdShim('node_modules\\@kikedealba\\gaze\\npm\\gaze.js'))
     const other = path.join(home, 'other')
     mkdirSync(other)
     writeFileSync(path.join(other, 'gaze.cmd'), cmdShim('node_modules\\someone-else\\gaze.js'))
@@ -214,7 +233,23 @@ describe('launcher and old installs', () => {
     const spaced = ['C:\\Program Files\\nodejs\\node.exe', SHIM]
 
     assert.deepEqual(await hookLauncher(['C:\\nodejs\\node.exe', 'C:\\npm\\gaze.js'], { ctx: ctx([]) }), { prefix: 'C:\\nodejs\\node.exe C:\\npm\\gaze.js' })
-    assert.deepEqual(await hookLauncher(spaced, { ctx: ctx([`"${npmDir}"`]) }), { prefix: 'gaze.cmd' })
+    const ownCmd = path.join(npmDir, 'gaze.cmd')
+    assert.match(ownCmd, /^[A-Za-z0-9_@+=:./\\-]+$/)
+    assert.deepEqual(await hookLauncher(spaced, { ctx: ctx([`"${npmDir}"`]) }), { prefix: ownCmd })
+    const quotedCmd = await hookLauncher(spaced, { ctx: ctx([spacedNpm]) })
+    assert.equal(quotedCmd.prefix, shellCommand(spaced, 'win32'))
+    assert.match(quotedCmd.warning, /PowerShell no/)
+    const previous = process.cwd()
+    process.chdir(npmDir)
+    try {
+      for (const relative of ['.', path.join('..', 'npm')]) {
+        const planted = await hookLauncher(spaced, { ctx: ctx([relative]) })
+        assert.equal(planted.prefix, shellCommand(spaced, 'win32'))
+        assert.ok(planted.warning)
+      }
+    } finally {
+      process.chdir(previous)
+    }
     assert.deepEqual(await hookLauncher(spaced, { ctx: ctx([other, npmDir]) }).then(({ prefix }) => prefix), shellCommand(spaced, 'win32'))
 
     for (const dirs of [[], [other]]) {

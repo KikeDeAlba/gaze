@@ -3,8 +3,9 @@ import path from 'node:path'
 import { parse as parseToml } from 'smol-toml'
 import { GLOBAL } from './db.js'
 import * as paths from './paths.js'
+import { exists } from './paths.js'
 import { lastJsonLine, runSync } from './proc.js'
-import { fold, nowIso, slugify, trim } from './text.js'
+import { compareBytes, fold, nowIso, slugify, trim } from './text.js'
 
 export const CACHE_SECONDS = 24 * 3600
 export const GLOBAL_CACHE_SECONDS = 3600
@@ -60,15 +61,6 @@ export function globalProject(source) {
 
 export function nowSecs() {
   return Math.floor(Date.now() / 1000)
-}
-
-function exists(p) {
-  try {
-    fs.statSync(p)
-    return true
-  } catch {
-    return false
-  }
 }
 
 function ancestors(start) {
@@ -130,7 +122,6 @@ export function remoteSlug(url) {
   return trimmed === '' ? null : trimmed
 }
 
-const compareBytes = (a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
 
 export function matchScope(slug, mapping) {
   const lower = slug.toLowerCase()

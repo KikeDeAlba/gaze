@@ -3,7 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { errorChain } from './envelope.js'
 import { cleanup, endpointFor, listen, request, rotateToken } from './ipc.js'
-import { VERSION, daemonMarker, dataDir, selfCommand, serveLog, socketPath, spawnedMarker } from './paths.js'
+import { hardenEnv, systemBinary } from './proc.js'
+import { VERSION, daemonMarker, dataDir, lockHeld, releaseLock, selfCommand, serveLock, serveLog, socketPath, spawnedMarker, tryLock } from './paths.js'
 import { nowIso } from './text.js'
 
 export const MANAGER = 'on-demand'
@@ -91,21 +92,13 @@ async function serveEmbedder() {
   return createServeEmbedder()
 }
 
-export async function serve({ idleMinutes, log = new ServeLog(), embedder, idleCheckMs = IDLE_CHECK_MS, minuteMs = MINUTE_MS } = {}) {
-  const socket = socketPath()
-  const endpoint = endpointFor(socket)
-  fs.mkdirSync(dataDir(), { recursive: true })
-  if ((await ping(socket)) !== null) throw new Error(`gaze serve ya corre en ${socket}`)
-  const model = embedder ?? (await serveEmbedder())
-  await model.embed(['warmup'], 'query')
-  const token = rotateToken()
-  let last = Date.now()
+async function bindAndRotate(socket, endpoint, model, onLine) {
+  let token = null
+  let server
   try {
-    await listen(endpoint, (msg) => handle(model, msg), {
-      token,
-      onLine: () => {
-        last = Date.now()
-      },
+    server = await listen(endpoint, (msg) => handle(model, msg), {
+      token: () => token,
+      onLine,
       afterReply: (msg) => {
         if (msg?.op !== 'shutdown') return
         cleanup(endpoint)
@@ -114,6 +107,33 @@ export async function serve({ idleMinutes, log = new ServeLog(), embedder, idleC
     })
   } catch (error) {
     throw new Error(`bind ${socket}`, { cause: error })
+  }
+  try {
+    token = rotateToken()
+  } catch (error) {
+    await new Promise((resolve) => server.close(resolve))
+    cleanup(endpoint)
+    throw new Error('rotate daemon token', { cause: error })
+  }
+  return server
+}
+
+export async function serve({ idleMinutes, log = new ServeLog(), embedder, idleCheckMs = IDLE_CHECK_MS, minuteMs = MINUTE_MS } = {}) {
+  const socket = socketPath()
+  const endpoint = endpointFor(socket)
+  fs.mkdirSync(dataDir(), { recursive: true })
+  const lock = serveLock()
+  if (!tryLock(lock)) throw new Error(`gaze serve ya corre en ${socket}`)
+  let last = Date.now()
+  try {
+    if ((await ping(socket)) !== null) throw new Error(`gaze serve ya corre en ${socket}`)
+    const model = embedder ?? (await serveEmbedder())
+    await model.embed(['warmup'], 'query')
+    await bindAndRotate(socket, endpoint, model, () => {
+      last = Date.now()
+    })
+  } finally {
+    releaseLock(lock)
   }
   log.line(`gaze serve listening on ${socket}`)
   const minutes = Number(idleMinutes)
@@ -131,7 +151,7 @@ export async function serve({ idleMinutes, log = new ServeLog(), embedder, idleC
 
 function childEnv(env = process.env) {
   const proxy = PROXY_VARS.some((name) => typeof env[name] === 'string' && env[name] !== '')
-  return proxy ? { ...env, NODE_USE_ENV_PROXY: '1' } : { ...env }
+  return hardenEnv(proxy ? { ...env, NODE_USE_ENV_PROXY: '1' } : env)
 }
 
 function openLog(file) {
@@ -187,24 +207,43 @@ function recentlySpawned(marker, now = Date.now()) {
   }
 }
 
-function launchOnDemand(command) {
+function claimSpawn(marker = spawnedMarker()) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.writeFileSync(marker, '', { flag: 'wx' })
+      return true
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
+    if (recentlySpawned(marker)) return false
+    const aside = `${marker}.${process.pid}.${Date.now()}.stale`
+    try {
+      fs.renameSync(marker, aside)
+      fs.rmSync(aside, { force: true })
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
+function launchOnDemand(command, { force = false } = {}) {
   fs.mkdirSync(dataDir(), { recursive: true })
-  fs.writeFileSync(spawnedMarker(), '')
+  if (force) fs.writeFileSync(spawnedMarker(), '')
+  else if (!claimSpawn()) return null
   return launch(command, serveArgs(ON_DEMAND_IDLE_MINUTES), { logFile: serveLog() })
 }
 
 export function spawnOnDemand({ command = selfCommand() } = {}) {
   try {
-    if (recentlySpawned(spawnedMarker())) return false
-    launchOnDemand(command)
-    return true
+    return launchOnDemand(command) !== null
   } catch {
     return false
   }
 }
 
 export function schtasksPath(env = process.env) {
-  return path.win32.join(env.SystemRoot ?? env.SYSTEMROOT ?? 'C:\\Windows', 'System32', 'schtasks.exe')
+  return systemBinary('schtasks.exe', env)
 }
 
 function systemExec(program, args) {
@@ -246,7 +285,7 @@ export async function install({ self = selfCommand(), legacy = {} } = {}) {
   await removeLegacyTask(legacy)
   let reply = await ping(socket)
   if (reply === null) {
-    launchOnDemand(self)
+    if (!lockHeld(serveLock())) launchOnDemand(self, { force: true })
     reply = await waitReady(socket)
   }
   const bin = self[self.length - 1]

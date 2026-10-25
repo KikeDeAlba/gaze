@@ -1,7 +1,9 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { GazeError } from './envelope.js'
+import { lockHeld, releaseLock, tryLock } from './paths.js'
 
 export const KINDS = ['rule', 'fact', 'decision', 'doc', 'entry', 'issue', 'meeting', 'memory']
 export const SOURCES = ['claude', 'harvest', 'inkwell', 'recap', 'bita', 'tally', 'import', 'user']
@@ -133,6 +135,15 @@ const COPY_TABLES = ['nodes', 'edges', 'attrs', 'pending_links', 'chunks', 'proj
 
 const NATIVE_MESSAGE = 'Esta base es de gaze nativo (vec0); usa GAZE_DATA_DIR para el port JS'
 const NATIVE_HINT = 'El port JS solo migra bases de gaze nativo en Windows; en macOS y Linux apunta GAZE_DATA_DIR a otro directorio o sigue usando el binario nativo'
+const MIGRATE_WAIT_MS = 120000
+const POLL_MS = 100
+const RENAME_TRIES = 50
+const BUSY_CODES = new Set(['EBUSY', 'EPERM', 'EACCES'])
+const SIDE_FILES = ['', '-wal', '-shm', '-journal']
+
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+
+export const migrationLock = (file) => `${file}.migrate.lock`
 
 function tableNames(db, schema = 'main') {
   return new Set(db.prepare(`SELECT name FROM ${schema}.sqlite_master WHERE type = 'table'`).all().map((row) => row.name))
@@ -156,13 +167,51 @@ function freePath(candidate) {
   return `${candidate}.${Date.now()}`
 }
 
+function renameRetry(from, to) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to)
+      return
+    } catch (error) {
+      if (!BUSY_CODES.has(error.code) || attempt >= RENAME_TRIES) throw error
+      sleepSync(POLL_MS)
+    }
+  }
+}
+
 function moveIfExists(from, to) {
-  if (fs.existsSync(from)) fs.renameSync(from, to)
+  if (fs.existsSync(from)) renameRetry(from, to)
+}
+
+function removeStaging(staging) {
+  for (const suffix of SIDE_FILES) fs.rmSync(staging + suffix, { force: true })
+}
+
+function swapIn(file, staging) {
+  const backup = freePath(`${file}.vec0.bak`)
+  try {
+    renameRetry(file, backup)
+  } catch (error) {
+    removeStaging(staging)
+    throw new Error(`migrate ${file}`, { cause: error })
+  }
+  try {
+    moveIfExists(`${file}-wal`, `${backup}-wal`)
+    moveIfExists(`${file}-shm`, `${backup}-shm`)
+    renameRetry(staging, file)
+  } catch (error) {
+    try {
+      if (!fs.existsSync(file)) renameRetry(backup, file)
+    } catch {}
+    removeStaging(staging)
+    throw new Error(`migrate ${file}`, { cause: error })
+  }
+  return backup
 }
 
 export function migrateVec0(file) {
-  const staging = `${file}.migrating`
-  for (const suffix of ['', '-wal', '-shm', '-journal']) fs.rmSync(staging + suffix, { force: true })
+  const staging = `${file}.migrating.${process.pid}.${crypto.randomBytes(4).toString('hex')}`
+  removeStaging(staging)
   const target = new DatabaseSync(staging)
   let nodes = 0
   try {
@@ -200,34 +249,90 @@ export function migrateVec0(file) {
     target.exec('DETACH DATABASE old')
   } catch (error) {
     target.close()
-    for (const suffix of ['', '-wal', '-shm', '-journal']) fs.rmSync(staging + suffix, { force: true })
+    removeStaging(staging)
     throw new Error(`migrate ${file}`, { cause: error })
   }
   target.close()
-  const backup = freePath(`${file}.vec0.bak`)
-  fs.renameSync(file, backup)
-  moveIfExists(`${file}-wal`, `${backup}-wal`)
-  moveIfExists(`${file}-shm`, `${backup}-shm`)
-  fs.renameSync(staging, file)
-  return { backup, nodes }
+  return { backup: swapIn(file, staging), nodes }
 }
 
 function defaultLog(message) {
   process.stderr.write(`${message}\n`)
 }
 
-export function openDb(file, { migrate = process.platform === 'win32', log = defaultLog } = {}) {
+function busy(file) {
+  return new GazeError('INTERNAL_ERROR', `Otro proceso está migrando ${file}`, 'Vuelve a intentarlo en un momento')
+}
+
+function vec0Backup(file) {
+  const base = `${path.basename(file)}.vec0.bak`
+  let names
+  try {
+    names = fs.readdirSync(path.dirname(file))
+  } catch {
+    return null
+  }
+  const found = names.find((name) => name.startsWith(base) && !name.endsWith('-wal') && !name.endsWith('-shm'))
+  return found === undefined ? null : path.join(path.dirname(file), found)
+}
+
+function waitForMigration(file, deadline) {
+  while (lockHeld(migrationLock(file))) {
+    if (Date.now() >= deadline) throw busy(file)
+    sleepSync(POLL_MS)
+  }
+}
+
+function refuseMissing(file) {
+  if (fs.existsSync(file)) return
+  const backup = vec0Backup(file)
+  if (backup === null) return
+  throw new GazeError('INTERNAL_ERROR', `Falta ${file} pero existe la copia de gaze nativo ${backup}`, `Restaura la copia con su nombre original o bórrala para empezar con una base vacía`)
+}
+
+function connect(file) {
+  const db = new DatabaseSync(file)
+  db.exec('PRAGMA busy_timeout = 10000')
+  return db
+}
+
+function migrateOnce(file, deadline) {
+  const lock = migrationLock(file)
+  while (!tryLock(lock)) {
+    if (Date.now() >= deadline) throw busy(file)
+    sleepSync(POLL_MS)
+  }
+  try {
+    refuseMissing(file)
+    const probe = connect(file)
+    let native
+    try {
+      native = isNativeVec0(probe)
+    } finally {
+      probe.close()
+    }
+    return native ? migrateVec0(file) : null
+  } finally {
+    releaseLock(lock)
+  }
+}
+
+export function openDb(file, { migrate = process.platform === 'win32', log = defaultLog, waitMs = MIGRATE_WAIT_MS } = {}) {
   const parent = path.dirname(file)
   if (parent !== '') fs.mkdirSync(parent, { recursive: true })
-  let db = new DatabaseSync(file)
-  db.exec('PRAGMA busy_timeout = 10000')
+  const deadline = Date.now() + waitMs
+  if (!fs.existsSync(file)) waitForMigration(file, deadline)
+  refuseMissing(file)
+  let db = connect(file)
   if (isNativeVec0(db)) {
     db.close()
     if (!migrate) throw new GazeError('INTERNAL_ERROR', NATIVE_MESSAGE, NATIVE_HINT)
-    const { backup } = migrateVec0(file)
-    log(`gaze: ${file} era una base de gaze nativo (vec0); se migró al port JS y el original quedó en ${backup}. Corre \`gaze reindex\` para regenerar los vectores.`)
-    db = new DatabaseSync(file)
-    db.exec('PRAGMA busy_timeout = 10000')
+    const migrated = migrateOnce(file, deadline)
+    if (migrated !== null) {
+      log(`gaze: ${file} era una base de gaze nativo (vec0); se migró al port JS y el original quedó en ${migrated.backup}. Corre \`gaze reindex\` para regenerar los vectores.`)
+    }
+    refuseMissing(file)
+    db = connect(file)
   }
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')

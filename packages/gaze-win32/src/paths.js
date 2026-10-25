@@ -55,12 +55,40 @@ export function canonical(p) {
   }
 }
 
-export function readUtf8Strict(file) {
-  const bytes = fs.readFileSync(file)
+export function decodeStrict(bytes) {
   try {
     return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
   } catch {
     throw new Error('stream did not contain valid UTF-8')
+  }
+}
+
+export function readUtf8Strict(file) {
+  return decodeStrict(fs.readFileSync(file))
+}
+
+export function isFile(p) {
+  try {
+    return fs.statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+export function exists(p) {
+  try {
+    fs.statSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function currentDir() {
+  try {
+    return process.cwd()
+  } catch {
+    return '/'
   }
 }
 
@@ -133,6 +161,71 @@ export function tokenPath() {
 
 export function spawnedMarker() {
   return path.join(dataDir(), 'serve.spawned')
+}
+
+export function serveLock() {
+  return path.join(dataDir(), 'serve.lock')
+}
+
+const EMPTY_LOCK_GRACE_MS = 10000
+
+export function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+function lockOwner(file) {
+  let raw
+  try {
+    raw = fs.readFileSync(file, 'utf8')
+  } catch {
+    return { missing: true, pid: null }
+  }
+  const pid = Number.parseInt(raw.trim(), 10)
+  return { missing: false, pid: Number.isInteger(pid) ? pid : null }
+}
+
+function stale(file, owner) {
+  if (owner.pid !== null) return !pidAlive(owner.pid)
+  try {
+    return Date.now() - fs.statSync(file).mtimeMs > EMPTY_LOCK_GRACE_MS
+  } catch {
+    return false
+  }
+}
+
+export function lockHeld(file) {
+  const owner = lockOwner(file)
+  return !owner.missing && !stale(file, owner)
+}
+
+export function tryLock(file) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      fs.writeFileSync(file, `${process.pid}\n`, { flag: 'wx' })
+      return true
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
+    const owner = lockOwner(file)
+    if (owner.missing) continue
+    if (!stale(file, owner)) return false
+    const aside = `${file}.${process.pid}.${Date.now()}.stale`
+    try {
+      fs.renameSync(file, aside)
+      fs.rmSync(aside, { force: true })
+    } catch {}
+  }
+  return false
+}
+
+export function releaseLock(file) {
+  if (lockOwner(file).pid === process.pid) fs.rmSync(file, { force: true })
 }
 
 export function registryDir() {

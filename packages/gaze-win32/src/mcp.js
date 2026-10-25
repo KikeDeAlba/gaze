@@ -3,12 +3,12 @@ import { errorChain, usage } from './envelope.js'
 import { VERSION } from './paths.js'
 import * as project from './project.js'
 import * as text from './text.js'
+import { field } from './text.js'
 
 export const PROTOCOL = '2025-06-18'
 
 const WHITESPACE = /\p{White_Space}/u
 
-const field = (value, key) => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value[key] : undefined)
 
 export function tools() {
   return [

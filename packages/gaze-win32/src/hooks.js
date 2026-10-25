@@ -5,10 +5,12 @@ import * as daemon from './daemon.js'
 import { DaemonEmbedder, FakeEmbedder, fakeRequested } from './embed.js'
 import * as ipc from './ipc.js'
 import * as paths from './paths.js'
+import { currentDir } from './paths.js'
 import { spawnDetached } from './proc.js'
 import * as project from './project.js'
 import { GLOBAL } from './store.js'
 import * as text from './text.js'
+import { field, str } from './text.js'
 
 export const HARVEST_ENV = 'GAZE_HARVEST'
 
@@ -73,8 +75,6 @@ const LEARNING_KINDS = ['decision', 'fact', 'rule']
 const TITLE_COVERAGE = Math.fround(0.2)
 const SEMANTIC_COVERAGE = Math.fround(0.25)
 
-const field = (value, key) => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value[key] : undefined)
-const str = (value) => (typeof value === 'string' ? value : null)
 const elapsedMs = (started) => Math.floor(performance.now() - started)
 const charCount = (s) => {
   let n = 0
@@ -112,14 +112,6 @@ export function projectDir(agent) {
     if (value !== undefined && value !== '') return value
   }
   return null
-}
-
-function currentDir() {
-  try {
-    return process.cwd()
-  } catch {
-    return '/'
-  }
 }
 
 function inputCwd(input, agent) {

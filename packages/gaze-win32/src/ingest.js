@@ -3,18 +3,17 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { errorChain } from './envelope.js'
 import * as paths from './paths.js'
+import { exists, isFile } from './paths.js'
 import { lastJsonLine, runSync } from './proc.js'
 import * as project from './project.js'
 import { GLOBAL } from './store.js'
 import * as text from './text.js'
+import { compareBytes, field, str } from './text.js'
 
 const MOVING = 'inkwell-moving:'
 const I64 = /^[+-]?\d+$/
 
-const field = (value, key) => (value !== null && typeof value === 'object' && !Array.isArray(value) ? value[key] : undefined)
-const str = (value) => (typeof value === 'string' ? value : null)
 const int = (value) => (typeof value === 'number' && Number.isInteger(value) ? value : null)
-const compareBytes = (a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
 const isWindows = () => process.platform === 'win32'
 
 function parseI64(value) {
@@ -24,26 +23,9 @@ function parseI64(value) {
   return Number(n)
 }
 
-function isFile(p) {
-  try {
-    return fs.statSync(p).isFile()
-  } catch {
-    return false
-  }
-}
-
 function isDir(p) {
   try {
     return fs.statSync(p).isDirectory()
-  } catch {
-    return false
-  }
-}
-
-function exists(p) {
-  try {
-    fs.statSync(p)
-    return true
   } catch {
     return false
   }

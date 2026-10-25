@@ -92,8 +92,16 @@ export function wikilinks(body) {
   return out
 }
 
-function compareBytes(a, b) {
+export function compareBytes(a, b) {
   return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
+}
+
+export function field(value, key) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value[key] : undefined
+}
+
+export function str(value) {
+  return typeof value === 'string' ? value : null
 }
 
 export function issueKeys(text) {

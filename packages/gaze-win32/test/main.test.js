@@ -6,7 +6,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
 import { SCHEMA, isNativeVec0 } from '../src/db.js'
-import { main, parse } from '../src/main.js'
+import { installSummary, main, parse, statusSummary } from '../src/main.js'
 import { PORT_BIN, VERSION, canonical } from '../src/paths.js'
 import * as index from '../src/index.js'
 
@@ -284,6 +284,18 @@ test('setup and uninstall register the argv from self', async () => {
   assert.match(human.stdout, /\n\nFalta \(no lo hago yo\):\n  gaze daemon install\n/)
   assert.match((await gaze(['uninstall'])).stdout, /^Registro de kit borrado\.\nLos datos se quedan en /)
   assert.match((await gaze(['uninstall'])).stdout, /^Registro de kit no existía\./)
+})
+
+test('daemon summaries only cover the on-demand states and results', () => {
+  assert.equal(statusSummary({ state: 'running', pid: 7 }), 'Corriendo (pid 7)')
+  assert.equal(statusSummary({ state: 'idle' }), 'Bajo demanda, apagado; arranca con el primer hook o búsqueda')
+  for (const state of ['stopped', 'not-loaded', 'starting']) assert.equal(statusSummary({ state, manager: 'on-demand', managerPid: 3 }), 'Apagado')
+  const result = { manager: 'on-demand', pid: 5, socket: '/s', log: '/l', warning: 'ignored' }
+  assert.equal(installSummary({ ...result, ready: true }), 'Daemon cargado en on-demand con pid 5 y respondiendo en /s')
+  assert.equal(
+    installSummary({ ...result, ready: false }),
+    'Daemon cargado en on-demand con pid 5, pero aún no responde en /s (puede estar descargando el modelo); revisa /l y gaze daemon status',
+  )
 })
 
 test('daemon status prints the on-demand states', async () => {

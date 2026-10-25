@@ -10,6 +10,7 @@ import * as importer from './import.js'
 import * as ingest from './ingest.js'
 import { McpServer } from './mcp.js'
 import * as paths from './paths.js'
+import { currentDir, decodeStrict } from './paths.js'
 import { spawnDetached } from './proc.js'
 import * as project from './project.js'
 import * as setup from './setup.js'
@@ -244,6 +245,18 @@ function parseLeaf(route, spec, args) {
   return { values }
 }
 
+export function installSummary(result) {
+  const manager = asText(result.manager)
+  if (result.ready === true) return `Daemon cargado en ${manager} con pid ${display(result.pid)} y respondiendo en ${asText(result.socket)}`
+  return `Daemon cargado en ${manager} con pid ${display(result.pid)}, pero aún no responde en ${asText(result.socket)} (puede estar descargando el modelo); revisa ${asText(result.log)} y gaze daemon status`
+}
+
+export function statusSummary(status) {
+  if (status.state === 'running') return `Corriendo (pid ${display(status.pid)})`
+  if (status.state === 'idle') return 'Bajo demanda, apagado; arranca con el primer hook o búsqueda'
+  return 'Apagado'
+}
+
 export function parse(argv) {
   const { json, args } = takeJson(argv)
   const first = nextWord(args, null)
@@ -269,26 +282,10 @@ export function parse(argv) {
   return leaf.help ? leaf : { route, values: leaf.values, json }
 }
 
-function currentDir() {
-  try {
-    return process.cwd()
-  } catch {
-    return '/'
-  }
-}
-
 async function readAll(stream) {
   const chunks = []
   for await (const chunk of stream) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
   return Buffer.concat(chunks)
-}
-
-function decodeStrict(bytes) {
-  try {
-    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
-  } catch {
-    throw new Error('stream did not contain valid UTF-8')
-  }
 }
 
 async function readBody(ctx, body) {
@@ -533,12 +530,7 @@ async function execute(ctx, route, v) {
     }
     case 'daemon install': {
       const result = await daemon.install({ self: ctx.self })
-      const manager = asText(result.manager)
-      let human
-      if (typeof result.warning === 'string') human = `Daemon instalado en ${manager}, pero sin arrancar: ${result.warning}`
-      else if (result.ready === true) human = `Daemon cargado en ${manager} con pid ${display(result.pid)} y respondiendo en ${asText(result.socket)}`
-      else human = `Daemon cargado en ${manager} con pid ${display(result.pid)}, pero aún no responde en ${asText(result.socket)} (puede estar descargando el modelo); revisa ${asText(result.log)} y gaze daemon status`
-      return output(result, human)
+      return output(result, installSummary(result))
     }
     case 'daemon uninstall': {
       const result = await daemon.uninstall()
@@ -546,24 +538,7 @@ async function execute(ctx, route, v) {
     }
     case 'daemon status': {
       const status = await daemon.status()
-      let human
-      switch (status.state) {
-        case 'running':
-          human = `Corriendo (pid ${display(status.pid)})`
-          break
-        case 'idle':
-          human = 'Bajo demanda, apagado; arranca con el primer hook o búsqueda'
-          break
-        case 'not-loaded':
-          human = `Instalado pero no cargado en ${asText(status.manager)} (${asText(status.unit)}). Cárgalo con: gaze daemon install`
-          break
-        case 'starting':
-          human = `Cargado en ${asText(status.manager)} pero sin responder en el socket (pid ${display(status.managerPid)}); revisa ${paths.serveLog()}`
-          break
-        default:
-          human = 'Apagado'
-      }
-      return output(status, human)
+      return output(status, statusSummary(status))
     }
     case 'reindex': {
       const store = await ctx.store()

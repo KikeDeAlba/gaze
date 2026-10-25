@@ -3,9 +3,8 @@ import path from 'node:path'
 import { GLOBAL } from './db.js'
 import * as paths from './paths.js'
 import * as project from './project.js'
-import { frontmatter, trim, truncate } from './text.js'
+import { compareBytes, frontmatter, trim, truncate } from './text.js'
 
-const compareBytes = (a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
 const charCount = (s) => [...s].length
 
 function errorChain(error) {

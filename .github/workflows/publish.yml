@@ -327,6 +327,13 @@ jobs:
           PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
+          name="$(jq -r .name package.json)"
+          version="$(jq -r .version package.json)"
+          published="$(npm view "$name@$version" version 2>/dev/null || true)"
+          if [ "$published" = "$version" ]; then
+            echo "$name@$version is already on npm; skipping the publish"
+            exit 0
+          fi
           if [ "$PRERELEASE" = "true" ]; then
             npm publish --provenance --access public --tag next
           else
@@ -339,6 +346,13 @@ jobs:
           PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
+          name="$(jq -r .name package.json)"
+          version="$(jq -r .version package.json)"
+          published="$(npm view "$name@$version" version 2>/dev/null || true)"
+          if [ "$published" = "$version" ]; then
+            echo "$name@$version is already on npm; skipping the publish"
+            exit 0
+          fi
           if [ "$PRERELEASE" = "true" ]; then
             npm publish --provenance --access public --tag next
           else

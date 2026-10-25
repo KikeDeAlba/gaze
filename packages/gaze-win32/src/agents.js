@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-import { commandFor, envGet, envSet, hardenEnv, killTree, resolveProgram } from './proc.js'
+import { commandFor, envGet, envSet, hardenEnv, killTree, resolveProgram, searchDirs } from './proc.js'
 import { lines, str, trim, truncate } from './text.js'
 
 export const AGENTS = ['claude', 'codex', 'gemini', 'antigravity', 'opencode']
@@ -300,9 +300,9 @@ export async function run(agent, prompt, model, cwd, timeoutMs, extraEnv = [], {
     env = childEnv(agent, process.env)
     const extras = Array.isArray(extraEnv) ? extraEnv : Object.entries(extraEnv ?? {})
     for (const [key, value] of [...extras, ...spec.env]) envSet(env, key, value, windows)
-    if (hasDir(program)) {
-      const rest = (searchPath ?? '').split(path.delimiter).filter((dir) => dir !== '')
-      envSet(env, 'PATH', [path.dirname(program), ...rest].join(path.delimiter), windows)
+    if (hasDir(program) || searchPath !== undefined) {
+      const rest = searchDirs(searchPath, windows)
+      envSet(env, 'PATH', [...(hasDir(program) ? [path.dirname(program)] : []), ...rest].join(path.delimiter), windows)
     }
     command = commandFor(program, spec.args, { platform })
   } catch (error) {

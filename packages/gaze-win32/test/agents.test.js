@@ -232,6 +232,20 @@ test('run passes extra env, prepends the program dir to path and rejects empty o
   await assert.rejects(run('claude', 'p', null, dir, 20000), /spawn/)
 })
 
+test('run drops relative, empty and dot entries from the child path', async () => {
+  const probe = fakeProgram('pathprobe', `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(JSON.stringify({ result: process.env.PATH ?? process.env.Path })))`)
+  const original = process.env.PATH
+  const node = path.dirname(process.execPath)
+  process.env.PATH = ['.', '', path.join('rel', 'dir'), node, `.${path.sep}x`].join(path.delimiter)
+  process.env.GAZE_HARVEST_BIN = probe
+  try {
+    const outcome = await run('claude', 'p', null, dir, 20000)
+    assert.deepEqual(outcome.text.split(path.delimiter), [path.dirname(probe), node])
+  } finally {
+    process.env.PATH = original
+  }
+})
+
 test('run reports programs it cannot prepare as spawn errors', async () => {
   process.env.GAZE_HARVEST_BIN = 'gaze-missing-agent'
   await assert.rejects(run('claude', 'p', null, dir, 20000, [], { platform: 'win32' }), (error) => {

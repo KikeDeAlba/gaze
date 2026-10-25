@@ -291,16 +291,24 @@ export async function run(agent, prompt, model, cwd, timeoutMs, extraEnv = [], {
   const windows = platform === 'win32'
   const bin = binOverride(agent) ?? agentBin(agent)
   const searchPath = envGet(process.env, 'PATH', windows)
-  const program = resolveProgram(bin, { path: searchPath, windows })
-  const spec = invocation(agent, program, prompt, model, cwd)
-  const env = childEnv(agent, process.env)
-  const extras = Array.isArray(extraEnv) ? extraEnv : Object.entries(extraEnv ?? {})
-  for (const [key, value] of [...extras, ...spec.env]) envSet(env, key, value, windows)
-  if (hasDir(program)) {
-    const rest = (searchPath ?? '').split(path.delimiter).filter((dir) => dir !== '')
-    envSet(env, 'PATH', [path.dirname(program), ...rest].join(path.delimiter), windows)
+  let program = bin
+  let spec
+  let env
+  let command
+  try {
+    program = resolveProgram(bin, { path: searchPath, windows })
+    spec = invocation(agent, program, prompt, model, cwd)
+    env = childEnv(agent, process.env)
+    const extras = Array.isArray(extraEnv) ? extraEnv : Object.entries(extraEnv ?? {})
+    for (const [key, value] of [...extras, ...spec.env]) envSet(env, key, value, windows)
+    if (hasDir(program)) {
+      const rest = (searchPath ?? '').split(path.delimiter).filter((dir) => dir !== '')
+      envSet(env, 'PATH', [path.dirname(program), ...rest].join(path.delimiter), windows)
+    }
+    command = commandFor(program, spec.args, { platform })
+  } catch (error) {
+    throw new Error(`spawn ${program}`, { cause: error })
   }
-  const command = commandFor(program, spec.args, { platform })
   const child = await new Promise((resolve, reject) => {
     let started
     try {

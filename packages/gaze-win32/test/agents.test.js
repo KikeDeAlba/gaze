@@ -231,3 +231,22 @@ test('run passes extra env, prepends the program dir to path and rejects empty o
   process.env.GAZE_HARVEST_BIN = path.join(dir, 'nonexistent-agent')
   await assert.rejects(run('claude', 'p', null, dir, 20000), /spawn/)
 })
+
+test('run reports programs it cannot prepare as spawn errors', async () => {
+  process.env.GAZE_HARVEST_BIN = 'gaze-missing-agent'
+  await assert.rejects(run('claude', 'p', null, dir, 20000, [], { platform: 'win32' }), (error) => {
+    assert.equal(error.message, 'spawn gaze-missing-agent')
+    assert.equal(error.cause.code, 'ENOENT')
+    return true
+  })
+  const odd = path.join(dir, '100%')
+  fs.mkdirSync(odd, { recursive: true })
+  const bat = path.join(odd, 'agent.bat')
+  fs.writeFileSync(bat, '@echo off\r\n')
+  process.env.GAZE_HARVEST_BIN = bat
+  await assert.rejects(run('claude', 'p', null, dir, 20000, [], { platform: 'win32' }), (error) => {
+    assert.equal(error.message, `spawn ${bat}`)
+    assert.match(error.cause.message, /argumento no seguro/)
+    return true
+  })
+})

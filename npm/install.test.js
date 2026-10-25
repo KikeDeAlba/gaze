@@ -526,16 +526,28 @@ describe('loadPort', () => {
     assert.equal(PORT, '@kikedealba/gaze-win32')
   })
 
-  test('falls back to packages/gaze-win32 of a checkout when the package is not installed', async () => {
+  test('falls back to packages/gaze-win32 of a checkout with GAZE_FORCE_JS=1 when the package is not installed', async () => {
     const root = jsRoot()
     const seen = []
-    const port = await loadPort({ root, load: async (specifier) => {
+    const port = await loadPort({ root, env: { GAZE_FORCE_JS: '1' }, load: async (specifier) => {
       seen.push(specifier)
       if (specifier === PORT) throw missing(specifier)
       return import(specifier)
     } })
     assert.equal(typeof port.main, 'function')
     assert.deepEqual(seen, [PORT, pathToFileURL(path.join(root, 'packages', 'gaze-win32', 'src', 'index.js')).href])
+  })
+
+  test('ignores a checkout next to the launcher without GAZE_FORCE_JS=1', async () => {
+    const root = jsRoot()
+    for (const env of [{}, { GAZE_FORCE_JS: '0' }]) {
+      const seen = []
+      await assert.rejects(
+        loadPort({ root, env, load: async (specifier) => (seen.push(specifier), Promise.reject(missing(specifier))) }),
+        (error) => error.name === 'InstallError' && error.message === '@kikedealba/gaze-win32 is missing; reinstall with npm install -g @kikedealba/gaze',
+      )
+      assert.deepEqual(seen, [PORT])
+    }
   })
 
   test('fails with a clear message when the optional package is missing', async () => {

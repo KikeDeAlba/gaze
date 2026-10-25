@@ -274,14 +274,14 @@ function missingPackage(error) {
   return error?.code === 'ERR_MODULE_NOT_FOUND' && String(error.message).includes(`'${PORT}'`)
 }
 
-export async function loadPort({ root = ROOT, load = (specifier) => import(specifier) } = {}) {
+export async function loadPort({ root = ROOT, env = process.env, load = (specifier) => import(specifier) } = {}) {
   let port
   try {
     port = await load(PORT)
   } catch (error) {
     if (!missingPackage(error)) throw new InstallError(`cannot load ${PORT}: ${error.message}`)
     const local = path.join(root, 'packages', 'gaze-win32', 'src', 'index.js')
-    if (!existsSync(local)) throw new InstallError(`${PORT} is missing; reinstall with npm install -g @kikedealba/gaze`)
+    if (env.GAZE_FORCE_JS !== '1' || !existsSync(local)) throw new InstallError(`${PORT} is missing; reinstall with npm install -g @kikedealba/gaze`)
     try {
       port = await load(pathToFileURL(local).href)
     } catch (failure) {

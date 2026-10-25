@@ -136,6 +136,7 @@ const COPY_TABLES = ['nodes', 'edges', 'attrs', 'pending_links', 'chunks', 'proj
 const NATIVE_MESSAGE = 'Esta base es de gaze nativo (vec0); usa GAZE_DATA_DIR para el port JS'
 const NATIVE_HINT = 'El port JS solo migra bases de gaze nativo en Windows; en macOS y Linux apunta GAZE_DATA_DIR a otro directorio o sigue usando el binario nativo'
 const MIGRATE_WAIT_MS = 120000
+export const HOOK_WAIT_MS = 1500
 const POLL_MS = 100
 const RENAME_TRIES = 50
 const BUSY_CODES = new Set(['EBUSY', 'EPERM', 'EACCES'])
@@ -185,6 +186,19 @@ function moveIfExists(from, to) {
 
 function removeStaging(staging) {
   for (const suffix of SIDE_FILES) fs.rmSync(staging + suffix, { force: true })
+}
+
+function removeOrphanStagings(file) {
+  const prefix = `${path.basename(file)}.migrating.`
+  let names
+  try {
+    names = fs.readdirSync(path.dirname(file))
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (name.startsWith(prefix)) fs.rmSync(path.join(path.dirname(file), name), { force: true })
+  }
 }
 
 function swapIn(file, staging) {
@@ -303,6 +317,7 @@ function migrateOnce(file, deadline) {
     sleepSync(POLL_MS)
   }
   try {
+    removeOrphanStagings(file)
     refuseMissing(file)
     const probe = connect(file)
     let native
@@ -315,6 +330,12 @@ function migrateOnce(file, deadline) {
   } finally {
     releaseLock(lock)
   }
+}
+
+export function needsReindex(db, file) {
+  if (vec0Backup(file) === null) return false
+  if (db.prepare('SELECT EXISTS (SELECT 1 FROM chunk_vectors) AS found').get().found === 1) return false
+  return db.prepare('SELECT EXISTS (SELECT 1 FROM nodes) AS found').get().found === 1
 }
 
 export function openDb(file, { migrate = process.platform === 'win32', log = defaultLog, waitMs = MIGRATE_WAIT_MS } = {}) {

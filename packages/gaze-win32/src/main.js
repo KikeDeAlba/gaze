@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util'
 import * as agents from './agents.js'
 import { loadConfig } from './config.js'
 import * as daemon from './daemon.js'
-import { openDb } from './db.js'
+import { HOOK_WAIT_MS, needsReindex, openDb } from './db.js'
 import { AutoEmbedder } from './embed.js'
 import { GazeError, errorChain, failure, success, usage } from './envelope.js'
 import * as hooks from './hooks.js'
@@ -11,7 +11,6 @@ import * as ingest from './ingest.js'
 import { McpServer } from './mcp.js'
 import * as paths from './paths.js'
 import { currentDir, decodeStrict } from './paths.js'
-import { spawnDetached } from './proc.js'
 import * as project from './project.js'
 import * as setup from './setup.js'
 import { GLOBAL, Store, hitJson } from './store.js'
@@ -338,18 +337,13 @@ class Context {
     return this.cached
   }
 
-  async store({ background = false } = {}) {
-    let migrated = false
-    const db = openDb(paths.dbPath(), {
-      log: (message) => {
-        migrated = true
-        this.err(message)
-      },
-    })
+  async store({ hook = false, reindex = true } = {}) {
+    const file = paths.dbPath()
+    const db = openDb(file, { log: (message) => this.err(message), ...(hook ? { waitMs: HOOK_WAIT_MS } : {}) })
     const store = new Store(db, loadConfig())
     this.opened.push(store)
-    if (migrated) {
-      if (background) spawnDetached([...this.self, 'reindex'], {})
+    if (reindex && needsReindex(db, file)) {
+      if (hook) hooks.spawnReindex(this.self)
       else {
         try {
           const done = await store.reindex(this.embedder(), false)
@@ -541,7 +535,7 @@ async function execute(ctx, route, v) {
       return output(status, statusSummary(status))
     }
     case 'reindex': {
-      const store = await ctx.store()
+      const store = await ctx.store({ reindex: false })
       const done = await store.reindex(ctx.embedder(), v.all)
       return output({ reindexed: done }, `${done} notas con embeddings nuevos.`)
     }
@@ -558,7 +552,7 @@ async function runHook(ctx, event, harness) {
     let result = null
     if (event === 'harvest') hooks.harvest(input, agent)
     else if (event === 'session-start' || event === 'prompt') {
-      const store = await ctx.store({ background: true })
+      const store = await ctx.store({ hook: true })
       result = event === 'session-start'
         ? hooks.sessionStart(store, input, agent)
         : await hooks.prompt(store, input, agent, { spawnOnDemand: () => daemon.spawnOnDemand({ command: ctx.self }) })
@@ -632,7 +626,7 @@ async function runInkwellHook(ctx) {
 
 async function runHarvest(ctx, v) {
   try {
-    const store = await ctx.store()
+    const store = await ctx.store({ hook: true })
     await hooks.harvestRun(store, ctx.embedder(), v.transcript, v.session, v.cwd, { out: ctx.io.stdout })
   } catch (error) {
     ctx.out(`${text.nowIso()} harvest ${v.session}: ${errorChain(error)}`)

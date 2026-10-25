@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
-import { SCHEMA, isNativeVec0 } from '../src/db.js'
+import { SCHEMA, isNativeVec0, migrationLock, openDb } from '../src/db.js'
 import { installSummary, main, parse, statusSummary } from '../src/main.js'
 import { PORT_BIN, VERSION, canonical } from '../src/paths.js'
 import * as index from '../src/index.js'
@@ -405,4 +405,66 @@ test('a vec0 database is migrated and then reindexed', async (t) => {
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nodes WHERE embedded = 0').get().n, 0)
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM chunk_vectors').get().n, 1)
   db.close()
+})
+
+function cutMigration() {
+  fs.mkdirSync(process.env.GAZE_DATA_DIR, { recursive: true })
+  const file = path.join(process.env.GAZE_DATA_DIR, 'gaze.db')
+  const db = openDb(file, { migrate: false, log: () => {} })
+  db.prepare("INSERT INTO nodes (id, project, kind, title, body, source, created_at, updated_at) VALUES ('n1', 'den', 'rule', 'Postgres', 'La base usa postgres', 'user', 'now', 'now')").run()
+  db.close()
+  fs.writeFileSync(`${file}.vec0.bak`, 'native copy')
+  return file
+}
+
+const vectors = (file) => {
+  const db = new DatabaseSync(file)
+  const n = db.prepare('SELECT COUNT(*) AS n FROM chunk_vectors').get().n
+  db.close()
+  return n
+}
+
+test('the CLI reindexes in process when a migration stopped before the reindex', async () => {
+  const file = cutMigration()
+  const first = await gaze(['rule', 'ls'])
+  assert.equal(first.code, 0)
+  assert.match(first.stderr, /gaze: 1 notas con embeddings nuevos\./)
+  assert.equal(vectors(file), 1)
+  const second = await gaze(['rule', 'ls'])
+  assert.equal(second.stderr, '')
+})
+
+test('gaze reindex does not reindex twice on open', async () => {
+  cutMigration()
+  const out = await gaze(['reindex'])
+  assert.equal(out.code, 0)
+  assert.equal(out.stderr, '')
+  assert.equal(out.stdout, '1 notas con embeddings nuevos.\n')
+})
+
+test('a hook spawns gaze reindex in background once when a migration stopped before the reindex', async () => {
+  const file = cutMigration()
+  const mark = path.join(process.env.GAZE_DATA_DIR, 'reindex.spawned')
+  const first = await gaze(['hook', 'session-start'], { stdin: '{"session_id":"t","cwd":"/"}' })
+  assert.equal(first.code, 0)
+  assert.match(first.stdout, /Postgres/)
+  assert.ok(fs.existsSync(mark))
+  const stamp = fs.statSync(mark).mtimeMs
+  assert.equal((await gaze(['hook', 'session-start'], { stdin: '{"session_id":"u","cwd":"/"}' })).code, 0)
+  assert.equal(fs.statSync(mark).mtimeMs, stamp)
+  assert.equal(vectors(file), 0)
+})
+
+test('a hook facing a migration in progress gives up in under 2 seconds without context', async () => {
+  fs.mkdirSync(process.env.GAZE_DATA_DIR, { recursive: true })
+  const file = path.join(process.env.GAZE_DATA_DIR, 'gaze.db')
+  fs.writeFileSync(migrationLock(file), `${process.pid}\n`)
+  const started = Date.now()
+  const out = await gaze(['hook', 'session-start'], { stdin: '{"session_id":"t","cwd":"/"}' })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 2000, `took ${elapsed} ms`)
+  assert.equal(out.code, 0)
+  assert.equal(out.stdout, '')
+  assert.match(out.stderr, /Otro proceso está migrando/)
+  assert.equal(fs.existsSync(file), false)
 })

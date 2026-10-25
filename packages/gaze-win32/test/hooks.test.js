@@ -9,6 +9,8 @@ import {
   BRAIN_LINE,
   Gate,
   HARVEST_ENV,
+  REINDEX_MARK,
+  REINDEX_MARK_MS,
   disabled,
   gatePasses,
   harvest,
@@ -29,6 +31,7 @@ import {
   selectPointers,
   sessionContext,
   sessionStart,
+  spawnReindex,
   stripTags,
   transcriptText,
   trivialPrompt,
@@ -439,4 +442,25 @@ test('harvest run reports timeouts, failures and unknown agents', async () => {
   await harvestRun(store, e, TRANSCRIPT, 'd', dir, { out })
   assert.equal(written.length, 3)
   assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM harvests').get().n, 0)
+})
+
+test('spawnReindex launches gaze reindex once per window and retries after it', () => {
+  const calls = []
+  const spawn = (argv) => {
+    calls.push(argv)
+    return 4242
+  }
+  const command = ['node', 'gaze.js']
+  assert.equal(spawnReindex(command, { spawn }), true)
+  assert.equal(spawnReindex(command, { spawn }), false)
+  assert.deepEqual(calls, [['node', 'gaze.js', 'reindex']])
+  const mark = path.join(process.env.GAZE_DATA_DIR, REINDEX_MARK)
+  assert.ok(fs.existsSync(mark))
+  assert.equal(spawnReindex(command, { spawn, now: Date.now() + REINDEX_MARK_MS + 1000 }), true)
+  assert.equal(calls.length, 2)
+})
+
+test('spawnReindex drops the mark when the spawn fails', () => {
+  assert.equal(spawnReindex(['node'], { spawn: () => null }), false)
+  assert.equal(fs.existsSync(path.join(process.env.GAZE_DATA_DIR, REINDEX_MARK)), false)
 })

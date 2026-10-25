@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import path from 'node:path'
 import { performance } from 'node:perf_hooks'
 import * as agents from './agents.js'
 import * as daemon from './daemon.js'
@@ -13,6 +14,8 @@ import * as text from './text.js'
 import { field, str } from './text.js'
 
 export const HARVEST_ENV = 'GAZE_HARVEST'
+export const REINDEX_MARK = 'reindex.spawned'
+export const REINDEX_MARK_MS = 10 * 60 * 1000
 
 export const BRAIN_LINE =
   'gaze: este proyecto tiene cerebro. Antes de preguntarle al usuario datos del proyecto, búscalos con gaze_search; guarda con gaze_remember decisiones, correcciones, convenciones y datos del cliente o de infra como notas atómicas con [[enlaces]].'
@@ -155,6 +158,25 @@ export function sessionContext(rules, budget) {
 
 export function needsBackgroundRefresh(p) {
   return p.slug === GLOBAL && p.repo !== null && p.repo !== undefined && !p.source.startsWith('cache:') && p.source !== 'env'
+}
+
+export function spawnReindex(command, { spawn = spawnDetached, now = Date.now() } = {}) {
+  const dir = paths.dataDir()
+  const mark = path.join(dir, REINDEX_MARK)
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    if (now - fs.statSync(mark).mtimeMs < REINDEX_MARK_MS) return false
+    fs.rmSync(mark, { force: true })
+  } catch {}
+  try {
+    fs.writeFileSync(mark, `${process.pid}\n`, { flag: 'wx' })
+  } catch {
+    return false
+  }
+  const pid = spawn([...command, 'reindex'], {})
+  if (pid !== null && pid !== undefined) return true
+  fs.rmSync(mark, { force: true })
+  return false
 }
 
 export function resolveForHook(store, cwd, { spawn = spawnDetached } = {}) {

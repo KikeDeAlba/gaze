@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { EDGE_KINDS, GLOBAL, KINDS, NOTE_KINDS, SCHEMA, SOURCES, isNativeVec0, migrateVec0, migrationLock, openDb, openMemory } from '../src/db.js'
+import { EDGE_KINDS, GLOBAL, KINDS, NOTE_KINDS, SCHEMA, SOURCES, isNativeVec0, migrateVec0, migrationLock, needsReindex, openDb, openMemory } from '../src/db.js'
 import { GazeError } from '../src/envelope.js'
 
 const RUST_DB = new URL('../../../src/db.rs', import.meta.url)
@@ -259,4 +259,29 @@ test('a migration lock left by a dead process does not block the migration', asy
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM nodes').get().n, 2)
   db.close()
   assert.equal(fs.existsSync(migrationLock(file)), false)
+})
+
+test('a migration removes the stagings left by earlier attempts', (t) => {
+  const file = path.join(dir, 'gaze.db')
+  if (!nativeFixture(file)) return t.skip('enableDefensive is not available')
+  const orphans = ['gaze.db.migrating.111.aaaaaaaa', 'gaze.db.migrating.111.aaaaaaaa-wal', 'gaze.db.migrating.222.bbbbbbbb-journal']
+  for (const name of orphans) fs.writeFileSync(path.join(dir, name), 'left over')
+  fs.writeFileSync(path.join(dir, 'other.db.migrating.1.cccccccc'), 'not ours')
+  const db = openDb(file, { migrate: true, log: quiet })
+  assert.equal(isNativeVec0(db), false)
+  db.close()
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.includes('.migrating.')), ['other.db.migrating.1.cccccccc'])
+})
+
+test('needsReindex only asks for vectors when notes have none and a vec0 backup exists', () => {
+  const file = path.join(dir, 'gaze.db')
+  const db = openDb(file, { migrate: false, log: quiet })
+  assert.equal(needsReindex(db, file), false)
+  db.exec("INSERT INTO nodes (id, project, kind, title, body, source, created_at, updated_at) VALUES ('n1', 'demo', 'fact', 'T', 'B', 'user', 'now', 'now')")
+  assert.equal(needsReindex(db, file), false)
+  fs.writeFileSync(`${file}.vec0.bak`, 'native copy')
+  assert.equal(needsReindex(db, file), true)
+  db.exec("INSERT INTO chunk_vectors (chunk_id, project, embedding) VALUES (1, 'demo', x'00')")
+  assert.equal(needsReindex(db, file), false)
+  db.close()
 })

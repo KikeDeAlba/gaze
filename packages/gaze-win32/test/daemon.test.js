@@ -11,8 +11,8 @@ import {
   LEGACY_TASK, ServeLog, handle, install, ping, removeLegacyTask, schtasksPath, serveArgs, shutdown, spawnDetached, spawnOnDemand, status,
   statusState, uninstall,
 } from '../src/daemon.js'
-import { endpointFor, request, requestAuth } from '../src/ipc.js'
-import { VERSION, daemonMarker, serveLog, socketPath, spawnedMarker } from '../src/paths.js'
+import { endpointFor, readToken, request, requestAuth, rotateToken } from '../src/ipc.js'
+import { VERSION, daemonMarker, serveLock, serveLog, socketPath, spawnedMarker, tokenPath } from '../src/paths.js'
 
 const unix = process.platform !== 'win32'
 const DAEMON_URL = pathToFileURL(path.resolve(import.meta.dirname, '../src/daemon.js')).href
@@ -215,6 +215,75 @@ test('a second serve refuses to start while one is running', { skip: !unix }, as
   const again = await ping()
   assert.equal(again.pid, pong.pid)
   assert.equal(first.child.exitCode, null)
+})
+
+test('two serves started together leave one daemon whose token the clients hold', { skip: !unix }, async () => {
+  for (let round = 0; round < 3; round += 1) {
+    const a = startChild()
+    const b = startChild()
+    const pong = await waitFor(() => ping())
+    const first = await withTimeout(Promise.race([a.exited.then((code) => [a, code]), b.exited.then((code) => [b, code])]), 5000)
+    assert.notEqual(first, 'timeout', `round ${round}: neither serve gave up`)
+    const [loser, code] = first
+    const winner = loser === a ? b : a
+    assert.equal(code, 1)
+    await sleep(200)
+    assert.equal(winner.child.exitCode, null, `round ${round}: ${winner.out.stderr}`)
+    assert.equal(pong.pid, winner.child.pid)
+    assert.equal(loser.out.stderr, `gaze serve: gaze serve ya corre en ${socketPath()}\n`)
+    const embedded = await request(endpointFor(socketPath()), { op: 'embed', mode: 'query', texts: ['ab'] }, { timeoutMs: 5000 })
+    assert.deepEqual(embedded, { ok: true, vectors: [[2, 1, 0.5]] })
+    assert.equal(fs.existsSync(serveLock()), false)
+    assert.equal(await shutdown(), true)
+    assert.equal(await withTimeout(winner.exited, 5000), 0)
+  }
+})
+
+test('a serve lock left by a dead process does not block the next serve', { skip: !unix }, async () => {
+  const dead = spawn(process.execPath, ['-e', ''])
+  await new Promise((resolve) => dead.on('exit', resolve))
+  fs.mkdirSync(path.dirname(serveLock()), { recursive: true })
+  fs.writeFileSync(serveLock(), `${dead.pid}\n`)
+  startChild()
+  assert.notEqual(await waitFor(() => ping()), null)
+  assert.equal(fs.existsSync(serveLock()), false)
+})
+
+test('a serve that cannot bind leaves the running token alone', { skip: !unix }, async () => {
+  const token = rotateToken()
+  const held = new Set()
+  const squatter = net.createServer((socket) => {
+    held.add(socket)
+    socket.on('error', () => {})
+  })
+  fs.mkdirSync(path.dirname(socketPath()), { recursive: true })
+  await new Promise((resolve) => squatter.listen(socketPath(), resolve))
+  try {
+    const { exited, out } = startChild()
+    assert.equal(await withTimeout(exited, 15000), 1)
+    assert.match(out.stderr, /^gaze serve: bind /)
+    assert.deepEqual(readToken(), token)
+    assert.equal(fs.readFileSync(tokenPath(), 'utf8'), `${token.toString('hex')}\n`)
+  } finally {
+    const closed = new Promise((resolve) => squatter.close(resolve))
+    for (const socket of held) socket.destroy()
+    await closed
+  }
+})
+
+test('install waits for a serve that is already starting instead of launching another', { skip: !unix }, async () => {
+  fs.mkdirSync(path.dirname(serveLock()), { recursive: true })
+  fs.writeFileSync(serveLock(), `${process.pid}\n`)
+  const launched = path.join(dir, 'launched')
+  const probe = path.join(dir, 'probe.mjs')
+  fs.writeFileSync(probe, `import fs from 'node:fs'\nfs.writeFileSync(${JSON.stringify(launched)}, 'x')\n`)
+  const installing = install({ self: [process.execPath, probe] })
+  await sleep(300)
+  fs.rmSync(serveLock())
+  startChild()
+  const result = await installing
+  assert.equal(result.ready, true)
+  assert.equal(fs.existsSync(launched), false)
 })
 
 test('serve exits after the idle timeout and removes the socket', { skip: !unix }, async () => {

@@ -159,12 +159,78 @@ describe('launcher and old installs', () => {
     assert.deepEqual(await launcher('C:\\pkg\\vendor\\gaze.exe', { ctx }), ['C:\\pkg\\vendor\\gaze.exe'])
   })
 
+  test('runs the port with node and npm/gaze.js on Windows', async () => {
+    const { home } = sandbox()
+    const ours = path.join(home, 'ours')
+    mkdirSync(ours)
+    if (process.platform !== 'win32') symlinkSync(SHIM, path.join(ours, 'gaze'))
+    const ctx = platformContext({ platform: 'win32', home, env: { USERPROFILE: home, PATH: ours } })
+    assert.deepEqual(await launcher(SHIM, { ctx }), [process.execPath, SHIM])
+    assert.deepEqual(await launcher(realpathSync(SHIM), { ctx }), [process.execPath, realpathSync(SHIM)])
+  })
+
+  test('uses node and npm/gaze.js elsewhere unless gaze on the PATH is this shim', { skip: process.platform === 'win32' }, async () => {
+    const { home } = sandbox()
+    const ours = path.join(home, 'ours')
+    mkdirSync(ours)
+    symlinkSync(SHIM, path.join(ours, 'gaze'))
+    const ctx = (dir) => platformContext({ platform: 'darwin', home, env: { HOME: home, PATH: dir } })
+    assert.deepEqual(await launcher(SHIM, { ctx: ctx('') }), [process.execPath, SHIM])
+    assert.deepEqual(await launcher(SHIM, { ctx: ctx(ours) }), ['gaze'])
+  })
+
+  test('quotes node and the shim for Windows hooks and keeps the MCP server as argv', () => {
+    const node = 'C:\\Program Files\\nodejs\\node.exe'
+    const shim = 'C:\\Users\\Ana Maria\\AppData\\Roaming\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js'
+    const spec = integration({ command: [node, shim], version: '1.2.3', platform: 'win32' })
+    assert.deepEqual(spec.mcp, [{ name: 'gaze', command: [node, shim, 'mcp'] }])
+    assert.deepEqual(spec.claudeDesktop.mcp, spec.mcp)
+    const prompt = `"${node}" "${shim}" hook prompt --harness codex`
+    assert.deepEqual(commands(spec.codex.hooks.UserPromptSubmit), [prompt])
+    assert.deepEqual(commands(spec.gemini.hooks.SessionStart), [`"${node}" "${shim}" hook session-start --harness gemini`])
+    assert.equal(ownHook(prompt, 'codex'), true)
+    const plain = integration({ command: ['C:\\nvm4w\\nodejs\\node.exe', 'C:\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js'], version: '1.2.3', platform: 'win32' })
+    assert.deepEqual(commands(plain.codex.hooks.UserPromptSubmit), ['C:\\nvm4w\\nodejs\\node.exe C:\\npm\\node_modules\\@kikedealba\\gaze\\npm\\gaze.js hook prompt --harness codex'])
+  })
+
+  test('installs the MCP server and the hooks as node plus npm/gaze.js and swaps the hooks of another node', async () => {
+    const { home, options } = sandbox()
+    const desktop = path.join(home, 'Library', 'Application Support', 'Claude')
+    mkdirSync(desktop, { recursive: true })
+    const hooksFile = path.join(home, '.codex', 'hooks.json')
+    mkdirSync(path.dirname(hooksFile), { recursive: true })
+    const stale = `'/old node/bin/node' ${SHIM} hook prompt --harness codex`
+    writeFileSync(hooksFile, JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: stale }] }] } }))
+    const source = { binary: SHIM, version: '1.2.3' }
+    const { steps } = await installAgents(['codex', 'gemini', 'opencode', 'antigravity', 'claude-desktop'], source, options)
+    assert.deepEqual(steps.filter((step) => step.state === 'failed'), [])
+    const mcp = { command: process.execPath, args: [SHIM, 'mcp'] }
+    const hook = `${shellCommand([process.execPath, SHIM], 'darwin')} hook prompt --harness codex`
+    assert.ok(readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').includes(`command = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(SHIM)}, "mcp"]`))
+    assert.deepEqual(commands(readJson(hooksFile).hooks.UserPromptSubmit), [hook])
+    const extension = path.join(home, '.gemini', 'extensions', 'gaze')
+    assert.deepEqual(readJson(path.join(extension, 'gemini-extension.json')).mcpServers.gaze, mcp)
+    assert.deepEqual(commands(readJson(path.join(extension, 'hooks', 'hooks.json')).hooks.BeforeAgent), [`${shellCommand([process.execPath, SHIM], 'darwin')} hook prompt --harness gemini`])
+    assert.deepEqual(readJson(path.join(home, '.config', 'opencode', 'opencode.json')).mcp.gaze.command, [process.execPath, SHIM, 'mcp'])
+    for (const file of [path.join(home, '.gemini', 'config', 'mcp_config.json'), path.join(desktop, 'claude_desktop_config.json')]) {
+      const { command, args } = readJson(file).mcpServers.gaze
+      assert.deepEqual({ command, args }, mcp)
+    }
+
+    await uninstallAgents('all', source, options)
+    assert.equal(readJson(hooksFile).hooks.UserPromptSubmit, undefined)
+    assert.equal(readJson(path.join(home, '.config', 'opencode', 'opencode.json')).mcp.gaze, undefined)
+  })
+
   test('tells gaze hooks apart from foreign ones regardless of the path', () => {
     assert.equal(ownHook("'/old/node/lib/node_modules/@kikedealba/gaze/vendor/gaze' hook prompt --harness codex", 'codex'), true)
     assert.equal(ownHook('/old/vendor/gaze hook session-start --harness codex', 'codex'), true)
     assert.equal(ownHook('gaze hook prompt --harness codex', 'codex'), true)
     assert.equal(ownHook("& 'C:\\old\\vendor\\gaze.exe' hook prompt --harness codex", 'codex'), true)
     assert.equal(ownHook('"C:\\Program Files\\gaze\\vendor\\gaze.exe" hook prompt --harness gemini', 'gemini'), true)
+    assert.equal(ownHook('/usr/bin/node /pkg/npm/gaze.js hook prompt --harness codex', 'codex'), true)
+    assert.equal(ownHook('"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Ana Maria\\npm\\gaze.js" hook prompt --harness gemini', 'gemini'), true)
+    assert.equal(ownHook('node /pkg/notgaze.js hook prompt --harness codex', 'codex'), false)
     assert.equal(ownHook('bita hook prompt --harness codex', 'codex'), false)
     assert.equal(ownHook('notgaze hook prompt --harness codex', 'codex'), false)
     assert.equal(ownHook('gaze hook prompt --harness gemini', 'codex'), false)
@@ -269,6 +335,31 @@ process.exitCode = ${exit}
     const code = await runSetup(['setup', '--agents', 'codex'], bin.file, { ...capture(), native: bin.native, version: '1.2.3', install: options })
     assert.equal(code, 4)
     assert.equal(existsSync(path.join(home, '.codex')), false)
+  })
+
+  test('runs the port setup in the same process, capturing stdout only for --json', async () => {
+    const { home, options } = nativeSandbox()
+    const calls = []
+    const native = async (argv, io) => {
+      calls.push({ argv, stdout: io.stdout === process.stdout, stderr: io.stderr === process.stderr, stdin: typeof io.stdin?.on === 'function' })
+      if (argv.includes('--json')) io.stdout.write(`${JSON.stringify({ ok: true, command: argv[0], data: { manifest: 'port' } })}\n`)
+      return 0
+    }
+    const io = capture()
+    assert.equal(await runSetup(['setup', '--agents', 'codex', '--json'], SHIM, { ...io, native, version: '1.2.3', install: options }), 0, io.out.stderr)
+    const result = JSON.parse(io.out.stdout)
+    assert.equal(result.data.manifest, 'port')
+    assert.ok(result.data.integrations.some((step) => step.agent === 'codex' && step.item === 'mcp gaze' && step.state === 'installed'))
+    assert.ok(readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').includes(JSON.stringify(realpathSync(SHIM))))
+    assert.equal(await runSetup(['uninstall', '--agents', 'codex'], SHIM, { ...capture(), native, version: '1.2.3', install: options }), 0)
+    assert.deepEqual(calls, [
+      { argv: ['setup', '--json'], stdout: false, stderr: true, stdin: true },
+      { argv: ['uninstall'], stdout: true, stderr: true, stdin: true },
+    ])
+    const failing = async () => 5
+    const { home: other, options: otherOptions } = nativeSandbox()
+    assert.equal(await runSetup(['setup', '--agents', 'codex'], SHIM, { ...capture(), native: failing, install: otherOptions }), 5)
+    assert.equal(existsSync(path.join(other, '.codex')), false)
   })
 
   test('rejects unknown agents before touching anything', async () => {
